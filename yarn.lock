@@ -3735,18 +3735,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@smithy/core@npm:^3.24.6":
-  version: 3.24.6
-  resolution: "@smithy/core@npm:3.24.6"
-  dependencies:
-    "@aws-crypto/crc32": "npm:5.2.0"
-    "@smithy/types": "npm:^4.14.3"
-    tslib: "npm:^2.6.2"
-  checksum: 10/c37a2bc247d19612e6b5cc6ce9dea2436d94b2133869d35711fb4a964e604cb2eec295ea563997a2be237a85430c24eed4c71159cf29d7191fb36ff6787dadb1
-  languageName: node
-  linkType: hard
-
-"@smithy/core@npm:^3.29.4":
+"@smithy/core@npm:^3.24.6, @smithy/core@npm:^3.29.4":
   version: 3.29.5
   resolution: "@smithy/core@npm:3.29.5"
   dependencies:
@@ -3809,16 +3798,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@smithy/types@npm:^4.14.3":
-  version: 4.14.3
-  resolution: "@smithy/types@npm:4.14.3"
-  dependencies:
-    tslib: "npm:^2.6.2"
-  checksum: 10/fd2131c6f9263b139f9ca1cf7c492454809b60fff516cc7c59bc4713c9931c57dcd353746ff5b8f7db4e8458628f3026e3e4af5ccd5bf91250365b23f15f4c78
-  languageName: node
-  linkType: hard
-
-"@smithy/types@npm:^4.16.1":
+"@smithy/types@npm:^4.14.3, @smithy/types@npm:^4.16.1":
   version: 4.16.1
   resolution: "@smithy/types@npm:4.16.1"
   dependencies:
