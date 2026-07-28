@@ -19,6 +19,7 @@ const mockProjects: ProjectResponse[] = [
     name: "vizdiff.io",
     vcsProvider: "github",
     repoUrl: "https://github.com/vizdiff-io/vizdiff.io",
+    key: "",
     token: "abc123def456",
     ownerId: 123,
     createdStampSec: oneMinuteAgo - 3600 * 24 * 30, // 1 month ago
@@ -31,6 +32,7 @@ const mockProjects: ProjectResponse[] = [
     name: "Design System",
     vcsProvider: "github",
     repoUrl: "https://github.com/example/example-project",
+    key: "",
     token: "def456ghi789",
     ownerId: 123,
     createdStampSec: oneMinuteAgo - 3600 * 24 * 7, // 1 week ago
@@ -43,6 +45,7 @@ const mockProjects: ProjectResponse[] = [
     name: "MyAwesomeProject",
     vcsProvider: "github",
     repoUrl: "https://github.com/test/MyAwesomeProject",
+    key: "",
     token: "ghi789jkl012",
     ownerId: 456,
     createdStampSec: oneMinuteAgo - 3600, // 1 hour ago
@@ -55,6 +58,7 @@ const mockProjects: ProjectResponse[] = [
     name: "Marketing Site",
     vcsProvider: "github",
     repoUrl: "https://github.com/example/example-project",
+    key: "",
     token: "jkl012mno345",
     ownerId: 456,
     createdStampSec: oneMinuteAgo - 3600 * 24 * 7, // 1 week ago

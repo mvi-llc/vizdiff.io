@@ -1,8 +1,6 @@
 import { createAppAuth } from "@octokit/auth-app"
 import { Octokit } from "@octokit/rest"
-import { Project } from "shared"
 
-import { Database } from "../database"
 import {
   GITHUB_APP_ID,
   GITHUB_CLIENT_ID,
@@ -11,7 +9,6 @@ import {
 } from "../environment"
 import { getInstallationForOrg, getInstallationsForUserId, syncUserInstallations } from "../github"
 import { log } from "../log"
-import { getAccessibleProjectIds } from "../projectAccess"
 import type { RequestHandler } from "../types"
 
 const GITHUB_HEADERS = { "X-GitHub-Api-Version": "2022-11-28" }
@@ -102,40 +99,16 @@ export const repos: RequestHandler = async (req, res) => {
         per_page: 100,
       })
 
-  // Get the list of project IDs that this user has access to
-  const db = await Database()
-  const accessibleProjectIds = await getAccessibleProjectIds(db, user.id)
-
-  // Get a set of repo IDs from the list of accessible project IDs
-  const accessibleRepoIds = new Set<number>()
-  if (accessibleProjectIds.length > 0) {
-    const results = await db
-      .getRepository(Project)
-      .createQueryBuilder("project")
-      .select("project.repoId", "repoId")
-      .where("project.id IN (:...ids) AND project.vcsProvider = :provider", {
-        ids: accessibleProjectIds,
-        provider: "github",
-      })
-      .getRawMany<{ repoId: string }>()
-    for (const row of results) {
-      accessibleRepoIds.add(parseInt(row.repoId, 10))
-    }
-  }
-
-  // Filter out repos that this user already has a project for (or has access to)
-  const filteredRepos = ghRes.data.filter((repo) => !accessibleRepoIds.has(repo.id))
+  // Repos that already have a VizDiff project are intentionally NOT filtered out: a monorepo can
+  // host multiple VizDiff projects (one per Storybook, distinguished by `key`; issue #443).
 
   log.info(
     {
       userId: user.id,
       org,
-      filteredReposLength: filteredRepos.length,
       totalReposLength: ghRes.data.length,
-      accessibleRepoIdCount: accessibleRepoIds.size,
-      accessibleProjectIdCount: accessibleProjectIds.length,
     },
     "Returning GitHub projects",
   )
-  res.json(filteredRepos)
+  res.json(ghRes.data)
 }

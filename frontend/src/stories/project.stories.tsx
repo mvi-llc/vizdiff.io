@@ -22,6 +22,7 @@ const mockProject: ProjectResponse = {
   name: "Cat Photos",
   vcsProvider: "github",
   repoUrl: "https://github.com/example/example-project",
+  key: "",
   token: "abc123def456",
   ownerId: 123,
   createdStampSec: oneMinuteAgo - 3600 * 24, // 1 day ago

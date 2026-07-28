@@ -64,6 +64,22 @@ After updating environment variables, restart your VizDiff services.
    token can see)
 4. Copy the **Project Token** from the project settings (you'll need this for CI)
 
+### Monorepos: multiple Storybooks per repository
+
+A single GitLab repository can host **multiple** VizDiff projects — one per Storybook (e.g.
+several frontends plus a shared component library). To add another project for the same repo,
+fill in the **Project key** field (or pass `key` to `POST /api/projects`) with a unique slug per
+Storybook, e.g. `web`, `admin`, `ui-lib`:
+
+- Each project gets its own upload token; give each package's CI job its own
+  `VIZDIFF_PROJECT_TOKEN` and scope the job with `rules:changes` so it only runs when that
+  package changes.
+- Each project reports an independent commit status: the default (no-key) project uses
+  `vizdiff/visual-tests`, keyed projects use `vizdiff/visual-tests/<key>` — so one MR shows a
+  per-Storybook pass/fail breakdown.
+- Webhooks need no extra configuration: events fan out to every VizDiff project registered for
+  the repository.
+
 ## Step 4: Configure GitLab CI
 
 Add the following `.gitlab-ci.yml` to your repository:

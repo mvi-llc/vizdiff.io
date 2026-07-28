@@ -15,6 +15,7 @@ import {
   ListItemText,
   Tabs,
   Tab,
+  TextField,
   Typography,
 } from "@mui/material"
 import type { Endpoints } from "@octokit/types"
@@ -84,6 +85,9 @@ export default function NewProjectDialog({
   const [reposLoading, setReposLoading] = useState(false)
   const [refreshCounter, setRefreshCounter] = useState(0)
   const [loadingStartTime, setLoadingStartTime] = useState<number | null>(null)
+  // Optional monorepo discriminator: allows adding several projects (one per Storybook) for the
+  // same repository. Left empty for the common single-project case.
+  const [projectKey, setProjectKey] = useState("")
 
   const [githubOrgs, isGithubOrgsLoading, _githubOrgsErr] = useAuthenticatedFetch<GithubOrg[]>(
     provider === "github" ? API_GITHUB_ORGS_URL + `?refresh=${refreshCounter}` : undefined,
@@ -183,14 +187,15 @@ export default function NewProjectDialog({
     setError(null)
     setLoadingStartTime(Date.now())
 
-    let projectData
+    let projectData: Record<string, unknown>
     let label: string
     let isPrivate: boolean
 
+    const key = projectKey.trim()
     if (provider === "github") {
       const githubRepo = repo as GithubRepo
       projectData = {
-        name: githubRepo.name,
+        name: key ? `${githubRepo.name} (${key})` : githubRepo.name,
         vcsProvider: "github",
         repoId: githubRepo.id,
         repoUrl: githubRepo.html_url,
@@ -200,13 +205,16 @@ export default function NewProjectDialog({
     } else {
       const gitlabProject = repo as GitLabProject
       projectData = {
-        name: gitlabProject.name,
+        name: key ? `${gitlabProject.name} (${key})` : gitlabProject.name,
         vcsProvider: "gitlab",
         repoId: gitlabProject.id,
         repoUrl: gitlabProject.web_url,
       }
       label = gitlabProject.path_with_namespace
       isPrivate = gitlabProject.visibility !== "public"
+    }
+    if (key) {
+      projectData.key = key
     }
 
     // Create the project
@@ -335,6 +343,19 @@ export default function NewProjectDialog({
             {error}
           </Alert>
         )}
+        <TextField
+          label="Project key (optional)"
+          value={projectKey}
+          onChange={(event) => setProjectKey(event.target.value)}
+          size="small"
+          fullWidth
+          sx={{ mb: 2 }}
+          helperText={
+            "For monorepos with multiple Storybooks: a unique key per project (e.g. web, ui-lib) " +
+            "lets one repository host several projects, each reporting its own commit status " +
+            "(vizdiff/visual-tests/<key>). Leave empty for a single project per repository."
+          }
+        />
         <Box
           sx={{
             display: "flex",

@@ -1,6 +1,13 @@
 import { Upload as S3Upload } from "@aws-sdk/lib-storage"
 import type { Logger } from "pino"
-import { createSummaryForBuild, ScreenshotTest, uploadTarballKey, WorkTask } from "shared"
+import {
+  createSummaryForBuild,
+  githubCheckRunName,
+  gitlabStatusContext,
+  ScreenshotTest,
+  uploadTarballKey,
+  WorkTask,
+} from "shared"
 import { uuidv7 } from "uuidv7"
 
 import { getProjectByToken } from "../authenticate"
@@ -197,7 +204,9 @@ export async function uploadStorybook(req: DefaultRequest, res: DefaultResponse)
       if (hostConfig && ENABLE_VCS_STATUS) {
         try {
           await updateGitLabCommitStatus(project.repoId, commitSha, "pending", {
-            name: "vizdiff/visual-tests",
+            // Include the project key so multiple projects on one repo (monorepo) report
+            // independent statuses on the same commit.
+            name: gitlabStatusContext(project.key),
             targetUrl: `${APP_URL}/build?id=${screenshotTest.id}`,
             description: "Queued storybook upload for rendering",
             host: gitlabHost,
@@ -303,7 +312,9 @@ async function createGitHubCheckRun({
     owner,
     repo,
     head_sha: commitSha,
-    name: "Visual Tests",
+    // Include the project key so multiple projects on one repo (monorepo) report independent
+    // check runs on the same commit.
+    name: githubCheckRunName(screenshotTest.project.key),
     status: "queued",
     details_url: `${APP_URL}/build?id=${screenshotTestId}`,
     output: {

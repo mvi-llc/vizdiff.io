@@ -41,6 +41,8 @@ export type ProjectResponse = {
   name: string
   vcsProvider: VCSProvider
   repoUrl: string
+  // Monorepo discriminator; empty string for the repo's default (or only) project
+  key: string
   token: string
   ownerId: number
   createdStampSec: number

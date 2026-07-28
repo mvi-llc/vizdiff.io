@@ -1,6 +1,3 @@
-import { Project } from "shared"
-
-import { Database } from "../database"
 import { GITLAB_HOST } from "../environment"
 import { getGitLabClient, getGitLabHosts, listGitLabGroupProjects } from "../gitlab"
 import { log } from "../log"
@@ -100,30 +97,17 @@ export const projects: RequestHandler = async (req, res) => {
     })) as GitLabProjectResponse[]
   }
 
-  // Filter out projects that already have a VizDiff project for this host.
-  const db = await Database()
-  const existing = await db
-    .getRepository(Project)
-    .createQueryBuilder("project")
-    .select("project.repoId", "repoId")
-    .where("project.vcsProvider = :provider AND project.gitlabHost = :host", {
-      provider: "gitlab",
-      host,
-    })
-    .getRawMany<{ repoId: string }>()
-
-  const existingGitlabProjectIds = new Set<number>(existing.map((row) => parseInt(row.repoId, 10)))
-  const filteredProjects = projectList.filter((proj) => !existingGitlabProjectIds.has(proj.id))
+  // Repos that already have a VizDiff project are intentionally NOT filtered out: a monorepo can
+  // host multiple VizDiff projects (one per Storybook, distinguished by `key`; issue #443).
 
   log.info(
     {
       host,
       groupId,
-      filteredProjectsLength: filteredProjects.length,
       totalProjectsLength: projectList.length,
     },
     "Returning GitLab projects",
   )
 
-  res.json(filteredProjects)
+  res.json(projectList)
 }

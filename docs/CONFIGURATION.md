@@ -158,11 +158,26 @@ yarn api migration:revert                                # revert the last migra
 Generating migrations requires a reachable Postgres (`docker compose up -d postgres`). The CLI uses
 the datasource at `api/src/datasource.ts`.
 
-### Projects-uniqueness data caveat
+### Projects uniqueness and monorepo support
 
-The self-host migration re-keys the `projects` unique index from `(user_id, vcs_provider, repo_id)`
-to `(vcs_provider, repo_id, gitlab_host)` — one project per repo regardless of creator. If multiple
-users previously created VizDiff projects for the same repo, the unique index creation will **fail**
+Projects are unique on `(vcs_provider, repo_id, gitlab_host, key)`. The `key` column is an
+optional monorepo discriminator (default `''`), so one repository can host **multiple** VizDiff
+projects — one per Storybook — as long as each has a distinct key (issue #443):
+
+- Creating a second project for a repo **without** a key is still rejected (HTTP 409), preserving
+  the old accidental-duplicate safety net for single-project repos.
+- Pass `key` when creating a project (`POST /api/projects`, or the "Project key" field in the
+  Add Repository dialog). Keys are 1-64 chars: letters, digits, dots, underscores, dashes.
+- Each project reports its own GitLab commit status context: `vizdiff/visual-tests` for the
+  default (empty-key) project, `vizdiff/visual-tests/<key>` otherwise — so several Storybooks in
+  one MR get independent pass/fail statuses. GitHub check runs are similarly named
+  `Visual Tests` / `Visual Tests (<key>)`.
+- Uploads are always identified by the per-project upload token, and webhooks fan out to every
+  project registered for the repository, so no extra CI/webhook configuration is needed per key.
+
+An earlier self-host migration re-keyed the `projects` unique index from
+`(user_id, vcs_provider, repo_id)` to `(vcs_provider, repo_id, gitlab_host)`. If multiple users
+previously created VizDiff projects for the same repo, that unique index creation will **fail**
 until duplicates are removed. De-duplicate before/with the migration, e.g.:
 
 ```sql
@@ -174,6 +189,9 @@ DELETE FROM projects p USING projects q
 WHERE p.vcs_provider = q.vcs_provider AND p.repo_id = q.repo_id
   AND p.gitlab_host IS NOT DISTINCT FROM q.gitlab_host AND p.id > q.id;
 ```
+
+(The later `AddProjectKey` migration widens the index to include `key`, enabling the monorepo
+setup above.)
 
 ### Schema naming conventions
 

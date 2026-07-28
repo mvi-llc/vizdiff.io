@@ -1,5 +1,11 @@
 import crypto from "crypto"
-import { createMarkdownForBuildApproval, Project, ScreenshotTest, TestResult } from "shared"
+import {
+  createMarkdownForBuildApproval,
+  githubCheckRunName,
+  Project,
+  ScreenshotTest,
+  TestResult,
+} from "shared"
 
 import { Database } from "../database"
 import {
@@ -95,13 +101,15 @@ export function escapeRegex(str: string): string {
 }
 
 /**
- * Find a project by repository URL (supports both GitHub and GitLab)
+ * Find all projects for a repository URL (supports both GitHub and GitLab).
+ * A repo can host multiple VizDiff projects (monorepo support, issue #443), so webhook handlers
+ * must fan events out to every match instead of assuming a single project.
  */
-async function findProjectByRepo(
+export async function findProjectsByRepo(
   repoOwner: string,
   repoName: string,
   provider: "github" | "gitlab" = "github",
-): Promise<Project | undefined> {
+): Promise<Project[]> {
   const db = await Database()
   const projectRepo = db.getRepository(Project)
 
@@ -116,7 +124,7 @@ async function findProjectByRepo(
   // Escape special regex characters in repoOwner and repoName to prevent regex injection
   const escapedOwner = escapeRegex(repoOwner)
   const escapedName = escapeRegex(repoName)
-  return projects.find((project) => {
+  return projects.filter((project) => {
     const url = project.repoUrl.toLowerCase()
     const repoPattern = new RegExp(
       `${hostPattern}[^/]*[/:]${escapedOwner}/${escapedName}(\\.git)?$`,
@@ -139,23 +147,24 @@ function originFromWebUrl(webUrl: string | undefined): string | undefined {
 }
 
 /**
- * Find a project by GitLab project ID and host. Webhooks are matched by the host derived from the
- * payload's `project.web_url` origin to prevent cross-host mismatches when serving multiple instances.
+ * Find all projects for a GitLab project ID and host. Webhooks are matched by the host derived
+ * from the payload's `project.web_url` origin to prevent cross-host mismatches when serving
+ * multiple instances. Multiple rows can match one repo (monorepo support, issue #443), so
+ * handlers fan the event out to every project.
  */
-async function findProjectByGitLabId(
+export async function findProjectsByGitLabId(
   gitlabProjectId: number,
   gitlabHost: string | undefined,
-): Promise<Project | undefined> {
+): Promise<Project[]> {
   const db = await Database()
   const projectRepo = db.getRepository(Project)
-  const project = await projectRepo.findOne({
+  return await projectRepo.find({
     where: {
       vcsProvider: "gitlab",
       repoId: gitlabProjectId,
       ...(gitlabHost ? { gitlabHost } : {}),
     },
   })
-  return project ?? undefined
 }
 
 export async function githubWebhook(req: RequestWithRawBody, res: DefaultResponse): Promise<void> {
@@ -237,34 +246,41 @@ async function githubCheckSuiteRequested(
     subject = `${repoOwner}/${repoName}#${headSha} (branch: ${branch})`
     log.info(`Processing check_suite "${action}" event for ${subject}`)
 
-    // Find the project associated with this repository
-    const project = await findProjectByRepo(repoOwner, repoName)
-    if (!project) {
+    // Find the projects associated with this repository (a monorepo can host several)
+    const projects = await findProjectsByRepo(repoOwner, repoName)
+    if (projects.length === 0) {
       log.error(`No project found for ${subject}`)
       res.status(404).json({ error: "No project found for this repository" })
       return
     }
 
-    // Check if a screenshot test already exists for this commit SHA
+    // Fan the event out to every project for this repo
     const db = await Database()
     const screenshotTestRepository = db.getRepository(ScreenshotTest)
-    const existingTest = await screenshotTestRepository.findOne({
-      where: {
-        commitSha: headSha,
-        project: { id: project.id },
-      },
-    })
+    for (const project of projects) {
+      // Check if a screenshot test already exists for this commit SHA
+      const existingTest = await screenshotTestRepository.findOne({
+        where: {
+          commitSha: headSha,
+          project: { id: project.id },
+        },
+      })
 
-    if (existingTest?.status === "failed") {
-      // TASK: Queue a worker task to re-run the screenshot test
-      log.warn(`TODO: Re-run screenshot test after failure for ${subject}`)
-    } else if (action === "rerequested") {
-      log.warn(
-        `GitHub check_suite re-requested for ${subject}, current status: ${existingTest?.status ?? "(none)"}`,
-      )
-    } else {
-      // This is the normal case, a check_suite webhook comes in before the storybook upload
-      log.info(`GitHub check_suite (action=${action}) received for ${subject}`)
+      if (existingTest?.status === "failed") {
+        // TASK: Queue a worker task to re-run the screenshot test
+        log.warn(
+          `TODO: Re-run screenshot test after failure for ${subject} (project ${project.id})`,
+        )
+      } else if (action === "rerequested") {
+        log.warn(
+          `GitHub check_suite re-requested for ${subject} (project ${project.id}), current status: ${existingTest?.status ?? "(none)"}`,
+        )
+      } else {
+        // This is the normal case, a check_suite webhook comes in before the storybook upload
+        log.info(
+          `GitHub check_suite (action=${action}) received for ${subject} (project ${project.id})`,
+        )
+      }
     }
 
     res.status(200).json({
@@ -363,7 +379,7 @@ async function githubCheckRunRequestedAction(
       repo,
       head_sha: test.commitSha,
       external_id: String(test.id),
-      name: "Visual Tests",
+      name: githubCheckRunName(test.project.key),
       status: "completed",
       conclusion,
       details_url: `${APP_URL}/build?id=${test.id}`,
@@ -540,28 +556,33 @@ async function handleGitLabPush(
 
   log.info(`GitLab push event for project ${projectId}, commit ${commitSha}, branch ${branch}`)
 
-  // Find the associated VizDiff project
-  const project = await findProjectByGitLabId(projectId, gitlabHost)
-  if (!project) {
+  // Find the associated VizDiff projects (a monorepo can host several)
+  const projects = await findProjectsByGitLabId(projectId, gitlabHost)
+  if (projects.length === 0) {
     log.info(`No VizDiff project found for GitLab project ${projectId}`)
     res.status(200).json({ message: "No project found, event acknowledged" })
     return
   }
 
-  // Check if a screenshot test already exists for this commit
+  // Fan the event out to every project for this repo
   const db = await Database()
   const screenshotTestRepository = db.getRepository(ScreenshotTest)
-  const existingTest = await screenshotTestRepository.findOne({
-    where: {
-      commitSha,
-      project: { id: project.id },
-    },
-  })
+  for (const project of projects) {
+    // Check if a screenshot test already exists for this commit
+    const existingTest = await screenshotTestRepository.findOne({
+      where: {
+        commitSha,
+        project: { id: project.id },
+      },
+    })
 
-  if (existingTest) {
-    log.info(`Screenshot test already exists for commit ${commitSha}`)
-  } else {
-    log.info(`GitLab push event received for ${payload.project.path_with_namespace}#${commitSha}`)
+    if (existingTest) {
+      log.info(`Screenshot test already exists for commit ${commitSha} (project ${project.id})`)
+    } else {
+      log.info(
+        `GitLab push event received for ${payload.project.path_with_namespace}#${commitSha} (project ${project.id})`,
+      )
+    }
   }
 
   res.status(200).json({ message: "Push event processed" })
@@ -585,9 +606,9 @@ async function handleGitLabMergeRequest(
     `GitLab MR event: project ${projectId}, MR !${mrIid}, action "${action}", commit ${commitSha}`,
   )
 
-  // Find the associated VizDiff project
-  const project = await findProjectByGitLabId(projectId, gitlabHost)
-  if (!project) {
+  // Find the associated VizDiff projects (a monorepo can host several)
+  const projects = await findProjectsByGitLabId(projectId, gitlabHost)
+  if (projects.length === 0) {
     log.info(`No VizDiff project found for GitLab project ${projectId}`)
     res.status(200).json({ message: "No project found, event acknowledged" })
     return
@@ -600,27 +621,30 @@ async function handleGitLabMergeRequest(
     return
   }
 
-  // Check if a screenshot test exists for this commit
+  // Fan the event out to every project for this repo
   const db = await Database()
   const screenshotTestRepository = db.getRepository(ScreenshotTest)
-  const existingTest = await screenshotTestRepository.findOne({
-    where: {
-      commitSha,
-      project: { id: project.id },
-    },
-  })
+  for (const project of projects) {
+    // Check if a screenshot test exists for this commit
+    const existingTest = await screenshotTestRepository.findOne({
+      where: {
+        commitSha,
+        project: { id: project.id },
+      },
+    })
 
-  if (existingTest) {
-    // Update the MR number if not already set
-    if (!existingTest.prNumber) {
-      existingTest.prNumber = mrIid
-      await screenshotTestRepository.save(existingTest)
-      log.info(`Updated screenshot test ${existingTest.id} with MR !${mrIid}`)
+    if (existingTest) {
+      // Update the MR number if not already set
+      if (!existingTest.prNumber) {
+        existingTest.prNumber = mrIid
+        await screenshotTestRepository.save(existingTest)
+        log.info(`Updated screenshot test ${existingTest.id} with MR !${mrIid}`)
+      }
+    } else {
+      log.info(
+        `GitLab MR event received for ${payload.project.path_with_namespace}!${mrIid} (commit ${commitSha}, branch ${sourceBranch}, project ${project.id})`,
+      )
     }
-  } else {
-    log.info(
-      `GitLab MR event received for ${payload.project.path_with_namespace}!${mrIid} (commit ${commitSha}, branch ${sourceBranch})`,
-    )
   }
 
   res.status(200).json({ message: "Merge request event processed" })
@@ -643,9 +667,9 @@ async function handleGitLabPipeline(
     `GitLab pipeline event: project ${projectId}, pipeline ${pipelineId}, status "${status}"`,
   )
 
-  // Find the associated VizDiff project
-  const project = await findProjectByGitLabId(projectId, gitlabHost)
-  if (!project) {
+  // Find the associated VizDiff projects (a monorepo can host several)
+  const projects = await findProjectsByGitLabId(projectId, gitlabHost)
+  if (projects.length === 0) {
     log.info(`No VizDiff project found for GitLab project ${projectId}`)
     res.status(200).json({ message: "No project found, event acknowledged" })
     return
@@ -654,7 +678,7 @@ async function handleGitLabPipeline(
   // We mainly log pipeline events for debugging; the actual status updates
   // happen when the storybook is uploaded via the API
   log.info(
-    `GitLab pipeline ${pipelineId} for ${payload.project.path_with_namespace}#${commitSha}: ${status}`,
+    `GitLab pipeline ${pipelineId} for ${payload.project.path_with_namespace}#${commitSha}: ${status} (${projects.length} VizDiff project(s))`,
   )
 
   res.status(200).json({ message: "Pipeline event processed" })

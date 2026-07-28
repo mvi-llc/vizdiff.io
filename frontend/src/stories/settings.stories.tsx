@@ -20,6 +20,7 @@ const mockProjects: ProjectResponse[] = [
     name: "vizdiff.io",
     vcsProvider: "gitlab",
     repoUrl: "https://gitlab.com/vizdiff-io/vizdiff.io",
+    key: "",
     token: "abc123def456",
     ownerId: 123,
     createdStampSec: oneMinuteAgo - 3600 * 24 * 30, // 1 month ago
@@ -32,6 +33,7 @@ const mockProjects: ProjectResponse[] = [
     name: "MyAwesomeProject",
     vcsProvider: "gitlab",
     repoUrl: "https://gitlab.com/test/MyAwesomeProject",
+    key: "",
     token: "ghi789jkl012",
     ownerId: 456,
     createdStampSec: oneMinuteAgo - 3600, // 1 hour ago

@@ -1,5 +1,5 @@
 import { randomBytes } from "crypto"
-import { Project, projectKeyPrefix } from "shared"
+import { isValidProjectKey, Project, projectKeyPrefix } from "shared"
 import type { VCSProvider } from "shared"
 
 import type { ProjectResponse } from "../apiTypes"
@@ -17,6 +17,7 @@ type ProjectWithStats = {
   project_vcs_provider: VCSProvider
   project_repo_id: number
   project_repo_url: string
+  project_key: string
   project_token: string
   project_created_at: Date
   owner_id: number
@@ -30,6 +31,9 @@ type CreateProjectBody = {
   vcsProvider?: VCSProvider
   repoId?: number
   repoUrl?: string
+  // Optional monorepo discriminator: allows multiple projects for the same repository
+  // (unique per (vcsProvider, repoId, gitlabHost)). Empty/omitted = the repo's default project.
+  key?: string
   // Legacy fields (backward compatibility)
   githubRepoId?: number
   githubRepoUrl?: string
@@ -101,6 +105,7 @@ function baseProjectStatsQuery(db: Awaited<ReturnType<typeof Database>>) {
       "project.vcsProvider",
       "project.repoId",
       "project.repoUrl",
+      "project.key",
       "project.token",
       "project.createdAt",
       "project.user as owner_id",
@@ -135,6 +140,7 @@ function convertToProjectResponse(project: ProjectWithStats): ProjectResponse {
     vcsProvider: project.project_vcs_provider,
     repoUrl: project.project_repo_url,
     githubRepoUrl: project.project_repo_url, // Legacy alias
+    key: project.project_key,
     token: project.project_token,
     ownerId: project.owner_id,
     createdStampSec: toSeconds(project.project_created_at),
@@ -153,6 +159,8 @@ export const create: RequestHandler = async (req, res) => {
   const vcsProviderRaw: string = body?.vcsProvider ?? "github"
   const repoId = body?.repoId ?? body?.githubRepoId
   const repoUrl = body?.repoUrl ?? body?.githubRepoUrl
+  // Optional monorepo discriminator (empty string = the repo's default project)
+  const key = body?.key?.trim() ?? ""
 
   // Validate vcsProvider at runtime to prevent invalid values from being stored
   if (vcsProviderRaw !== "github" && vcsProviderRaw !== "gitlab") {
@@ -175,6 +183,14 @@ export const create: RequestHandler = async (req, res) => {
     res.status(400).json({ error: "Missing repoUrl (or githubRepoUrl)" })
     return
   }
+  if (key && !isValidProjectKey(key)) {
+    res.status(400).json({
+      error:
+        `Invalid key: "${key}". Keys must be 1-64 characters, start with a letter or digit, ` +
+        `and contain only letters, digits, dots, underscores, and dashes`,
+    })
+    return
+  }
 
   const db = await Database()
 
@@ -183,6 +199,7 @@ export const create: RequestHandler = async (req, res) => {
   project.vcsProvider = vcsProvider
   project.repoId = repoId
   project.repoUrl = repoUrl
+  project.key = key
   // Retain the creator for audit purposes (authorization is now any-authenticated-user).
   project.user = user
   project.token = generateProjectToken()
@@ -192,7 +209,23 @@ export const create: RequestHandler = async (req, res) => {
   }
 
   const projectTable = db.getRepository(Project)
-  await projectTable.save(project)
+  try {
+    await projectTable.save(project)
+  } catch (error) {
+    // Unique violation on (vcs_provider, repo_id, gitlab_host, key): a project for this repo with
+    // the same key already exists. Surface a clear 409 instead of a generic 500 — monorepos add
+    // more projects for the same repo by picking a distinct key.
+    if (isUniqueViolation(error)) {
+      res.status(409).json({
+        error: key
+          ? `A project with key "${key}" already exists for this repository. Choose a different key`
+          : `A project already exists for this repository. To add another project for the same ` +
+            `repository (e.g. multiple Storybooks in a monorepo), provide a unique "key"`,
+      })
+      return
+    }
+    throw error
+  }
 
   const response: ProjectResponse = {
     id: project.id,
@@ -200,6 +233,7 @@ export const create: RequestHandler = async (req, res) => {
     vcsProvider: project.vcsProvider,
     repoUrl: project.repoUrl,
     githubRepoUrl: project.repoUrl, // Legacy alias
+    key: project.key,
     token: project.token,
     ownerId: user.id,
     createdStampSec: toSeconds(project.createdAt),
@@ -313,6 +347,18 @@ export const resetToken: RequestHandler = async (req, res) => {
 /** Generate a random 16-character hex string to use as a project token. */
 function generateProjectToken(): string {
   return randomBytes(8).toString("hex") // 8 bytes = 16 hex chars
+}
+
+/** True when `error` is a Postgres unique-violation (23505) on the repo-uniqueness index. */
+function isUniqueViolation(error: unknown): boolean {
+  const err = error as {
+    code?: string
+    constraint?: string
+    driverError?: { code?: string; constraint?: string }
+  }
+  const code = err.code ?? err.driverError?.code
+  const constraint = err.constraint ?? err.driverError?.constraint
+  return code === "23505" && (constraint == undefined || constraint.includes("vcs_repo_host"))
 }
 
 /** Return the origin (scheme://host[:port]) of a URL, or undefined if it cannot be parsed. */

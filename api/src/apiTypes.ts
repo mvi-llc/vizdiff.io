@@ -35,6 +35,8 @@ export type ProjectResponse = {
   repoUrl: string
   // Legacy alias for backward compatibility
   githubRepoUrl: string
+  // Monorepo discriminator; empty string for the repo's default (or only) project
+  key: string
   token: string
   ownerId: number
   createdStampSec: number
