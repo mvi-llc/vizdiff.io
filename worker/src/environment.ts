@@ -97,6 +97,26 @@ export const WORKER_STORY_CONCURRENCY = Math.max(
   1,
   parseInt(process.env.WORKER_STORY_CONCURRENCY ?? "1", 10) || 1,
 )
+
+// Opt-in software (SwiftShader) WebGL for story rendering (issue #447). The worker image ships
+// SwiftShader (Alpine's chromium-swiftshader package), but WebGL stays off by default because
+// SwiftShader is in-process software rasterization driven by untrusted story content — a larger
+// attack surface than no GL at all — so deployments that don't render WebGL stories shouldn't pay
+// for it. Disabled → screenshot sessions launch with --disable-webgl (WebGL-dependent stories fall
+// into their error boundaries, as before); enabled → --enable-unsafe-swiftshader, and stories get
+// deterministic software WebGL (same SwiftShader version → same pixels), which suits visual
+// regression well.
+export const WORKER_ENABLE_WEBGL = process.env.WORKER_ENABLE_WEBGL === "true"
+
+// Whitespace-separated extra Chrome flags appended to the screenshot session launch args, after
+// the hardening and WebGL flags (issue #447). An operator escape hatch for browser tuning without
+// an image rebuild. Appending can only add flags, not remove the hardening set; use
+// WORKER_ENABLE_WEBGL (not this) to control WebGL.
+export const WORKER_CHROME_EXTRA_ARGS: readonly string[] = (
+  process.env.WORKER_CHROME_EXTRA_ARGS ?? ""
+)
+  .split(/\s+/)
+  .filter((arg) => arg.length > 0)
 // --- Upload sanity / safety limits -------------------------------------------------------------
 // These guard untrusted storybook uploads against zip-bombs, path traversal, pathological story
 // counts, and oversized identifiers. All are configurable via env with sane defaults. A value of

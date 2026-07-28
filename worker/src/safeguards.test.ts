@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest"
 import type { Browser } from "webdriverio"
 
 import {
+  DISABLE_WEBGL_CHROME_ARGS,
+  ENABLE_WEBGL_CHROME_ARGS,
   HARDENING_CHROME_ARGS,
   hardenedChromeArgs,
   installBrowserSafeguards,
@@ -31,6 +33,41 @@ describe("hardenedChromeArgs", () => {
     const result = hardenedChromeArgs(["--headless", "--disable-webrtc"])
     expect(result.filter((a) => a === "--disable-webrtc")).toHaveLength(1)
     expect(result[0]).toBe("--headless")
+  })
+
+  it("disables WebGL by default", () => {
+    const result = hardenedChromeArgs([])
+    for (const flag of DISABLE_WEBGL_CHROME_ARGS) {
+      expect(result).toContain(flag)
+    }
+    for (const flag of ENABLE_WEBGL_CHROME_ARGS) {
+      expect(result).not.toContain(flag)
+    }
+  })
+
+  it("swaps to the software-WebGL flags when enableWebgl is set", () => {
+    const result = hardenedChromeArgs([], { enableWebgl: true })
+    for (const flag of ENABLE_WEBGL_CHROME_ARGS) {
+      expect(result).toContain(flag)
+    }
+    for (const flag of DISABLE_WEBGL_CHROME_ARGS) {
+      expect(result).not.toContain(flag)
+    }
+  })
+
+  it("appends operator extra args last", () => {
+    const result = hardenedChromeArgs(["--headless"], {
+      extraArgs: ["--force-color-profile=srgb", "--lang=de"],
+    })
+    expect(result.slice(-2)).toEqual(["--force-color-profile=srgb", "--lang=de"])
+  })
+
+  it("de-duplicates extra args against earlier flags without reordering them", () => {
+    const result = hardenedChromeArgs(["--headless"], {
+      extraArgs: ["--disable-webrtc", "--lang=de"],
+    })
+    expect(result.filter((a) => a === "--disable-webrtc")).toHaveLength(1)
+    expect(result.indexOf("--disable-webrtc")).toBeLessThan(result.indexOf("--lang=de"))
   })
 })
 

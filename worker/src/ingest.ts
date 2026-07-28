@@ -28,6 +28,8 @@ import {
   MAX_STORIES_PER_UPLOAD,
   S3_BUCKET_NAME,
   S3_CLIENT_CONFIG,
+  WORKER_CHROME_EXTRA_ARGS,
+  WORKER_ENABLE_WEBGL,
   WORKER_STORY_CONCURRENCY,
 } from "./environment"
 import { safeExtract } from "./extract"
@@ -266,13 +268,12 @@ export async function ingestStorybook(
         "goog:chromeOptions": {
           // Base flags plus hardening flags that disable risky browser features
           // (WebRTC, background networking, etc.) when executing untrusted
-          // story bundles. See `safeguards.ts`.
-          args: hardenedChromeArgs([
-            "--headless",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-          ]),
+          // story bundles, plus opt-in software WebGL and operator extra args
+          // (issue #447). See `safeguards.ts`.
+          args: hardenedChromeArgs(
+            ["--headless", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            { enableWebgl: WORKER_ENABLE_WEBGL, extraArgs: WORKER_CHROME_EXTRA_ARGS },
+          ),
         },
       },
       logLevel: "warn",

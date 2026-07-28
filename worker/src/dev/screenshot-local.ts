@@ -4,7 +4,9 @@ import http from "node:http"
 import path from "node:path"
 import { remote, type Browser } from "webdriverio"
 
+import { WORKER_CHROME_EXTRA_ARGS, WORKER_ENABLE_WEBGL } from "../environment"
 import { log } from "../log"
+import { hardenedChromeArgs } from "../safeguards"
 import { startStaticServer } from "../server"
 import {
   captureStableScreenshot,
@@ -56,7 +58,13 @@ async function main(options: CliOptions) {
       capabilities: {
         browserName: "chrome",
         "goog:chromeOptions": {
-          args: ["--headless", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+          // Same launch args as the real ingest path (safeguards.ts), including
+          // opt-in WebGL and extra args, so local screenshots match production
+          // rendering.
+          args: hardenedChromeArgs(
+            ["--headless", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            { enableWebgl: WORKER_ENABLE_WEBGL, extraArgs: WORKER_CHROME_EXTRA_ARGS },
+          ),
         },
       },
       logLevel: "warn",

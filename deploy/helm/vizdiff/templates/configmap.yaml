@@ -44,3 +44,9 @@ data:
 
   # --- Worker ---
   WORKER_HEALTH_PORT: "3003"
+  {{- if .Values.worker.enableWebgl }}
+  WORKER_ENABLE_WEBGL: "true"
+  {{- end }}
+  {{- with .Values.worker.chromeExtraArgs }}
+  WORKER_CHROME_EXTRA_ARGS: {{ . | quote }}
+  {{- end }}
