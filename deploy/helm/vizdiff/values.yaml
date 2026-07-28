@@ -166,6 +166,16 @@ ingress:
     frontend: /
     api: /api
 
+# Worker rendering options.
+worker:
+  # -- Opt-in software (SwiftShader) WebGL for story rendering (issue #447). Off by default
+  # because SwiftShader is in-process software rasterization driven by untrusted story content.
+  # Enable for Storybooks with WebGL components (maplibre-gl, deck.gl, three.js, ...).
+  enableWebgl: false
+  # -- Whitespace-separated extra Chrome flags appended to the worker's screenshot sessions,
+  # after the hardening and WebGL flags (WORKER_CHROME_EXTRA_ARGS).
+  chromeExtraArgs: ""
+
 # Per-service container resource requests/limits.
 resources:
   api:

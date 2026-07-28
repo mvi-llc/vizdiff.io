@@ -71,13 +71,55 @@ export const HARDENING_CHROME_ARGS: readonly string[] = [
 ]
 
 /**
- * Returns the full Chrome args array: the existing base flags plus the
- * hardening flags, de-duplicated while preserving order.
+ * Flags appended when software WebGL is disabled (the default). The worker
+ * image ships SwiftShader (Alpine's `chromium-swiftshader` package), so WebGL
+ * would otherwise be live by default; this keeps the hardened no-GL posture
+ * explicit — SwiftShader is in-process software rasterization driven by
+ * untrusted story content, a larger attack surface than no GL at all.
  */
-export function hardenedChromeArgs(baseArgs: readonly string[]): string[] {
+export const DISABLE_WEBGL_CHROME_ARGS: readonly string[] = ["--disable-webgl"]
+
+/**
+ * Flags appended when software WebGL is opted in (issue #447). SwiftShader
+ * renders WebGL on the CPU; `--enable-unsafe-swiftshader` lifts the software-GL
+ * gate that recent Chrome builds impose (a no-op on builds that don't gate it,
+ * such as the Alpine Chromium in the worker image).
+ */
+export const ENABLE_WEBGL_CHROME_ARGS: readonly string[] = ["--enable-unsafe-swiftshader"]
+
+export interface ChromeArgsOptions {
+  /**
+   * Opt in to software (SwiftShader) WebGL for story rendering. Default false:
+   * appends {@link DISABLE_WEBGL_CHROME_ARGS}; true appends
+   * {@link ENABLE_WEBGL_CHROME_ARGS} instead.
+   */
+  enableWebgl?: boolean
+  /**
+   * Operator-supplied Chrome flags appended after the hardening and WebGL
+   * flags. Appending can only add flags, not remove earlier ones, so the
+   * hardening set stays intact.
+   */
+  extraArgs?: readonly string[]
+}
+
+/**
+ * Returns the full Chrome args array: the base flags, the hardening flags, the
+ * WebGL flags per `options.enableWebgl`, and any operator extra args — in that
+ * order, de-duplicated while preserving first occurrence.
+ */
+export function hardenedChromeArgs(
+  baseArgs: readonly string[],
+  options: ChromeArgsOptions = {},
+): string[] {
+  const webglArgs = options.enableWebgl ? ENABLE_WEBGL_CHROME_ARGS : DISABLE_WEBGL_CHROME_ARGS
   const seen = new Set<string>()
   const result: string[] = []
-  for (const arg of [...baseArgs, ...HARDENING_CHROME_ARGS]) {
+  for (const arg of [
+    ...baseArgs,
+    ...HARDENING_CHROME_ARGS,
+    ...webglArgs,
+    ...(options.extraArgs ?? []),
+  ]) {
     if (!seen.has(arg)) {
       seen.add(arg)
       result.push(arg)

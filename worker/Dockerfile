@@ -6,6 +6,7 @@ FROM node:${NODE_VERSION}-alpine AS base
 RUN apk add --no-cache \
     chromium \
     chromium-chromedriver \
+    chromium-swiftshader \
     nss \
     freetype \
     freetype-dev \
