@@ -272,19 +272,19 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@aws-sdk/lib-storage@npm:3.1073.0":
-  version: 3.1073.0
-  resolution: "@aws-sdk/lib-storage@npm:3.1073.0"
+"@aws-sdk/lib-storage@npm:3.1090.0":
+  version: 3.1090.0
+  resolution: "@aws-sdk/lib-storage@npm:3.1090.0"
   dependencies:
-    "@smithy/core": "npm:^3.24.6"
-    "@smithy/types": "npm:^4.14.3"
+    "@smithy/core": "npm:^3.29.4"
+    "@smithy/types": "npm:^4.16.1"
     buffer: "npm:5.6.0"
     events: "npm:3.3.0"
     stream-browserify: "npm:3.0.0"
     tslib: "npm:^2.6.2"
   peerDependencies:
-    "@aws-sdk/client-s3": ^3.1073.0
-  checksum: 10/e45505685739fc0ebe9054e058227d5e1eb9faccd2095e2321171fa6b3ee5207d876e28bccf2821e7929149d053122b0af2ffa7cb8c9b82b1f8758833dd05018
+    "@aws-sdk/client-s3": ^3.1090.0
+  checksum: 10/c70a66189cc178f781de7fa108f065b2161042858b7cb8a647a8e72ada6348ecf174d3841bdd575af29c19cf836850ec56d3cca76a1773b43730f2abe2c5622f
   languageName: node
   linkType: hard
 
@@ -3735,14 +3735,13 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@smithy/core@npm:^3.24.6":
-  version: 3.24.6
-  resolution: "@smithy/core@npm:3.24.6"
+"@smithy/core@npm:^3.24.6, @smithy/core@npm:^3.29.4":
+  version: 3.29.5
+  resolution: "@smithy/core@npm:3.29.5"
   dependencies:
-    "@aws-crypto/crc32": "npm:5.2.0"
-    "@smithy/types": "npm:^4.14.3"
+    "@smithy/types": "npm:^4.16.1"
     tslib: "npm:^2.6.2"
-  checksum: 10/c37a2bc247d19612e6b5cc6ce9dea2436d94b2133869d35711fb4a964e604cb2eec295ea563997a2be237a85430c24eed4c71159cf29d7191fb36ff6787dadb1
+  checksum: 10/b03bf978bc48247bb4d129f2300943fcb450b2d5f89b443b7f01f2a8a38067d3f18f185ec6fac43d9176220379955544060e88f0cf425d441527a010eebda2d1
   languageName: node
   linkType: hard
 
@@ -3799,12 +3798,12 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@smithy/types@npm:^4.14.3":
-  version: 4.14.3
-  resolution: "@smithy/types@npm:4.14.3"
+"@smithy/types@npm:^4.14.3, @smithy/types@npm:^4.16.1":
+  version: 4.16.1
+  resolution: "@smithy/types@npm:4.16.1"
   dependencies:
     tslib: "npm:^2.6.2"
-  checksum: 10/fd2131c6f9263b139f9ca1cf7c492454809b60fff516cc7c59bc4713c9931c57dcd353746ff5b8f7db4e8458628f3026e3e4af5ccd5bf91250365b23f15f4c78
+  checksum: 10/23651203f2e8800b2b2311ef163ddec166d91e15b30fa1c877be352aeef8ae7cc7b0189f99e07b0dcd52160b10adfb3fa4ca32c38a2d7195fc5428b8986d5201
   languageName: node
   linkType: hard
 
@@ -5420,7 +5419,7 @@ __metadata:
   resolution: "api@workspace:api"
   dependencies:
     "@aws-sdk/client-s3": "npm:3.1068.0"
-    "@aws-sdk/lib-storage": "npm:3.1073.0"
+    "@aws-sdk/lib-storage": "npm:3.1090.0"
     "@aws-sdk/s3-request-presigner": "npm:3.1073.0"
     "@gitbeaker/rest": "npm:^43.8.0"
     "@octokit/auth-app": "npm:^8.1.2"
