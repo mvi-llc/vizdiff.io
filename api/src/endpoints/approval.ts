@@ -1,4 +1,10 @@
-import { createMarkdownForBuildApproval, ScreenshotTest, TestResult } from "shared"
+import {
+  createMarkdownForBuildApproval,
+  githubCheckRunName,
+  gitlabStatusContext,
+  ScreenshotTest,
+  TestResult,
+} from "shared"
 
 import { Database } from "../database"
 import { APP_URL, ENABLE_VCS_STATUS, GITHUB_ENABLED, GITLAB_HOST } from "../environment"
@@ -92,7 +98,7 @@ export const approveOrDeny: RequestHandler = async (req, res) => {
           repo,
           head_sha: test.commitSha,
           external_id: String(test.id),
-          name: "Visual Tests",
+          name: githubCheckRunName(test.project.key),
           status: "completed",
           conclusion,
           details_url: `${APP_URL}/build?id=${test.id}`,
@@ -125,7 +131,7 @@ export const approveOrDeny: RequestHandler = async (req, res) => {
           const changeCount = testResults.filter((r) => r.diffRatio && r.diffRatio > 0).length
 
           await updateGitLabCommitStatus(test.project.repoId, test.commitSha, state, {
-            name: "vizdiff/visual-tests",
+            name: gitlabStatusContext(test.project.key),
             targetUrl: `${APP_URL}/build?id=${test.id}`,
             description:
               status === "approved"

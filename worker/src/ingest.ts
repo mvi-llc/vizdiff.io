@@ -11,6 +11,7 @@ import {
   createSummaryForBuild,
   createMarkdownForBuildResult,
   createSummaryForFailedBuild,
+  gitlabStatusContext,
   uploadTarballKey,
 } from "shared"
 import { Not, In } from "typeorm"
@@ -156,7 +157,9 @@ export async function ingestStorybook(
       gitlabHost,
       state: "running",
       testId: screenshotTestId,
-      name: "vizdiff/visual-tests",
+      // Include the project key so multiple projects on one repo (monorepo) report independent
+      // statuses on the same commit.
+      name: gitlabStatusContext(screenshotTest.project.key),
       description: "Rendering storybook components…",
     })
   }
@@ -423,7 +426,7 @@ export async function ingestStorybook(
               gitlabHost,
               state: "success",
               testId: screenshotTest.id,
-              name: "vizdiff/visual-tests",
+              name: gitlabStatusContext(screenshotTest.project.key),
               description: "No visual changes detected",
             })
           } else {
@@ -510,7 +513,7 @@ export async function ingestStorybook(
         gitlabHost,
         state: "failed",
         testId: screenshotTestId,
-        name: "vizdiff/visual-tests",
+        name: gitlabStatusContext(screenshotTest.project.key),
         description: "Failed to render storybook components",
       })
     }
@@ -549,7 +552,7 @@ export async function ingestStorybook(
           gitlabHost,
           state: "canceled",
           testId: screenshotTestId,
-          name: "vizdiff/visual-tests",
+          name: gitlabStatusContext(screenshotTest.project.key),
           description: "Storybook rendering was cancelled or timed out",
         })
       }
