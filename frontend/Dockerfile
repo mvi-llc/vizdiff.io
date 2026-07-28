@@ -33,7 +33,7 @@ COPY shared ./shared
 COPY frontend ./frontend
 RUN yarn workspace frontend build
 
-FROM nginx:1.27-alpine
+FROM nginx:1.31-alpine
 COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=builder /app/frontend/out /usr/share/nginx/html
 
