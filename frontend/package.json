@@ -35,7 +35,7 @@
     "@types/react-syntax-highlighter": "^15.5.13",
     "axios": "1.18.0",
     "chromatic": "17.5.0",
-    "date-fns": "^4.1.0",
+    "date-fns": "^4.4.0",
     "eslint": "9.39.5",
     "eslint-config-next": "15.3.2",
     "eslint-plugin-storybook": "10.4.4",
