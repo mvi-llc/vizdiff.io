@@ -37,8 +37,12 @@ type CreateProjectBody = {
 
 /**
  * Build the common project-with-stats SELECT. Callers add their own WHERE clause.
+ *
+ * When `projectId` is provided, the windowed screenshot_tests subquery is constrained to that
+ * project. project_id is the PARTITION BY key, so dropping whole partitions cannot change row
+ * numbers (same reasoning as the builds/activity queries in screenshotTests.ts).
  */
-function baseProjectStatsQuery(db: Awaited<ReturnType<typeof Database>>) {
+function baseProjectStatsQuery(db: Awaited<ReturnType<typeof Database>>, projectId?: number) {
   return db
     .getRepository(Project)
     .createQueryBuilder("project")
@@ -47,49 +51,29 @@ function baseProjectStatsQuery(db: Awaited<ReturnType<typeof Database>>) {
         qb
           .select([
             "st.projectId as pid",
-            "MAX(st.id) as sid",
             "MAX(st.createdAt) as screatedAt",
-            "MAX(tc.testcount) as tcount", // Use MAX instead of SUM to get only the latest test count
+            // Distinct test names in the project's latest build (st.rn = 1 leaves one row per
+            // project, so MAX only collapses the GROUP BY). Correlating on that row's st.id makes
+            // this an index lookup into test_results per project instead of a
+            // ROW_NUMBER() window scan over the entire table.
+            "MAX((SELECT COUNT(DISTINCT tr.name) FROM test_results tr WHERE tr.screenshot_test_id = st.id)) as tcount",
             "(SELECT COUNT(DISTINCT st2.build_number) FROM screenshot_tests st2 WHERE st2.project_id = st.projectId AND st2.status IN ('no_changes', 'unapproved', 'approved')) as buildcount",
           ])
-          .from(
-            (subQuery) =>
-              subQuery
-                .select([
-                  "screenshot_tests.id as id",
-                  "screenshot_tests.project_id as projectId",
-                  "screenshot_tests.created_at as createdAt",
-                  "screenshot_tests.build_number as buildNumber",
-                  "ROW_NUMBER() OVER (PARTITION BY screenshot_tests.project_id ORDER BY screenshot_tests.created_at DESC) as rn",
-                ])
-                .from("screenshot_tests", "screenshot_tests")
-                .where("screenshot_tests.status IN ('no_changes', 'unapproved', 'approved')")
-                .orderBy("screenshot_tests.created_at", "DESC"),
-            "st",
-          )
-          .leftJoin(
-            (subQuery) =>
-              subQuery
-                .select([
-                  "tr.screenshotTestId as screenshotTestId",
-                  "COUNT(DISTINCT tr.testName) as testcount",
-                ])
-                .from(
-                  (innerSubQuery) =>
-                    innerSubQuery
-                      .select([
-                        "tr2.screenshot_test_id as screenshotTestId",
-                        "tr2.name as testName",
-                        "ROW_NUMBER() OVER (PARTITION BY tr2.screenshot_test_id, tr2.name ORDER BY tr2.id DESC) as rn",
-                      ])
-                      .from("test_results", "tr2"),
-                  "tr",
-                )
-                .where("tr.rn = 1")
-                .groupBy("tr.screenshotTestId"),
-            "tc",
-            "tc.screenshotTestId = st.id",
-          )
+          .from((subQuery) => {
+            subQuery
+              .select([
+                "screenshot_tests.id as id",
+                "screenshot_tests.project_id as projectId",
+                "screenshot_tests.created_at as createdAt",
+                "ROW_NUMBER() OVER (PARTITION BY screenshot_tests.project_id ORDER BY screenshot_tests.created_at DESC) as rn",
+              ])
+              .from("screenshot_tests", "screenshot_tests")
+              .where("screenshot_tests.status IN ('no_changes', 'unapproved', 'approved')")
+            if (projectId != undefined) {
+              subQuery.andWhere("screenshot_tests.project_id = :projectId", { projectId })
+            }
+            return subQuery.orderBy("screenshot_tests.created_at", "DESC")
+          }, "st")
           .where("st.rn = 1")
           .groupBy("st.projectId"),
       "latest_test",
@@ -118,7 +102,7 @@ async function getProjectWithStats(
   db: Awaited<ReturnType<typeof Database>>,
   projectId: number,
 ): Promise<ProjectWithStats | null> {
-  const projectsWithStats = await baseProjectStatsQuery(db)
+  const projectsWithStats = await baseProjectStatsQuery(db, projectId)
     .where("project.id = :projectId", { projectId })
     .getRawOne<ProjectWithStats>()
 
