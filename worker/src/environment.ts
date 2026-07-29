@@ -98,6 +98,24 @@ export const WORKER_STORY_CONCURRENCY = Math.max(
   parseInt(process.env.WORKER_STORY_CONCURRENCY ?? "1", 10) || 1,
 )
 
+// Baseline-comparison changed/unchanged decision. A story is marked "changed" when BOTH floors
+// are met: at least WORKER_CHANGED_MIN_PIXELS differing pixels AND a diff ratio of at least
+// WORKER_CHANGED_THRESHOLD. The previous behavior was a lone hardcoded 0.1% ratio, which dilutes
+// with screenshot area: the same one-word text change flags on a button-sized story but passes
+// silently on a full-page story (~0.05% of a 1M-pixel screenshot). An absolute pixel floor is
+// size-independent, so the default is 10 pixels with the ratio floor at 0 (rendering is
+// deterministic per worker image, so a handful of pixels is a real change, while <10 tolerates
+// stray single-pixel jitter). Deployments with nondeterministic stories can raise either floor.
+// Neither affects the capture-stabilization loop. Invalid values fall back to the defaults.
+const rawChangedMinPixels = parseInt(process.env.WORKER_CHANGED_MIN_PIXELS ?? "10", 10)
+export const WORKER_CHANGED_MIN_PIXELS =
+  Number.isFinite(rawChangedMinPixels) && rawChangedMinPixels >= 0 ? rawChangedMinPixels : 10
+const rawChangedThreshold = parseFloat(process.env.WORKER_CHANGED_THRESHOLD ?? "0")
+export const WORKER_CHANGED_THRESHOLD =
+  Number.isFinite(rawChangedThreshold) && rawChangedThreshold >= 0 && rawChangedThreshold <= 1
+    ? rawChangedThreshold
+    : 0
+
 // Opt-in software (SwiftShader) WebGL for story rendering (issue #447). The worker image ships
 // SwiftShader (Alpine's chromium-swiftshader package), but WebGL stays off by default because
 // SwiftShader is in-process software rasterization driven by untrusted story content — a larger

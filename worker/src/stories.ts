@@ -13,7 +13,11 @@ import {
 import type { Repository } from "typeorm"
 import type { Browser } from "webdriverio"
 
-import { MAX_STORY_IDENTIFIER_LENGTH } from "./environment"
+import {
+  MAX_STORY_IDENTIFIER_LENGTH,
+  WORKER_CHANGED_MIN_PIXELS,
+  WORKER_CHANGED_THRESHOLD,
+} from "./environment"
 import { diffImages, diffImagesNoMask } from "./images"
 import { log } from "./log"
 import type { SetViewportOptions, Story, StorybookWindow } from "./types"
@@ -491,8 +495,15 @@ export async function processStory({
           const diffRes = diffImages(newPng, baselinePng)
           diffRatio = diffRes.diffRatio
 
-          // Default threshold of 0.1% difference
-          changeStatus = diffRatio < 0.001 ? "unchanged" : "changed"
+          // Changed when both floors are met: an absolute pixel count (size-
+          // independent, so small text changes flag on full-page stories too)
+          // and a diff ratio (0 by default; a raisable escape hatch for
+          // deployments with nondeterministic stories).
+          const meetsFloors =
+            diffRes.numDiffPixels > 0 &&
+            diffRes.numDiffPixels >= WORKER_CHANGED_MIN_PIXELS &&
+            diffRatio >= WORKER_CHANGED_THRESHOLD
+          changeStatus = meetsFloors ? "changed" : "unchanged"
           logChild.debug({ diffRatio, changeStatus }, `Diff ratio for story ${storyId}`)
 
           // Write and upload the diff image

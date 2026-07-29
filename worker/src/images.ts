@@ -24,7 +24,7 @@ function createPaddedData(
 export function diffImages(
   newImage: PNG,
   baselineImage: PNG,
-): { diffRatio: number; diffMask: PNG } {
+): { diffRatio: number; numDiffPixels: number; diffMask: PNG } {
   if (newImage.width !== baselineImage.width) {
     throw new Error(
       `Image widths must match for comparison: ${newImage.width} vs ${baselineImage.width}`,
@@ -62,7 +62,7 @@ export function diffImages(
   // Calculate ratio based on the total pixels of the larger dimension area
   const diffRatio = numDiffPixels / (width * maxHeight)
 
-  return { diffRatio, diffMask: diffPng }
+  return { diffRatio, numDiffPixels, diffMask: diffPng }
 }
 
 export function diffImagesNoMask(newImage: PNG, baselineImage: PNG): number {
