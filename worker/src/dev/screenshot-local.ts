@@ -14,6 +14,7 @@ import {
   getStorybookStories,
   navigateToStorybook,
 } from "../stories"
+import { installStoryRenderStateHook } from "../storyReady"
 import type { Story } from "../types"
 import { nodeCompatTransformRequest } from "../wdio"
 
@@ -57,6 +58,9 @@ async function main(options: CliOptions) {
       hostname: "localhost",
       capabilities: {
         browserName: "chrome",
+        // Enable WebDriver BiDi so the story render-state hook (issue #458) can be
+        // installed via `addInitScript`, matching the real ingest path.
+        webSocketUrl: true,
         "goog:chromeOptions": {
           // Same launch args as the real ingest path (safeguards.ts), including
           // opt-in WebGL and extra args, so local screenshots match production
@@ -71,6 +75,10 @@ async function main(options: CliOptions) {
       transformRequest: nodeCompatTransformRequest,
     })
     log.info("WebDriverIO initialized.")
+
+    // Record Storybook's story-render lifecycle in the page (issue #458) so capture waits for
+    // render completion, matching the real ingest path.
+    await installStoryRenderStateHook(browser)
 
     // Set initial viewport
     await browser.setViewport({ width: 1200, height: 900, devicePixelRatio: 1 })
@@ -116,7 +124,7 @@ async function main(options: CliOptions) {
 
       try {
         // Call the refactored screenshot function
-        await captureStableScreenshot(browser, storyId, viewport, port, tempDir, outputFilePath)
+        await captureStableScreenshot(browser, story, viewport, port, tempDir, outputFilePath)
 
         log.info(`Screenshot saved to ${outputFilePath}`)
         successCount++
