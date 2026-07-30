@@ -42,12 +42,7 @@ import {
 } from "./ingest"
 import { log } from "./log"
 import { captureStoryWithRetry } from "./stories"
-import {
-  DependencyNotReadyError,
-  NonRetryableTaskError,
-  fetchTask,
-  isPermanentS3FetchError,
-} from "./tasks"
+import { DependencyNotReadyError, NonRetryableTaskError, isPermanentS3FetchError } from "./tasks"
 import { BuildTimeoutError } from "./timeout"
 import { postBuildFailedStatus } from "./vcsStatus"
 import {
@@ -120,15 +115,7 @@ vi.mock("./tasks", async (importOriginal) => {
   const actual: object = await importOriginal()
   return {
     ...actual,
-    latestTaskQueueId: vi.fn().mockResolvedValue(undefined),
-    fetchTask: vi.fn().mockResolvedValue({
-      task_type: "ingest_storybook",
-      screenshot_test_id: 123,
-      data: {
-        projectId: "test-project",
-        uploadId: "test-upload",
-      },
-    }),
+    claimNextTask: vi.fn().mockResolvedValue(undefined),
     deleteTask: vi.fn().mockResolvedValue(undefined),
     releaseLock: vi.fn().mockResolvedValue(undefined),
   }
@@ -1068,12 +1055,29 @@ describe("worker", () => {
     it("fires from the dedicated sweep timer even while a task is in flight", async () => {
       vi.useFakeTimers()
       try {
-        // Occupy the worker: fetchTask hangs, so currentTaskId stays set for the duration.
-        vi.mocked(fetchTask).mockImplementationOnce(() => new Promise(() => undefined))
-        void startTask(999_451)
-
-        const { getMany } = mockDatabaseForSweep([], [])
+        // Occupy the worker with an already-claimed task whose processing hangs (the baseline
+        // dependency check never resolves), so currentTaskId stays set for the duration. The
+        // same Database mock serves the sweep's query-builder reads with no stuck builds.
+        /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-return */
+        const getMany = vi.fn().mockResolvedValue([])
+        const queryBuilder: any = { getMany }
+        queryBuilder.where = vi.fn().mockReturnValue(queryBuilder)
+        queryBuilder.andWhere = vi.fn().mockReturnValue(queryBuilder)
+        vi.mocked(Database).mockResolvedValue({
+          getRepository: () => ({
+            createQueryBuilder: () => queryBuilder,
+            findOneBy: vi.fn(() => new Promise(() => undefined)),
+          }),
+        } as any)
+        /* eslint-enable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-return */
         mockPoolClient()
+        void startTask({
+          id: 999_451,
+          task_type: "ingest_storybook",
+          screenshot_test_id: 123,
+          data: { projectId: "test-project", uploadId: "test-upload" },
+          attempts: 1,
+        })
 
         const timer = startStuckBuildSweepTimer()
         try {

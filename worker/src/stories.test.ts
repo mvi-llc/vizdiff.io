@@ -28,7 +28,16 @@ import { createMockBrowser, defaultMockPageState } from "./testing/mockBrowser"
 
 // Mock function declarations for all external dependencies
 const mockSend = vi.fn()
+// Since issue #456 per-story results are persisted via `upsert` (idempotent on the unique
+// (screenshot_test_id, story_id) key) instead of `save`; the mock mirrors TypeORM's
+// InsertResult shape so the entity id copy-back in upsertTestResult() works.
 const mockTestResultSave = vi.fn()
+const upsertResult = (data: TestResult) => ({
+  // `id` is unset on a freshly-constructed entity despite its non-optional type.
+  identifiers: [{ id: (data.id as number | undefined) ?? 1 }],
+  generatedMaps: [],
+  raw: [],
+})
 
 /**
  * Mock S3 client for testing file uploads/downloads
@@ -336,7 +345,9 @@ describe("stories", () => {
       port: 9009,
       s3Client: new S3Client({}),
       testResultTable: {
-        save: mockTestResultSave.mockImplementation(async (data: TestResult) => data),
+        upsert: mockTestResultSave.mockImplementation(async (data: TestResult) =>
+          upsertResult(data),
+        ),
       } as unknown as Repository<TestResult>,
       browser: mockBrowser,
     })
@@ -413,7 +424,9 @@ describe("stories", () => {
       port: 9009,
       s3Client: new S3Client({}),
       testResultTable: {
-        save: mockTestResultSave.mockImplementation(async (data: TestResult) => data),
+        upsert: mockTestResultSave.mockImplementation(async (data: TestResult) =>
+          upsertResult(data),
+        ),
       } as unknown as Repository<TestResult>,
       browser: mockBrowser,
     })
@@ -459,7 +472,9 @@ describe("stories", () => {
       port: 9009,
       s3Client: new S3Client({}),
       testResultTable: {
-        save: mockTestResultSave.mockImplementation(async (data: TestResult) => data),
+        upsert: mockTestResultSave.mockImplementation(async (data: TestResult) =>
+          upsertResult(data),
+        ),
       } as unknown as Repository<TestResult>,
       browser: mockBrowser,
     })
@@ -493,7 +508,9 @@ describe("stories", () => {
       port: 9009,
       s3Client: new S3Client({}),
       testResultTable: {
-        save: mockTestResultSave.mockImplementation(async (data: TestResult) => data),
+        upsert: mockTestResultSave.mockImplementation(async (data: TestResult) =>
+          upsertResult(data),
+        ),
       } as unknown as Repository<TestResult>,
       browser: mockBrowser,
     })
@@ -528,7 +545,9 @@ describe("stories", () => {
         port: 9009,
         s3Client: new S3Client({}),
         testResultTable: {
-          save: mockTestResultSave.mockImplementation(async (data: TestResult) => data),
+          upsert: mockTestResultSave.mockImplementation(async (data: TestResult) =>
+            upsertResult(data),
+          ),
         } as unknown as Repository<TestResult>,
         browser: mockBrowser,
       }),
@@ -566,7 +585,9 @@ describe("stories", () => {
       port: 9009,
       s3Client: new S3Client({}),
       testResultTable: {
-        save: mockTestResultSave.mockImplementation(async (data: TestResult) => data),
+        upsert: mockTestResultSave.mockImplementation(async (data: TestResult) =>
+          upsertResult(data),
+        ),
       } as unknown as Repository<TestResult>,
       browser: mockBrowser,
     })
@@ -596,7 +617,9 @@ describe("stories", () => {
         port: 9009,
         s3Client: new S3Client({}),
         testResultTable: {
-          save: mockTestResultSave.mockImplementation(async (data: TestResult) => data),
+          upsert: mockTestResultSave.mockImplementation(async (data: TestResult) =>
+            upsertResult(data),
+          ),
         } as unknown as Repository<TestResult>,
         browser: mockBrowser,
       }
@@ -652,7 +675,9 @@ describe("stories", () => {
         port: 9009,
         s3Client: new S3Client({}),
         testResultTable: {
-          save: mockTestResultSave.mockImplementation(async (data: TestResult) => data),
+          upsert: mockTestResultSave.mockImplementation(async (data: TestResult) =>
+            upsertResult(data),
+          ),
         } as unknown as Repository<TestResult>,
         browser: mockBrowser,
       })
@@ -675,7 +700,9 @@ describe("stories", () => {
         port: 9009,
         s3Client: new S3Client({}),
         testResultTable: {
-          save: mockTestResultSave.mockImplementation(async (data: TestResult) => data),
+          upsert: mockTestResultSave.mockImplementation(async (data: TestResult) =>
+            upsertResult(data),
+          ),
         } as unknown as Repository<TestResult>,
         browser: mockBrowser,
       })
@@ -731,7 +758,9 @@ describe("stories", () => {
       port: 9009,
       s3Client: new S3Client({}),
       testResultTable: {
-        save: mockTestResultSave.mockImplementation(async (data: TestResult) => data),
+        upsert: mockTestResultSave.mockImplementation(async (data: TestResult) =>
+          upsertResult(data),
+        ),
       } as unknown as Repository<TestResult>,
       browser: mockBrowser,
     })
@@ -788,9 +817,9 @@ describe("stories", () => {
         port: 9009,
         s3Client: new S3Client({}),
         testResultTable: {
-          save: mockTestResultSave.mockImplementation(async (data: TestResult) => {
+          upsert: mockTestResultSave.mockImplementation(async (data: TestResult) => {
             saved.push(data)
-            return data
+            return upsertResult(data)
           }),
         } as unknown as Repository<TestResult>,
         pool,
@@ -928,7 +957,9 @@ describe("stories", () => {
         port: 9009,
         s3Client: new S3Client({}),
         testResultTable: {
-          save: mockTestResultSave.mockImplementation(async (data: TestResult) => data),
+          upsert: mockTestResultSave.mockImplementation(async (data: TestResult) =>
+            upsertResult(data),
+          ),
         } as unknown as Repository<TestResult>,
         browser: mockBrowser,
       }

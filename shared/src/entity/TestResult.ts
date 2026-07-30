@@ -14,6 +14,11 @@ import type { TestResultErrorKind, TestResultStatus } from "./types"
 
 @Entity("test_results")
 @Index("IDX_test_results_screenshot_test_id", ["screenshotTest.id"])
+// One result row per story per build (issue #456, cross-worker sharding groundwork): shard/story
+// retries UPSERT on this key instead of inserting duplicate rows. Name and column order must
+// match the migration (AddShardingSupport) exactly so `synchronize: true` (tests) and migrations
+// produce identical schemas.
+@Index("IDX_test_results_test_story", ["screenshotTest.id", "storyId"], { unique: true })
 export class TestResult {
   @PrimaryGeneratedColumn()
   id!: number

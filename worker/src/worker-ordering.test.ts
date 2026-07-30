@@ -1,19 +1,21 @@
 /**
- * Issue #125 — dependent task ordering.
+ * Task claim ordering and deferral (issues #125, #456).
  *
- * When two commits A (older, lower task-queue id) then B (newer, higher id) land
- * on the same branch and B's render task depends on A's baseline, the worker must
- * process A *before* B so that B sees a populated baseline instead of an empty
- * one.
+ * Since the sharding-groundwork claim rework (issue #456) the worker claims the OLDEST eligible
+ * task (`ORDER BY id ASC` + SKIP LOCKED in claimNextTask), so when two commits A (older, lower
+ * task-queue id) then B (newer, higher id) land on the same branch and B's render task depends
+ * on A's baseline, A is naturally claimed and processed before B.
  *
- * This suite drives the *real* `pollForNewTasks` loop (the sibling worker test
- * file stubs it out) against a simulated task queue and asserts the processing
- * order. It reproduces the exact regression called out in review: previously the
- * worker re-polled exactly when the deferral window expired, so the deferred
- * (newer, higher-id) task B was no longer excluded and descending-id selection
- * re-picked B instead of its dependency A. The fix re-polls strictly *before* the
- * exclusion window expires (DEFER_REPOLL_MS < DEFER_INTERVAL_MS), so A is the
- * only eligible candidate at the re-poll and runs first.
+ * The deferral machinery (issue #125) still matters for out-of-order enqueues — a dependency
+ * that got a HIGHER queue id than its dependent: the dependent is claimed first, defers with
+ * DependencyNotReadyError, and is excluded from selection until its backoff expires so the
+ * dependency is the only eligible candidate at the re-poll. The re-poll fires strictly *before*
+ * the exclusion window expires (DEFER_REPOLL_MS < DEFER_INTERVAL_MS); without that gap the
+ * deferred (lower-id) task would no longer be excluded at the re-poll and ascending-id selection
+ * would re-claim it instead of its dependency.
+ *
+ * This suite drives the *real* `pollForNewTasks` loop (the sibling worker test file stubs it
+ * out) against a simulated task queue and asserts the processing order.
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -31,18 +33,24 @@ const isBaselineBuildPending = vi.fn(async (_screenshotTestId: number) => false)
 // Screenshot-test ids whose ingest should fail (to exercise the retry/backoff/give-up paths).
 const failingTestIds = new Set<number>()
 
-// Mock the queue *selection* layer (these helpers are imported by worker.ts from
-// ./tasks). `latestTaskQueueId` returns the newest (highest id) task NOT in the
-// caller's exclude set — mirroring production `ORDER BY id DESC` + `id NOT IN`.
+// Mock the queue *claim* layer (imported by worker.ts from ./tasks). `claimNextTask` returns the
+// OLDEST (lowest id) task NOT in the caller's exclude list — mirroring production
+// `ORDER BY id ASC` + `NOT (id = ANY(...))`. Locking is not modeled: this suite runs a single
+// worker whose `currentTaskId`/`claimInFlight` guards already serialize claims.
 vi.mock("./tasks", async (importOriginal) => {
   const actual: object = await importOriginal()
   return {
     ...actual,
-    latestTaskQueueId: vi.fn(async (excludeIds: ReadonlySet<number> = new Set()) => {
-      const ids = [...queue.keys()].filter((id) => !excludeIds.has(id)).sort((a, b) => b - a)
-      return ids.length > 0 ? ids[0] : undefined
+    claimNextTask: vi.fn(async (excludeIds: readonly number[] = []) => {
+      const exclude = new Set(excludeIds)
+      const ids = [...queue.keys()].filter((id) => !exclude.has(id)).sort((a, b) => a - b)
+      const id = ids[0]
+      if (id == undefined) {
+        return undefined
+      }
+      const task = queue.get(id)
+      return task ? { id, attempts: 1, ...task } : undefined
     }),
-    fetchTask: vi.fn(async (id: number) => queue.get(id)),
   }
 })
 
@@ -139,7 +147,7 @@ async function pump(done: () => boolean, stepMs: number, maxSteps = 50): Promise
   }
 }
 
-describe("dependent task ordering — worker processes A before B (#125)", () => {
+describe("dependent task ordering — worker processes A before B (#125, #456)", () => {
   beforeEach(() => {
     vi.useFakeTimers()
     queue.clear()
@@ -154,10 +162,10 @@ describe("dependent task ordering — worker processes A before B (#125)", () =>
     vi.useRealTimers()
   })
 
-  it("processes the older dependency A before the newer dependent B; B never runs against an empty baseline", async () => {
+  it("claims the older dependency A before the newer dependent B (oldest-first)", async () => {
     // Both queued: A (older render of base_commit_sha, still pending) and B
-    // (newer, depends on A). B is at a HIGHER id, so naive descending-id
-    // selection would pick B first.
+    // (newer, depends on A). Oldest-first claiming picks A directly — no
+    // deferral round-trip is needed for the common in-order enqueue.
     queue.set(TASK_A_ID, {
       task_type: "ingest_storybook",
       screenshot_test_id: TEST_A_ID,
@@ -179,24 +187,59 @@ describe("dependent task ordering — worker processes A before B (#125)", () =>
     })
 
     pollForNewTasks()
-    // Advance in 1s steps so we cross the deferral re-poll (2s) and the
-    // exclusion-window expiry (5s) boundaries in order.
     await pump(() => processedOrder.includes(TEST_A_ID) && processedOrder.includes(TEST_B_ID), 1000)
 
-    // A must be processed strictly before B...
-    expect(processedOrder.indexOf(TEST_A_ID)).toBeGreaterThanOrEqual(0)
-    expect(processedOrder.indexOf(TEST_B_ID)).toBeGreaterThanOrEqual(0)
-    expect(processedOrder.indexOf(TEST_A_ID)).toBeLessThan(processedOrder.indexOf(TEST_B_ID))
-
-    // ...and the very first task the worker actually ran is A, not B. This is the
-    // crux of the regression: without the fix the worker re-selects B at the
-    // re-poll and runs it first (against an empty baseline).
-    expect(processedOrder[0]).toBe(TEST_A_ID)
-
-    // By the time B ran, A had already been removed from the queue, so its
-    // baseline was ready — B did not run against an empty baseline.
+    // The very first task the worker ran is A (the oldest), then B — and by the
+    // time B ran, A was gone from the queue, so B's baseline was populated (its
+    // baseline check returned false and no deferral round-trip happened).
+    expect(processedOrder).toEqual([TEST_A_ID, TEST_B_ID])
     expect(queue.has(TASK_A_ID)).toBe(false)
     expect(queue.has(TASK_B_ID)).toBe(false)
+  })
+
+  it("defers an out-of-order dependent (lower id) so its dependency (higher id) runs first", async () => {
+    // Out-of-order enqueue: the dependent got the LOWER queue id and its baseline
+    // dependency the HIGHER one, so ascending-id selection claims the dependent
+    // first. It must defer (DependencyNotReadyError), stay excluded through the
+    // re-poll (DEFER_REPOLL_MS < DEFER_INTERVAL_MS), and let the dependency run.
+    const DEPENDENT_TASK_ID = 100
+    const DEPENDENT_TEST_ID = 1000
+    const DEPENDENCY_TASK_ID = 200
+    const DEPENDENCY_TEST_ID = 2000
+
+    queue.set(DEPENDENT_TASK_ID, {
+      task_type: "ingest_storybook",
+      screenshot_test_id: DEPENDENT_TEST_ID,
+      data: { projectId: "p", uploadId: "upload-dependent" },
+    })
+    queue.set(DEPENDENCY_TASK_ID, {
+      task_type: "ingest_storybook",
+      screenshot_test_id: DEPENDENCY_TEST_ID,
+      data: { projectId: "p", uploadId: "upload-dependency" },
+    })
+
+    // The dependent's baseline is in flight until the dependency task is done.
+    isBaselineBuildPending.mockImplementation(async (screenshotTestId: number) => {
+      if (screenshotTestId === DEPENDENT_TEST_ID) {
+        return queue.has(DEPENDENCY_TASK_ID)
+      }
+      return false
+    })
+
+    pollForNewTasks()
+    // Advance in 1s steps so we cross the deferral re-poll (2s) and the
+    // exclusion-window expiry (5s) boundaries in order.
+    await pump(
+      () =>
+        processedOrder.includes(DEPENDENT_TEST_ID) && processedOrder.includes(DEPENDENCY_TEST_ID),
+      1000,
+    )
+
+    // The dependency ran first even though its queue id is higher...
+    expect(processedOrder).toEqual([DEPENDENCY_TEST_ID, DEPENDENT_TEST_ID])
+    // ...and both tasks were completed and removed from the queue.
+    expect(queue.has(DEPENDENT_TASK_ID)).toBe(false)
+    expect(queue.has(DEPENDENCY_TASK_ID)).toBe(false)
   })
 
   it("falls back to processing B after MAX_DEFER_COUNT if its baseline never finishes (livelock guard)", async () => {
@@ -236,35 +279,35 @@ describe("failure backoff and give-up", () => {
     vi.useRealTimers()
   })
 
-  it("does not let a failing newest task starve older runnable tasks", async () => {
-    // The newest task (higher id) always fails; the older task must still run
-    // while the failing one sits in its backoff window. Before the fix,
-    // latestTaskQueueId() only ever returned the newest id, so the poll just
-    // slept and the older task was never considered.
-    const OLD_TASK_ID = 300
-    const OLD_TEST_ID = 3000
-    const FAILING_TASK_ID = 400
-    const FAILING_TEST_ID = 4000
+  it("does not let a failing oldest task starve newer runnable tasks", async () => {
+    // The oldest task (lower id) always fails; the newer task must still run
+    // while the failing one sits in its backoff window. Under oldest-first
+    // claiming this exclusion is what prevents the failing task from being
+    // re-claimed on every poll and starving everything behind it.
+    const FAILING_TASK_ID = 300
+    const FAILING_TEST_ID = 3000
+    const NEW_TASK_ID = 400
+    const NEW_TEST_ID = 4000
 
-    queue.set(OLD_TASK_ID, {
-      task_type: "ingest_storybook",
-      screenshot_test_id: OLD_TEST_ID,
-      data: { projectId: "p", uploadId: "upload-old" },
-    })
     queue.set(FAILING_TASK_ID, {
       task_type: "ingest_storybook",
       screenshot_test_id: FAILING_TEST_ID,
       data: { projectId: "p", uploadId: "upload-failing" },
     })
+    queue.set(NEW_TASK_ID, {
+      task_type: "ingest_storybook",
+      screenshot_test_id: NEW_TEST_ID,
+      data: { projectId: "p", uploadId: "upload-new" },
+    })
     failingTestIds.add(FAILING_TEST_ID)
 
     pollForNewTasks()
-    // First poll picks the failing (newest) task; the next poll (10s later) must
-    // exclude it (its first backoff window is 30s) and pick the older task.
-    await pump(() => processedOrder.includes(OLD_TEST_ID), 10_000)
+    // First poll claims the failing (oldest) task; the next poll (10s later) must
+    // exclude it (its first backoff window is 30s) and claim the newer task.
+    await pump(() => processedOrder.includes(NEW_TEST_ID), 10_000)
 
-    expect(processedOrder).toContain(OLD_TEST_ID)
-    expect(queue.has(OLD_TASK_ID)).toBe(false)
+    expect(processedOrder).toContain(NEW_TEST_ID)
+    expect(queue.has(NEW_TASK_ID)).toBe(false)
     // The failing task is still queued (it is in backoff, not given up yet).
     expect(queue.has(FAILING_TASK_ID)).toBe(true)
   })
