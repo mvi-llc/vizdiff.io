@@ -31,13 +31,28 @@ import type { DataSourceOptions, Repository, DataSource } from "typeorm"
 import { expect, describe, it, afterAll, beforeEach, vi, afterEach } from "vitest"
 import { remote } from "webdriverio"
 
-import { Database } from "./database"
-import { ingestStorybook, isBaselineBuildPending } from "./ingest"
+import { Database, DatabasePool } from "./database"
+import { WORKER_ID } from "./identity"
+import { failBuildBeforeExit, ingestStorybook, isBaselineBuildPending } from "./ingest"
 import { log } from "./log"
 import { processStory } from "./stories"
-import { DependencyNotReadyError, NonRetryableTaskError, isPermanentS3FetchError } from "./tasks"
+import {
+  DependencyNotReadyError,
+  NonRetryableTaskError,
+  fetchTask,
+  isPermanentS3FetchError,
+} from "./tasks"
 import { BuildTimeoutError } from "./timeout"
-import { processTask, shutdown, sweepStuckBuilds } from "./worker"
+import { postBuildFailedStatus } from "./vcsStatus"
+import {
+  handleShutdownSignal,
+  processTask,
+  reclaimOrphanedBuilds,
+  shutdown,
+  startStuckBuildSweepTimer,
+  startTask,
+  sweepStuckBuilds,
+} from "./worker"
 
 // Mock function declarations - these track calls to key operations
 const mockSend = vi.fn()
@@ -78,7 +93,16 @@ vi.mock("./worker", async (importOriginal) => {
     ...actual,
     main: vi.fn(),
     pollForNewTasks: vi.fn(),
-    sweepStuckBuilds: vi.fn().mockResolvedValue(0),
+  }
+})
+
+// Stub the best-effort VCS status helper (issue #451) so tests can assert exactly when a failed
+// status is posted, without touching the GitHub/GitLab clients. parseBuildCheckData stays real.
+vi.mock("./vcsStatus", async (importOriginal) => {
+  const actual: object = await importOriginal()
+  return {
+    ...actual,
+    postBuildFailedStatus: vi.fn().mockResolvedValue(undefined),
   }
 })
 
@@ -123,14 +147,11 @@ vi.mock("./database", () => ({
     options: { type: "postgres", database: "test" } as DataSourceOptions,
     isInitialized: true,
   })),
-  DatabasePool: vi.fn(() => ({
-    connect: vi.fn().mockResolvedValue({
-      query: vi.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
-      release: vi.fn(),
-    }),
+  DatabasePool: vi.fn(async () => ({
     query: vi.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
-    end: vi.fn().mockResolvedValue(undefined),
+    release: vi.fn(),
   })),
+  closeDatabasePool: vi.fn().mockResolvedValue(undefined),
 }))
 
 // Mock browser shape: a bag of vi.fn() stubs plus capabilities. The index signature lets tests
@@ -209,11 +230,17 @@ vi.mock("./extract", async (importOriginal) => {
   }
 })
 
-// Mock environment so the build timeout (and the post-abort grace period) are short enough to
-// exercise in tests without slowing the suite. All other exports keep their real values.
+// Mock environment so the build timeout (and the post-abort grace period and fatal failsafe
+// bound) are short enough to exercise in tests without slowing the suite. All other exports keep
+// their real values.
 vi.mock("./environment", async (importOriginal) => {
   const actual: object = await importOriginal()
-  return { ...actual, BUILD_TIMEOUT_MS: 50, BUILD_ABORT_GRACE_MS: 500 }
+  return {
+    ...actual,
+    BUILD_TIMEOUT_MS: 50,
+    BUILD_ABORT_GRACE_MS: 500,
+    WORKER_FATAL_FAILSAFE_TIMEOUT_MS: 300,
+  }
 })
 
 // Mock story processing module
@@ -811,124 +838,399 @@ describe("worker", () => {
     })
   })
 
-  // Add a new test case for sweepStuckBuilds
+  // --- Build lifecycle hardening (issue #451) --------------------------------------------------
+
+  // A controllable pg client mock for the raw-SQL paths (DatabasePool()). `handler` inspects the
+  // SQL text and returns a result; unmatched queries return an empty result.
+  type QueryResult = { rows: unknown[]; rowCount: number }
+  type QueryHandler = (sql: string, params: unknown[]) => QueryResult | undefined
+  function mockPoolClient(handler?: QueryHandler) {
+    const query = vi.fn(async (sql: string, params: unknown[] = []): Promise<QueryResult> => {
+      return handler?.(sql, params) ?? { rows: [], rowCount: 0 }
+    })
+    const client = { query, release: vi.fn() }
+    vi.mocked(DatabasePool).mockResolvedValue(
+      client as unknown as Awaited<ReturnType<typeof DatabasePool>>,
+    )
+    return client
+  }
+
+  // Find the calls to `client.query` whose SQL matches `pattern`.
+  function queriesMatching(client: { query: ReturnType<typeof vi.fn> }, pattern: RegExp) {
+    return client.query.mock.calls.filter(([sql]) => pattern.test(sql as string))
+  }
+
+  // Database mock whose ScreenshotTest repository returns the given stuck builds from the two
+  // query-builder passes (running, then pending) and `entity` from findOneBy (used to load the
+  // build with eager relations for the VCS status post).
+  /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-return */
+  function mockDatabaseForSweep(
+    stuckRunning: any[],
+    stuckPending: any[],
+    entity: any = mockScreenshotTest,
+  ) {
+    const getMany = vi
+      .fn()
+      .mockResolvedValueOnce(stuckRunning)
+      .mockResolvedValueOnce(stuckPending)
+      .mockResolvedValue([])
+    const andWhere = vi.fn()
+    const findOneBy = vi.fn().mockResolvedValue(entity)
+    const queryBuilder: any = { getMany }
+    queryBuilder.where = vi.fn().mockReturnValue(queryBuilder)
+    andWhere.mockReturnValue(queryBuilder)
+    queryBuilder.andWhere = andWhere
+    vi.mocked(Database).mockResolvedValue({
+      getRepository: () => ({
+        createQueryBuilder: () => queryBuilder,
+        findOneBy,
+      }),
+    } as any)
+    return { getMany, andWhere, findOneBy }
+  }
+  /* eslint-enable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-return */
+
   describe("sweepStuckBuilds", () => {
-    // These mocks are explicitly typed with any to avoid TypeScript errors
-    // when mocking complex database interactions for tests
-    /* eslint-disable @typescript-eslint/no-explicit-any */
-    let mockGetMany: any
-    let mockSave: any
-    /* eslint-enable @typescript-eslint/no-explicit-any */
+    const staleDate = new Date(Date.now() - 3 * 60 * 60 * 1000)
 
-    beforeEach(async () => {
-      // Clear mocks
-      vi.clearAllMocks()
+    it("fails stuck builds via a conditional UPDATE, deletes their queue rows, and posts the VCS status once each", async () => {
+      const stuckRunningBuild = { id: 1, status: "running", updatedAt: staleDate }
+      const stuckPendingBuild = { id: 2, status: "pending", updatedAt: staleDate }
+      mockDatabaseForSweep([stuckRunningBuild], [stuckPendingBuild])
 
-      // Override the mock implementation for these tests
-      // We're not testing the mock, we're testing the actual implementation
-
-      vi.mocked(sweepStuckBuilds).mockImplementation(async () => {
-        // Get stuck running builds
-        const stuckRunningBuilds = await mockGetMany()
-
-        // Get stuck pending builds
-        const stuckPendingBuilds = await mockGetMany()
-
-        // Update status of stuck builds
-        const allStuckBuilds = [...stuckRunningBuilds, ...stuckPendingBuilds]
-        for (const build of allStuckBuilds) {
-          build.status = "failed"
-          await mockSave(build)
+      const gitlabCheckData = { projectId: 7, commitSha: "sha", gitlabHost: "https://gitlab.com" }
+      const client = mockPoolClient((sql) => {
+        if (sql.includes("UPDATE screenshot_tests")) {
+          return { rows: [{ id: 1 }], rowCount: 1 }
         }
-
-        return allStuckBuilds.length
+        if (sql.includes("DELETE FROM task_queue")) {
+          return { rows: [{ data: { gitlabCheckData } }], rowCount: 1 }
+        }
+        return undefined
       })
 
-      // Create mocks we can control in tests
-      mockGetMany = vi.fn()
-      mockSave = vi.fn()
+      const count = await sweepStuckBuilds()
+      expect(count).toBe(2)
 
-      // Mock the database with a structure that matches our usage
+      // Conditional flip: the observed status is part of the WHERE clause.
+      const updates = queriesMatching(client, /UPDATE screenshot_tests/)
+      expect(updates).toHaveLength(2)
+      expect(updates[0]![0]).toMatch(/WHERE id = \$1 AND status = \$2/)
+      expect(updates[0]![0]).toMatch(/RETURNING id/)
+      expect(updates[0]![1]).toEqual([1, "running"])
+      expect(updates[1]![1]).toEqual([2, "pending"])
+
+      // Queue rows are removed for each swept build, salvaging the stored check data.
+      const deletes = queriesMatching(client, /DELETE FROM task_queue/)
+      expect(deletes).toHaveLength(2)
+      expect(deletes[0]![1]).toEqual([1])
+      expect(deletes[1]![1]).toEqual([2])
+
+      // One VCS status post per swept build, carrying the salvaged check data.
+      expect(postBuildFailedStatus).toHaveBeenCalledTimes(2)
+      expect(postBuildFailedStatus).toHaveBeenCalledWith(
+        mockScreenshotTest,
+        expect.stringContaining("stuck"),
+        expect.objectContaining({ gitlabCheckData }),
+      )
+    })
+
+    it("uses COALESCE(last_progress_at, updated_at) for the running-stuck predicate", async () => {
+      const { andWhere } = mockDatabaseForSweep([], [])
+      mockPoolClient()
+
+      await sweepStuckBuilds()
+
+      expect(andWhere).toHaveBeenCalledWith(
+        expect.stringContaining("COALESCE(test.last_progress_at, test.updated_at)"),
+        expect.objectContaining({ minutes: expect.any(Number) }),
+      )
+    })
+
+    it("skips queue cleanup and the VCS post when the conditional UPDATE returns no row (concurrent sweeper won)", async () => {
+      const stuckRunningBuild = { id: 1, status: "running", updatedAt: staleDate }
+      mockDatabaseForSweep([stuckRunningBuild], [])
+
+      // Another sweeper already flipped the build: the conditional UPDATE matches nothing.
+      const client = mockPoolClient(() => ({ rows: [], rowCount: 0 }))
+
+      const count = await sweepStuckBuilds()
+
+      expect(count).toBe(0)
+      expect(queriesMatching(client, /DELETE FROM task_queue/)).toHaveLength(0)
+      expect(postBuildFailedStatus).not.toHaveBeenCalled()
+    })
+
+    it("does nothing when no builds are stuck", async () => {
+      mockDatabaseForSweep([], [])
+      const client = mockPoolClient()
+
+      const count = await sweepStuckBuilds()
+
+      expect(count).toBe(0)
+      expect(queriesMatching(client, /UPDATE screenshot_tests/)).toHaveLength(0)
+      expect(postBuildFailedStatus).not.toHaveBeenCalled()
+    })
+
+    it("propagates database errors", async () => {
+      const originalError = log.error
+      log.error = vi.fn()
       /* eslint-disable @typescript-eslint/no-explicit-any */
       vi.mocked(Database).mockResolvedValue({
         getRepository: () => ({
           createQueryBuilder: () => ({
-            where: () => ({
-              andWhere: () => ({
-                getMany: mockGetMany,
-              }),
-            }),
+            where: vi.fn().mockReturnThis(),
+            andWhere: vi.fn().mockReturnThis(),
+            getMany: vi.fn().mockRejectedValue(new Error("Database error")),
           }),
-          save: mockSave,
         }),
       } as any)
       /* eslint-enable @typescript-eslint/no-explicit-any */
-    })
 
-    it("should update stuck builds to failed status", async () => {
-      // Setup mock data
-      const threeHoursAgo = new Date()
-      threeHoursAgo.setHours(threeHoursAgo.getHours() - 3)
-
-      const stuckRunningBuild = {
-        id: 1,
-        status: "running",
-        updatedAt: threeHoursAgo,
-      }
-
-      const stuckPendingBuild = {
-        id: 2,
-        status: "pending",
-        updatedAt: threeHoursAgo,
-      }
-
-      // Mock responses for running and pending builds
-
-      mockGetMany.mockResolvedValueOnce([stuckRunningBuild])
-      mockGetMany.mockResolvedValueOnce([stuckPendingBuild])
-
-      // Run the function
-      const count = await sweepStuckBuilds()
-
-      // Verify the results
-      expect(count).toBe(2)
-
-      expect(mockSave).toHaveBeenCalledTimes(2)
-      expect(mockSave).toHaveBeenCalledWith(
-        expect.objectContaining({
-          id: 1,
-          status: "failed",
-        }),
-      )
-      expect(mockSave).toHaveBeenCalledWith(
-        expect.objectContaining({
-          id: 2,
-          status: "failed",
-        }),
-      )
-    })
-
-    it("should not update any builds if none are stuck", async () => {
-      // Mock empty results
-
-      mockGetMany.mockResolvedValueOnce([])
-      mockGetMany.mockResolvedValueOnce([])
-
-      // Run the function
-      const count = await sweepStuckBuilds()
-
-      // Verify results
-      expect(count).toBe(0)
-      expect(mockSave).not.toHaveBeenCalled()
-    })
-
-    it("should handle errors properly", async () => {
-      // Mock error
-
-      mockGetMany.mockRejectedValueOnce(new Error("Database error"))
-
-      // Verify the function throws
       await expect(sweepStuckBuilds()).rejects.toThrow("Database error")
+      log.error = originalError
+    })
+
+    it("fires from the dedicated sweep timer even while a task is in flight", async () => {
+      vi.useFakeTimers()
+      try {
+        // Occupy the worker: fetchTask hangs, so currentTaskId stays set for the duration.
+        vi.mocked(fetchTask).mockImplementationOnce(() => new Promise(() => undefined))
+        void startTask(999_451)
+
+        const { getMany } = mockDatabaseForSweep([], [])
+        mockPoolClient()
+
+        const timer = startStuckBuildSweepTimer()
+        try {
+          expect(getMany).not.toHaveBeenCalled()
+          // One minute later the dedicated timer fires and the sweep runs, even though the
+          // worker is busy (the idle poll tick would never have fired).
+          await vi.advanceTimersByTimeAsync(60_000)
+          expect(getMany).toHaveBeenCalled()
+        } finally {
+          clearInterval(timer)
+        }
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+  })
+
+  describe("reclaimOrphanedBuilds (#451)", () => {
+    it("requeues an orphaned build when its task still has attempt budget", async () => {
+      mockDatabaseForSweep([], [])
+      const client = mockPoolClient((sql) => {
+        if (sql.includes("SELECT id FROM screenshot_tests")) {
+          return { rows: [{ id: 42 }], rowCount: 1 }
+        }
+        if (sql.includes("SELECT id, attempts FROM task_queue")) {
+          return { rows: [{ id: 7, attempts: 1 }], rowCount: 1 }
+        }
+        return undefined
+      })
+
+      await reclaimOrphanedBuilds("worker-a")
+
+      // The orphan query is scoped to this worker's id.
+      const selects = queriesMatching(client, /SELECT id FROM screenshot_tests/)
+      expect(selects[0]![1]).toEqual(["worker-a"])
+
+      // The task lock is cleared so any worker can pick it up again...
+      const unlocks = queriesMatching(client, /UPDATE task_queue SET locked_at = NULL/)
+      expect(unlocks).toHaveLength(1)
+      expect(unlocks[0]![1]).toEqual([7])
+
+      // ...and the build flips back to pending (conditionally: only if still running).
+      const updates = queriesMatching(client, /UPDATE screenshot_tests/)
+      expect(updates).toHaveLength(1)
+      expect(updates[0]![0]).toContain("'pending'")
+      expect(updates[0]![0]).toMatch(/WHERE id = \$1 AND status = 'running'/)
+      expect(updates[0]![1]).toEqual([42])
+
+      expect(queriesMatching(client, /DELETE FROM task_queue/)).toHaveLength(0)
+      expect(postBuildFailedStatus).not.toHaveBeenCalled()
+    })
+
+    it("fails the build and posts the VCS status when the attempt budget is exhausted", async () => {
+      const { findOneBy } = mockDatabaseForSweep([], [])
+      const githubCheckData = { owner: "o", repo: "r", checkRunId: 5, installationId: 6 }
+      const client = mockPoolClient((sql) => {
+        if (sql.includes("SELECT id FROM screenshot_tests")) {
+          return { rows: [{ id: 42 }], rowCount: 1 }
+        }
+        if (sql.includes("SELECT id, attempts FROM task_queue")) {
+          // WORKER_MAX_TASK_ATTEMPTS defaults to 3; this task has burned its budget.
+          return { rows: [{ id: 7, attempts: 3 }], rowCount: 1 }
+        }
+        if (sql.includes("UPDATE screenshot_tests")) {
+          return { rows: [{ id: 42 }], rowCount: 1 }
+        }
+        if (sql.includes("DELETE FROM task_queue")) {
+          return { rows: [{ data: { githubCheckData } }], rowCount: 1 }
+        }
+        return undefined
+      })
+
+      await reclaimOrphanedBuilds("worker-a")
+
+      // The build is failed conditionally (only if still running), not requeued.
+      const updates = queriesMatching(client, /UPDATE screenshot_tests/)
+      expect(updates).toHaveLength(1)
+      expect(updates[0]![0]).toContain("'failed'")
+      expect(updates[0]![0]).toMatch(/WHERE id = \$1 AND status = 'running'/)
+      expect(queriesMatching(client, /UPDATE task_queue SET locked_at = NULL/)).toHaveLength(0)
+
+      // The dead task row is removed and its check data salvaged for the status post.
+      const deletes = queriesMatching(client, /DELETE FROM task_queue/)
+      expect(deletes).toHaveLength(1)
+      expect(deletes[0]![1]).toEqual([7])
+
+      expect(findOneBy).toHaveBeenCalledWith({ id: 42 })
+      expect(postBuildFailedStatus).toHaveBeenCalledTimes(1)
+      expect(postBuildFailedStatus).toHaveBeenCalledWith(
+        mockScreenshotTest,
+        expect.stringContaining("orphaned"),
+        expect.objectContaining({ githubCheckData }),
+      )
+    })
+
+    it("fails the build and posts the VCS status when the queue row is gone", async () => {
+      mockDatabaseForSweep([], [])
+      const client = mockPoolClient((sql) => {
+        if (sql.includes("SELECT id FROM screenshot_tests")) {
+          return { rows: [{ id: 42 }], rowCount: 1 }
+        }
+        if (sql.includes("UPDATE screenshot_tests")) {
+          return { rows: [{ id: 42 }], rowCount: 1 }
+        }
+        return undefined
+      })
+
+      await reclaimOrphanedBuilds("worker-a")
+
+      const updates = queriesMatching(client, /UPDATE screenshot_tests/)
+      expect(updates).toHaveLength(1)
+      expect(updates[0]![0]).toContain("'failed'")
+      expect(queriesMatching(client, /DELETE FROM task_queue/)).toHaveLength(0)
+      expect(postBuildFailedStatus).toHaveBeenCalledTimes(1)
+    })
+
+    it("does nothing when there are no orphaned builds", async () => {
+      mockDatabaseForSweep([], [])
+      const client = mockPoolClient()
+
+      await reclaimOrphanedBuilds("worker-a")
+
+      expect(queriesMatching(client, /UPDATE/)).toHaveLength(0)
+      expect(postBuildFailedStatus).not.toHaveBeenCalled()
+    })
+  })
+
+  describe("failBuildBeforeExit (#451)", () => {
+    it("conditionally fails the build, deletes the queue row, and posts the VCS status", async () => {
+      const client = mockPoolClient()
+      const checkData = {
+        gitlabCheckData: { projectId: 7, commitSha: "sha", gitlabHost: "https://gitlab.com" },
+      }
+
+      /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
+      await failBuildBeforeExit(123, 55, mockScreenshotTest as any, checkData)
+
+      // The status flip is conditional so it can never clobber a terminal status.
+      const updates = queriesMatching(client, /UPDATE screenshot_tests/)
+      expect(updates).toHaveLength(1)
+      expect(updates[0]![0]).toMatch(/WHERE id = \$1 AND status IN \('pending', 'running'\)/)
+      expect(updates[0]![1]).toEqual([123])
+
+      // The wedged build is non-retryable: its queue row is removed.
+      const deletes = queriesMatching(client, /DELETE FROM task_queue/)
+      expect(deletes).toHaveLength(1)
+      expect(deletes[0]![1]).toEqual([55])
+
+      expect(postBuildFailedStatus).toHaveBeenCalledWith(
+        mockScreenshotTest,
+        expect.any(String),
+        checkData,
+      )
+    })
+
+    it("skips the queue delete when no task queue id is known", async () => {
+      const client = mockPoolClient()
+
+      /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
+      await failBuildBeforeExit(123, undefined, mockScreenshotTest as any)
+
+      expect(queriesMatching(client, /UPDATE screenshot_tests/)).toHaveLength(1)
+      expect(queriesMatching(client, /DELETE FROM task_queue/)).toHaveLength(0)
+      expect(postBuildFailedStatus).toHaveBeenCalled()
+    })
+
+    it("is bounded by the fatal failsafe timeout: a wedged render still exits even if the DB hangs", async () => {
+      const originalError = log.error
+      const originalWarn = log.warn
+      const originalFatal = log.fatal
+      const fatalMock = vi.fn()
+      log.error = vi.fn()
+      log.warn = vi.fn()
+      log.fatal = fatalMock
+      const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never)
+      try {
+        // Earlier tests replace the S3Client mock implementation (clearAllMocks does not restore
+        // it); reinstate the default send-backed client so the download phase succeeds.
+        vi.mocked(S3Client).mockImplementation(function (this: { send: typeof mockSend }) {
+          this.send = mockSend
+        } as unknown as typeof S3Client)
+
+        // The database hangs, so failBuildBeforeExit never settles; the failsafe timer
+        // (WORKER_FATAL_FAILSAFE_TIMEOUT_MS, mocked to 300ms — 5s in production) must still
+        // bound the exit.
+        vi.mocked(DatabasePool).mockImplementation(() => new Promise(() => undefined))
+
+        // A story wedged beyond recovery: it never settles, even when its session is closed.
+        vi.mocked(processStory).mockImplementationOnce(() => new Promise(() => undefined))
+
+        // Swallow the (never-delivered) rejection; the promise dangles by design (withTimeout
+        // never resolves while the wedged render holds resources).
+        void ingestStorybook("test-project", 123, "test-upload", undefined, undefined, 55).catch(
+          () => undefined,
+        )
+
+        // BUILD_TIMEOUT_MS (50ms) fires the abort, BUILD_ABORT_GRACE_MS (500ms) expires without
+        // the render unwinding -> onUnrecoverable runs and starts the failsafe race.
+        await vi.waitFor(() => expect(fatalMock).toHaveBeenCalled(), { timeout: 3000 })
+
+        // One failsafe interval later the race resolves via the timer and the worker exits even
+        // though the DB write never completed — the exit is never delayed indefinitely.
+        await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(1), { timeout: 3000 })
+      } finally {
+        exitSpy.mockRestore()
+        log.error = originalError
+        log.warn = originalWarn
+        log.fatal = originalFatal
+      }
+    })
+  })
+
+  // NOTE: must run last within this file: handleShutdownSignal() flips the module-level
+  // `shuttingDown` flag, after which the worker accepts no new tasks.
+  describe("graceful shutdown (#451)", () => {
+    it("resets the owned running build to pending after releasing the task lock", async () => {
+      const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never)
+      try {
+        const client = mockPoolClient()
+
+        handleShutdownSignal("SIGTERM")
+        await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(0))
+
+        const updates = queriesMatching(client, /UPDATE screenshot_tests/)
+        expect(updates).toHaveLength(1)
+        expect(updates[0]![0]).toContain("SET status = 'pending', worker_id = NULL")
+        expect(updates[0]![0]).toMatch(/WHERE status = 'running' AND worker_id = \$1/)
+        expect(updates[0]![1]).toEqual([WORKER_ID])
+      } finally {
+        exitSpy.mockRestore()
+      }
     })
   })
 })

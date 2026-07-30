@@ -1,17 +1,15 @@
 import http from "node:http"
-import os from "node:os"
 
 import { DatabasePool } from "./database"
 import { VIZDIFF_VERSION, WORKER_HEALTH_PORT } from "./environment"
+// Stable per-instance identity so multiple workers each keep their own `worker_status` row.
+import { WORKER_ID } from "./identity"
 import { log } from "./log"
 
 let lastHeartbeatAt = Date.now()
 let lastTaskStartedAt: number | null = null
 let lastTaskFinishedAt: number | null = null
 let activeTaskId: number | null = null
-
-// Stable per-process identity so multiple workers each keep their own `worker_status` row.
-const WORKER_ID = os.hostname()
 
 /**
  * Upsert this worker's row in `worker_status` so the api can surface the running version + liveness

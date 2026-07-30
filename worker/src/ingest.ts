@@ -18,7 +18,7 @@ import { Not, In } from "typeorm"
 import { remote } from "webdriverio"
 
 import { createBrowserPool } from "./browserPool"
-import { Database } from "./database"
+import { Database, DatabasePool } from "./database"
 import { downloadWithTimeout } from "./download"
 import {
   BUILD_ABORT_GRACE_MS,
@@ -30,11 +30,13 @@ import {
   S3_CLIENT_CONFIG,
   WORKER_CHROME_EXTRA_ARGS,
   WORKER_ENABLE_WEBGL,
+  WORKER_FATAL_FAILSAFE_TIMEOUT_MS,
   WORKER_STORY_CONCURRENCY,
 } from "./environment"
 import { safeExtract } from "./extract"
 import { updateGitHubCheckRun, type GitHubCheckData } from "./github"
 import { getGitLabHostConfig, updateGitLabCommitStatus, type GitLabCheckData } from "./gitlab"
+import { WORKER_ID } from "./identity"
 import { log } from "./log"
 import { buildImageUrlResolver } from "./s3"
 import {
@@ -46,6 +48,7 @@ import { startStaticServer } from "./server"
 import { getStorybookStories, navigateToStorybook, processStory } from "./stories"
 import { NonRetryableTaskError, isPermanentS3FetchError } from "./tasks"
 import { withTimeout } from "./timeout"
+import { postBuildFailedStatus, type BuildCheckData } from "./vcsStatus"
 import { nodeCompatTransformRequest } from "./wdio"
 
 /** Log resident set size, warning when it crosses the configured threshold. */
@@ -107,12 +110,47 @@ export async function isBaselineBuildPending(screenshotTestId: number): Promise<
   return inFlightCount > 0
 }
 
+/**
+ * Best-effort fast-fail for the fatal exit path (issue #451): before the worker exits over a
+ * wedged render, flip the build to "failed", remove its queue row (a wedged build is
+ * non-retryable, matching BuildTimeoutError semantics — retrying would just wedge the next
+ * worker), and post the failed VCS status so CI is unblocked immediately instead of waiting for
+ * the stuck-build sweeper. Uses raw SQL via the pool (not TypeORM save) so the writes are
+ * minimal, conditional, and cannot clobber a concurrent status transition.
+ */
+export async function failBuildBeforeExit(
+  screenshotTestId: number,
+  taskQueueId: number | undefined,
+  screenshotTest: ScreenshotTest,
+  checkData?: BuildCheckData,
+): Promise<void> {
+  const client = await DatabasePool()
+  try {
+    await client.query(
+      `UPDATE screenshot_tests SET status = 'failed', updated_at = NOW()
+       WHERE id = $1 AND status IN ('pending', 'running')`,
+      [screenshotTestId],
+    )
+    if (taskQueueId != undefined) {
+      await client.query(`DELETE FROM task_queue WHERE id = $1`, [taskQueueId])
+    }
+  } finally {
+    client.release()
+  }
+  await postBuildFailedStatus(
+    screenshotTest,
+    "Build did not unwind after exceeding the build timeout; the worker restarted",
+    checkData,
+  )
+}
+
 export async function ingestStorybook(
   projectId: string,
   screenshotTestId: number,
   uploadId: string,
   githubCheckData?: GitHubCheckData,
   gitlabCheckData?: GitLabCheckData,
+  taskQueueId?: number,
 ): Promise<void> {
   log.info(`Starting storybook ingestion for project ${projectId}, upload ${uploadId}`)
 
@@ -210,8 +248,10 @@ export async function ingestStorybook(
   log.debug(`Creating temporary directory: ${tmpDir}`)
   await fsPromises.mkdir(tmpDir, { recursive: true })
 
-  // Update the screenshot test status to running
+  // Update the screenshot test status to running and record this worker as its owner (issue
+  // #451) so a restarting worker can reclaim the build if this process dies mid-render.
   screenshotTest.status = "running"
+  screenshotTest.workerId = WORKER_ID
   await screenshotTestRepo.save(screenshotTest)
 
   try {
@@ -472,7 +512,27 @@ export async function ingestStorybook(
                 `${BUILD_ABORT_GRACE_MS}ms after abort; a render is wedged. Exiting worker so the ` +
                 `orchestrator restarts a clean process.`,
             )
-            process.exit(1)
+            // Before exiting, best-effort fail the build and post the failed VCS status (issue
+            // #451) so CI is unblocked immediately instead of waiting for the stuck-build
+            // sweeper. Bounded by WORKER_FATAL_FAILSAFE_TIMEOUT_MS so a slow database or VCS API
+            // cannot stall the restart; process.exit(1) runs regardless.
+            void (async () => {
+              try {
+                await Promise.race([
+                  failBuildBeforeExit(screenshotTestId, taskQueueId, screenshotTest, {
+                    githubCheckData,
+                    gitlabCheckData,
+                  }),
+                  new Promise<void>((resolve) => {
+                    setTimeout(resolve, WORKER_FATAL_FAILSAFE_TIMEOUT_MS).unref()
+                  }),
+                ])
+              } catch (failErr) {
+                log.error(failErr, `Failed to fail build ${screenshotTest.id} before fatal exit`)
+              } finally {
+                process.exit(1)
+              }
+            })()
           },
         },
       )

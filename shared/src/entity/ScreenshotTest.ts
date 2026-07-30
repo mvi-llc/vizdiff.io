@@ -19,6 +19,10 @@ import type { WorkTask } from "./WorkTask"
 @Index("IDX_project_id_commit_sha", ["project.id", "commitSha"])
 @Index("IDX_project_id_branch", ["project.id", "branch"])
 @Index("IDX_project_id_build_number", ["project.id", "buildNumber"], { unique: true })
+// Supports the worker's startup orphan reclaim (issue #451): "find running builds owned by a
+// given worker id". Name must match the migration (AddBuildWorkerTracking) exactly so
+// `synchronize: true` (tests) and migrations produce identical schemas.
+@Index("IDX_screenshot_tests_status_worker", ["status", "workerId"])
 export class ScreenshotTest {
   @PrimaryGeneratedColumn()
   id!: number
@@ -82,6 +86,17 @@ export class ScreenshotTest {
 
   @Column({ name: "browser_version", type: "text", nullable: true })
   browserVersion!: string | null
+
+  // Identity of the worker currently processing this build (issue #451). Set when the build
+  // flips to "running"; used at worker startup to reclaim builds orphaned by a fatal exit.
+  @Column({ name: "worker_id", type: "text", nullable: true })
+  workerId!: string | null
+
+  // Last time the in-flight build reported render progress (issue #452). Shipped with #451 but
+  // not yet written; the stuck-build sweeper reads COALESCE(last_progress_at, updated_at) so it
+  // degrades to updated_at until the progress watchdog lands.
+  @Column({ name: "last_progress_at", type: "timestamptz", nullable: true })
+  lastProgressAt!: Date | null
 
   @CreateDateColumn({ name: "created_at", type: "timestamptz", nullable: false })
   createdAt!: Date
