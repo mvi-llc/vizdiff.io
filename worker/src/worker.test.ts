@@ -121,6 +121,18 @@ vi.mock("./tasks", async (importOriginal) => {
   }
 })
 
+// Partial mock of the sharding module (issue #456, Phase B): stub only the chunk entry points
+// so processTask dispatch can be asserted; everything else (the shared render internals the
+// ingest tests exercise, computeBuildTimeoutMs, etc.) stays real.
+vi.mock("./shard", async (importOriginal) => {
+  const actual: object = await importOriginal()
+  return {
+    ...actual,
+    runRenderChunk: vi.fn().mockResolvedValue(undefined),
+    giveUpOnChunkTask: vi.fn().mockResolvedValue(undefined),
+  }
+})
+
 // Mock database connection
 vi.mock("./database", () => ({
   Database: vi.fn().mockImplementation(async () => ({
@@ -501,6 +513,50 @@ describe("worker", () => {
       }
       expect(error).toBeInstanceOf(Error)
       expect(error!.message).toBe("Unknown task type: unknown_task_type")
+    })
+
+    // Cross-worker sharding (issue #456, Phase B): render_story_chunk tasks dispatch to
+    // runRenderChunk WITHOUT the isBaselineBuildPending gate (chunks only exist because the
+    // discovery task already passed it — and the Database mock here would throw on the gate's
+    // query-builder anyway, so a regression would fail loudly).
+    it("dispatches render_story_chunk tasks to runRenderChunk", async () => {
+      const { runRenderChunk } = await import("./shard")
+      const payload = {
+        projectId: "test-project",
+        uploadId: "test-upload",
+        storyIds: ["story-a", "story-b"],
+        chunkIndex: 0,
+        chunkCount: 2,
+      }
+
+      await processTask("render_story_chunk", 123, payload)
+
+      expect(runRenderChunk).toHaveBeenCalledTimes(1)
+      expect(runRenderChunk).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectId: "test-project",
+          uploadId: "test-upload",
+          storyIds: ["story-a", "story-b"],
+          chunkIndex: 0,
+          chunkCount: 2,
+        }),
+        123,
+        // processTask is invoked directly (no claimed task), so no queue row id is threaded.
+        undefined,
+      )
+    })
+
+    it("rejects an invalid render_story_chunk payload as non-retryable", async () => {
+      const originalError = log.error
+      log.error = vi.fn()
+      const { runRenderChunk } = await import("./shard")
+
+      await expect(
+        processTask("render_story_chunk", 123, { projectId: "test-project" }),
+      ).rejects.toBeInstanceOf(NonRetryableTaskError)
+
+      expect(runRenderChunk).not.toHaveBeenCalled()
+      log.error = originalError
     })
   })
 

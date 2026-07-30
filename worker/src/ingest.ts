@@ -1,107 +1,51 @@
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3"
-import type { Capabilities } from "@wdio/types"
+import { S3Client } from "@aws-sdk/client-s3"
 import { promises as fsPromises } from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { Readable } from "node:stream"
 import {
   TestResult,
   ScreenshotTest,
   createSummaryForBuild,
-  createMarkdownForBuildResult,
   createSummaryForFailedBuild,
   gitlabStatusContext,
   uploadTarballKey,
 } from "shared"
 import { Not, In } from "typeorm"
-import { remote } from "webdriverio"
 
-import { createBrowserPool } from "./browserPool"
 import { Database, DatabasePool } from "./database"
-import { downloadWithTimeout } from "./download"
 import {
-  BUILD_ABORT_GRACE_MS,
-  BUILD_MEMORY_WARN_BYTES,
-  BUILD_TIMEOUT_FLOOR_MS,
-  BUILD_TIMEOUT_MS,
-  CHROMEDRIVER_PORT,
   MAX_STORIES_PER_UPLOAD,
-  S3_BUCKET_NAME,
   S3_CLIENT_CONFIG,
-  WORKER_CHROME_EXTRA_ARGS,
-  WORKER_ENABLE_WEBGL,
-  WORKER_FATAL_FAILSAFE_TIMEOUT_MS,
-  WORKER_FINALIZE_CONCURRENCY,
-  WORKER_FINALIZE_QUEUE_LIMIT,
-  WORKER_PER_STORY_BUDGET_MS,
-  WORKER_PROGRESS_TIMEOUT_MS,
-  WORKER_SESSION_MAX_INFRA_FAILURES,
-  WORKER_SESSION_RECYCLE_STORIES,
-  WORKER_STORY_CONCURRENCY,
+  WORKER_SHARD_CHUNK_SIZE,
+  WORKER_SHARD_MIN_STORIES,
+  WORKER_SHARDING_ENABLED,
 } from "./environment"
-import { safeExtract } from "./extract"
 import { updateGitHubCheckRun, type GitHubCheckData } from "./github"
 import { getGitLabHostConfig, updateGitLabCommitStatus, type GitLabCheckData } from "./gitlab"
 import { WORKER_ID } from "./identity"
 import { log } from "./log"
-import { recordBuildOutcome, recordStoryPhaseDuration, recordStoryResult } from "./metrics"
-import { runStoryPipeline, settlePrewarmedPool } from "./pipeline"
-import { beginBuildProgress, endBuildProgress } from "./progress"
-import { buildImageUrlResolver } from "./s3"
-import {
-  hardenedChromeArgs,
-  installBrowserSafeguards,
-  installNetworkEgressBlock,
-} from "./safeguards"
+import { recordBuildOutcome } from "./metrics"
+import { settlePrewarmedPool } from "./pipeline"
+import { installNetworkEgressBlock } from "./safeguards"
 import { startStaticServer } from "./server"
 import {
-  captureStoryWithRetry,
-  finalizeStoryWithRecording,
-  getStorybookStories,
-  navigateToStorybook,
-} from "./stories"
-import { installStoryRenderStateHook } from "./storyReady"
-import { NonRetryableTaskError, isPermanentS3FetchError } from "./tasks"
-import { BuildTimeoutError, withTimeout } from "./timeout"
-import type { Story } from "./types"
+  completeBuild,
+  createStoryBrowserPool,
+  downloadAndExtractTarball,
+  enqueueRenderChunks,
+  fetchBaseTestResults,
+  getS3BucketForProjectId,
+  logBuildMemoryUsage,
+  planChunks,
+  renderStoriesWithWatchdog,
+} from "./shard"
+import { getStorybookStories, navigateToStorybook } from "./stories"
+import { BuildTimeoutError } from "./timeout"
 import { postBuildFailedStatus, type BuildCheckData } from "./vcsStatus"
-import { nodeCompatTransformRequest } from "./wdio"
 
-/** Log resident set size, warning when it crosses the configured threshold. */
-function logBuildMemoryUsage(phase: string, screenshotTestId: number): void {
-  const { rss, heapUsed } = process.memoryUsage()
-  const ctx = { phase, screenshotTestId, rssBytes: rss, heapUsedBytes: heapUsed }
-  if (rss >= BUILD_MEMORY_WARN_BYTES) {
-    log.warn(ctx, `High memory usage during build (RSS ${(rss / 1024 / 1024).toFixed(0)} MiB)`)
-  } else {
-    log.debug(ctx, `Build memory usage (RSS ${(rss / 1024 / 1024).toFixed(0)} MiB)`)
-  }
-}
-
-/**
- * Compute the whole-build timeout ceiling (issue #452), applied to the render fan-out only
- * (story discovery runs beforehand under its own per-step timeouts).
- *
- * When `explicitEnvMs` (BUILD_TIMEOUT_MS) is set, it is returned verbatim — back-compat for
- * deployments that tuned the flat cap. Otherwise the ceiling scales with the discovered story
- * count: `max(BUILD_TIMEOUT_FLOOR_MS, ceil(storyCount * WORKER_PER_STORY_BUDGET_MS /
- * concurrency))`, so a large-but-healthy storybook is never killed just for being large. The
- * ceiling is a backstop; the progress watchdog (WORKER_PROGRESS_TIMEOUT_MS) is the primary
- * stall detector.
- */
-export function computeBuildTimeoutMs(
-  storyCount: number,
-  concurrency: number,
-  explicitEnvMs: number | undefined,
-): number {
-  if (explicitEnvMs != undefined) {
-    return explicitEnvMs
-  }
-  return Math.max(
-    BUILD_TIMEOUT_FLOOR_MS,
-    Math.ceil((storyCount * WORKER_PER_STORY_BUDGET_MS) / Math.max(1, concurrency)),
-  )
-}
+// Re-exported from shard.ts (issue #456, Phase B moved the render internals there so the inline
+// and per-chunk paths share them); kept here for existing callers/tests.
+export { computeBuildTimeoutMs } from "./shard"
 
 /**
  * Determine whether the baseline build that a render task depends on is still
@@ -197,6 +141,12 @@ export async function ingestStorybook(
   // Wall-clock start for vizdiff_worker_build_duration_seconds (issue #457): measures actual
   // processing (download through render/finalize), not time spent queued.
   const ingestStartMs = Date.now()
+
+  // Set when this ingest hands the render off to render_story_chunk tasks (issue #456, Phase
+  // B): the build deliberately stays "running" for the chunk workers, so the completion
+  // aggregation and the "still running means something broke" failsafe below must both be
+  // skipped.
+  let shardedHandoff = false
 
   // Fetch the screenshot test record (project and user loaded via eager relations)
   const db = await Database()
@@ -299,105 +249,18 @@ export async function ingestStorybook(
   await screenshotTestRepo.save(screenshotTest)
 
   try {
-    // Initialize WebdriverIO
-    log.debug("Initializing WebdriverIO in headless Chrome mode")
-    const config: Capabilities.WebdriverIOConfig = {
-      outputDir: path.join(tmpDir, "wdio-logs"),
-      hostname: "localhost",
-      // Connect to the chromedriver started by the container's start.sh (CHROMEDRIVER_PORT=4444 in
-      // the image); undefined when unset so local dev lets WebdriverIO manage its own driver.
-      port: CHROMEDRIVER_PORT,
-      capabilities: {
-        browserName: "chrome",
-        // Enable WebDriver BiDi so we can install page-level rendering
-        // safeguards (issue #69) via `addInitScript`.
-        webSocketUrl: true,
-        "goog:chromeOptions": {
-          // Base flags plus hardening flags that disable risky browser features
-          // (WebRTC, background networking, etc.) when executing untrusted
-          // story bundles, plus opt-in software WebGL and operator extra args
-          // (issue #447). See `safeguards.ts`.
-          args: hardenedChromeArgs(
-            ["--headless", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-            { enableWebgl: WORKER_ENABLE_WEBGL, extraArgs: WORKER_CHROME_EXTRA_ARGS },
-          ),
-        },
-      },
-      logLevel: "warn",
-      // Fail HTTP-level WebDriver requests against a dead driver faster than the 120 s default,
-      // so session replacement (issue #450) is detected and resolved promptly. (The 60 s BiDi
-      // command timeout is hardcoded in the webdriver package and not configurable here.)
-      connectionRetryTimeout: 30_000,
-      // Strip forbidden headers WebdriverIO injects so sessions work under
-      // Node 26's undici 7 (see wdio.ts).
-      transformRequest: nodeCompatTransformRequest,
-    }
     // Build a pool of independent headless-Chrome sessions so stories render concurrently
-    // (issue #152, Phase 1b). Pool size == WORKER_STORY_CONCURRENCY (default 1). Each session gets
-    // the page-level safeguards installed up front (disable real-time transports + off-origin
-    // fetch/XHR/window.open at the JS layer) before it navigates to any untrusted story; the hard
-    // network egress boundary is installed per session below, once the static-server origin is known.
-    // Sessions are recycled after WORKER_SESSION_RECYCLE_STORIES stories (bounding Chrome's
-    // cumulative memory growth, issue #453) and replaced after WORKER_SESSION_MAX_INFRA_FAILURES
-    // consecutive infra failures (dead-session recovery, issue #450).
+    // (issue #152, Phase 1b); see createStoryBrowserPool in shard.ts for the session setup
+    // (safeguards, render-state hook, recycling, dead-session replacement).
     //
     // Prewarm (issue #456): pool creation is kicked off BEFORE the tarball download so all N
     // Chrome sessions launch concurrently with the download + extraction instead of serially
     // after them. settlePrewarmedPool joins the two: if the download/extract fails first, the
     // pool is awaited and destroyed so an early failure never leaks Chrome processes.
-    const poolPromise = createBrowserPool(
-      WORKER_STORY_CONCURRENCY,
-      async () => {
-        const session = await remote(config)
-        await installBrowserSafeguards(session)
-        // Record Storybook's story-render lifecycle in the page (issue #458) so capture waits for
-        // render completion instead of screenshotting an async story's loading fallback.
-        await installStoryRenderStateHook(session)
-        return session
-      },
-      {
-        recycleAfterStories: WORKER_SESSION_RECYCLE_STORIES,
-        maxConsecutiveInfraFailures: WORKER_SESSION_MAX_INFRA_FAILURES,
-      },
-    )
+    const poolPromise = createStoryBrowserPool(tmpDir)
 
     const downloadAndExtract = async (): Promise<void> => {
-      // Initialize the tarball download from S3
-      const tarballPath = path.join(tmpDir, "storybook.tar.gz")
-      log.info(`Downloading storybook build from S3 ${key} -> ${tarballPath}`)
-      const getObjectCommand = new GetObjectCommand({ Bucket: bucket, Key: key })
-      let response
-      try {
-        response = await s3Client.send(getObjectCommand)
-      } catch (error) {
-        // If the upload tarball is permanently gone (e.g. NoSuchKey) there is no
-        // point retrying. Surface it as a non-retryable error so the worker deletes
-        // the task from the queue instead of releasing the lock for backoff retries.
-        // The outer catch below marks the ScreenshotTest as failed before this
-        // propagates.
-        if (isPermanentS3FetchError(error)) {
-          const name = (error as { name?: string }).name ?? "unknown"
-          throw new NonRetryableTaskError(
-            `Storybook upload tarball is unavailable (${name}) at s3://${bucket}/${key}; not retrying`,
-            error,
-          )
-        }
-        throw error
-      }
-      if (!response.Body) {
-        throw new Error("Empty response body from S3")
-      }
-      if (!(response.Body instanceof Readable)) {
-        throw new Error(`Unexpected response.Body type ${typeof response.Body}`)
-      }
-      // Download the tarball to a temporary file
-      await downloadWithTimeout(response.Body, tarballPath, 30 * 1000)
-      log.debug(`Successfully downloaded storybook build from S3`)
-
-      // Extract the tarball
-      log.info(`Extracting storybook build to: ${tmpDir}`)
-      await safeExtract(tarballPath, tmpDir)
-      log.debug(`Successfully extracted storybook build`)
+      await downloadAndExtractTarball({ s3Client, bucket, key, destDir: tmpDir })
     }
 
     const { pool } = await settlePrewarmedPool(poolPromise, downloadAndExtract())
@@ -414,7 +277,7 @@ export async function ingestStorybook(
 
     logBuildMemoryUsage("render-start", screenshotTest.id)
 
-    const renderStorybook = async (): Promise<void> => {
+    const renderStorybook = async (): Promise<"sharded" | "rendered"> => {
       // Start a local server to serve the Storybook files
       const { server, port } = await startStaticServer(tmpDir)
 
@@ -430,7 +293,7 @@ export async function ingestStorybook(
       )
 
       try {
-        // Discovery phase. Runs BEFORE the build watchdog below (issue #452): navigation, story
+        // Discovery phase. Runs BEFORE the build watchdog (issue #452): navigation, story
         // discovery, and the baseline prefetch each carry their own bounded internal timeouts
         // (10-30 s), and the whole-build ceiling can only be derived once the story count is
         // known.
@@ -460,185 +323,62 @@ export async function ingestStorybook(
 
         log.info(`Found ${storyCount} stories to process`)
 
-        const testResultTable = db.getRepository(TestResult)
+        // Persist the expected story count (issue #456, Phase B) BEFORE any render task can
+        // finish: sharded completion is "count of distinct story results >= expected". Also
+        // written on the inline path, where it is informational.
+        screenshotTest.expectedStoryCount = storyCount
+        await screenshotTestRepo.save(screenshotTest)
 
-        // Fetch test results from the base commit if it exists
-        const baseTestResults = new Map<string, TestResult>()
-        if (screenshotTest.baseCommitSha) {
-          log.info(`Fetching base test results for commit ${screenshotTest.baseCommitSha}`)
-          const baseTests = await testResultTable
-            .createQueryBuilder("result")
-            .leftJoinAndSelect("result.screenshotTest", "test")
-            // Filter by project as well as commit sha: two projects can share a commit sha
-            // (forks, monorepos), and the pair lets Postgres use the
-            // (project_id, commit_sha) index.
-            .where("test.project_id = :projectId", { projectId: screenshotTest.project.id })
-            .andWhere("test.commit_sha = :commitSha", { commitSha: screenshotTest.baseCommitSha })
-            .getMany()
-
-          for (const test of baseTests) {
-            baseTestResults.set(test.storyId, test)
-          }
-          log.info(`Found ${baseTestResults.size} base test results`)
-        }
-
-        // Derive the whole-build ceiling now that the story count is known (issue #452): an
-        // explicit BUILD_TIMEOUT_MS is used verbatim; otherwise the ceiling scales with the
-        // story count so a large-but-healthy storybook is never killed by a flat cap.
-        const buildTimeoutMs = computeBuildTimeoutMs(storyCount, pool.size, BUILD_TIMEOUT_MS)
-        log.info(
-          `Build timeout ceiling: ${buildTimeoutMs}ms for ${storyCount} stories` +
-            (WORKER_PROGRESS_TIMEOUT_MS > 0
-              ? `, progress watchdog: ${WORKER_PROGRESS_TIMEOUT_MS}ms`
-              : ""),
-        )
-
-        // Render stories concurrently across the session pool (issue #152, Phase 1b) through the
-        // two-lane capture/finalize pipeline (issue #456). Capture slots equal the pool size, so
-        // a slot rarely waits on acquire(); on capture success the session is released
-        // immediately and the story's S3 uploads + baseline diff + DB save run in a bounded
-        // background lane (WORKER_FINALIZE_CONCURRENCY), letting the session move straight to
-        // the next story. WORKER_FINALIZE_QUEUE_LIMIT caps captured-but-unfinalized stories
-        // (each buffers one PNG in memory). Session checkout, health probing, infra-error retry,
-        // and failure recording live inside captureStoryWithRetry/finalizeStoryWithRecording
-        // (issues #450/#454): a single story's failure records a `failed` TestResult and
-        // resolves, so one bad story (or one dead session) cannot abort the build.
-        log.info(
-          `Rendering ${Object.keys(stories).length} stories across ${pool.size} session(s) ` +
-            `(finalize concurrency ${WORKER_FINALIZE_CONCURRENCY}, ` +
-            `queue limit ${WORKER_FINALIZE_QUEUE_LIMIT})`,
-        )
-
-        // Track render progress (issue #452): every settled story — success or recorded failure
-        // — counts as forward progress. The in-process stall watchdog polls lastProgressAtMs,
-        // and a throttled last_progress_at heartbeat lets the cross-worker stuck-build sweeper
-        // distinguish a large-but-healthy build from a wedged one. Stories count as complete
-        // when they FINALIZE; capture completions additionally touch() the watchdog (cheap) so
-        // a long finalize backlog is never mistaken for a stall.
-        const progress = beginBuildProgress(screenshotTest.id, storyCount)
-        let testResults: TestResult[]
-        try {
-          const storyInfoFor = (story: Story) => ({
-            story,
-            screenshotTest,
-            baseTestResult: baseTestResults.get(story.id),
-            bucket,
-            tmpDir,
-            projectId,
-            uploadId,
-            port,
-            s3Client,
-            testResultTable,
-          })
-          const renderAllStories = runStoryPipeline({
-            stories: Object.values(stories),
-            captureConcurrency: pool.size,
-            finalizeConcurrency: WORKER_FINALIZE_CONCURRENCY,
-            queueLimit: WORKER_FINALIZE_QUEUE_LIMIT,
-            capture: async (story) => {
-              const outcome = await captureStoryWithRetry({ ...storyInfoFor(story), pool })
-              // Story metrics (issue #457): a `captured` outcome reports its capture-phase
-              // duration (its final ok/failed outcome is recorded at finalize); a `recorded`
-              // outcome IS the story's final (failed) result, so record it now.
-              if (outcome.kind === "captured") {
-                recordStoryPhaseDuration("capture", outcome.captured.captureDurationMs / 1000)
-              } else {
-                recordStoryResult(outcome.result)
-              }
-              return outcome
-            },
-            finalize: async (story, captured) => {
-              const finalizeStartMs = Date.now()
-              const result = await finalizeStoryWithRecording(storyInfoFor(story), captured)
-              recordStoryPhaseDuration("finalize", (Date.now() - finalizeStartMs) / 1000)
-              recordStoryResult(result)
-              return result
-            },
-            hooks: {
-              onCaptureComplete: () => {
-                progress.touch()
-              },
-              onStoryComplete: () => {
-                progress.completeStory()
-              },
-              onCapturesDrained: () => {
-                logBuildMemoryUsage("capture-drain", screenshotTest.id)
-              },
-            },
-          })
-
-          // Wrap the render fan-out in the build watchdog. Two triggers share one abort path
-          // (issue #452): the progress watchdog fires when no story has completed for
-          // WORKER_PROGRESS_TIMEOUT_MS (a wedged build is detected in minutes regardless of
-          // size), and the derived ceiling above is the whole-build backstop. On either trigger
-          // we force-close every pooled session so the in-flight WebDriver commands reject and
-          // the stack unwinds. Crucially, withTimeout then waits for the fan-out to actually
-          // settle before surfacing the error — the per-story `finally` that returns each
-          // session to the pool must run before the worker is freed to accept a new build. If
-          // the render fails to unwind within the grace period, a session is wedged beyond
-          // in-process recovery, so withTimeout exits the worker (default onUnrecoverable) and
-          // the orchestrator restarts a clean process. BuildTimeoutError (and its subclass
-          // BuildStalledError) is treated as a non-retryable failure by the task scheduler.
-          testResults = await withTimeout(
-            renderAllStories,
-            buildTimeoutMs,
-            () => {
-              log.warn(
-                `Build ${screenshotTest.id} (#${screenshotTest.buildNumber}) hit the build watchdog ` +
-                  `(ceiling ${buildTimeoutMs}ms, ${progress.completedStories}/${storyCount} stories ` +
-                  `completed); aborting and closing browser session(s)`,
-              )
-              // Force-close every pooled session so in-flight WebDriver commands reject.
-              return pool.destroyAll()
-            },
-            {
-              abortGraceMs: BUILD_ABORT_GRACE_MS,
-              onUnrecoverable: (err) => {
-                log.fatal(
-                  err,
-                  `Build ${screenshotTest.id} (#${screenshotTest.buildNumber}) did not unwind within ` +
-                    `${BUILD_ABORT_GRACE_MS}ms after abort; a render is wedged. Exiting worker so the ` +
-                    `orchestrator restarts a clean process.`,
-                )
-                // Before exiting, best-effort fail the build and post the failed VCS status
-                // (issue #451) so CI is unblocked immediately instead of waiting for the
-                // stuck-build sweeper. Bounded by WORKER_FATAL_FAILSAFE_TIMEOUT_MS so a slow
-                // database or VCS API cannot stall the restart; process.exit(1) runs regardless.
-                void (async () => {
-                  try {
-                    await Promise.race([
-                      failBuildBeforeExit(screenshotTestId, taskQueueId, screenshotTest, {
-                        githubCheckData,
-                        gitlabCheckData,
-                      }),
-                      new Promise<void>((resolve) => {
-                        setTimeout(resolve, WORKER_FATAL_FAILSAFE_TIMEOUT_MS).unref()
-                      }),
-                    ])
-                  } catch (failErr) {
-                    log.error(
-                      failErr,
-                      `Failed to fail build ${screenshotTest.id} before fatal exit`,
-                    )
-                  } finally {
-                    process.exit(1)
-                  }
-                })()
-              },
-              // The progress watchdog; 0 disables it, leaving only the ceiling.
-              ...(WORKER_PROGRESS_TIMEOUT_MS > 0
-                ? {
-                    stall: {
-                      getLastProgressMs: () => progress.lastProgressAtMs,
-                      stallTimeoutMs: WORKER_PROGRESS_TIMEOUT_MS,
-                    },
-                  }
-                : {}),
-            },
+        // Cross-worker sharding (issue #456, Phase B): for a large build, enqueue one
+        // render_story_chunk task per chunk of story ids and return with the build left
+        // "running" (the VCS running status is already posted). Any worker — including this
+        // one — claims chunks; the last-finishing chunk reconciles completion and posts the
+        // final VCS status.
+        if (WORKER_SHARDING_ENABLED && storyCount >= WORKER_SHARD_MIN_STORIES) {
+          const chunks = planChunks(Object.keys(stories), WORKER_SHARD_CHUNK_SIZE)
+          log.info(
+            `Sharding build ${screenshotTest.id} (#${screenshotTest.buildNumber}): ` +
+              `${storyCount} stories across ${chunks.length} chunk(s) of up to ` +
+              `${WORKER_SHARD_CHUNK_SIZE}`,
           )
-        } finally {
-          endBuildProgress()
+          await enqueueRenderChunks(screenshotTest, projectId, uploadId, chunks, {
+            githubCheckData,
+            gitlabCheckData,
+          })
+          // Release single-worker ownership: chunks are rendered by many workers, so neither
+          // this worker's startup orphan reclaim nor its graceful-shutdown reset (issue #451)
+          // should treat the still-running build as its own.
+          screenshotTest.workerId = null
+          await screenshotTestRepo.save(screenshotTest)
+          return "sharded"
         }
+
+        // Inline (unsharded) path: prefetch baselines and render everything in this task.
+        const testResultTable = db.getRepository(TestResult)
+        const baseTestResults = await fetchBaseTestResults(screenshotTest)
+
+        // Render through the shared watchdog-guarded capture/finalize fan-out (issues #152/#452/
+        // #456; see renderStoriesWithWatchdog in shard.ts). On a wedged render the worker exits;
+        // the fatal cleanup fails the build, deletes the queue row, and posts the failed VCS
+        // status first (issue #451).
+        const testResults = await renderStoriesWithWatchdog({
+          pool,
+          stories: Object.values(stories),
+          screenshotTest,
+          baseTestResults,
+          bucket,
+          tmpDir,
+          projectId,
+          uploadId,
+          port,
+          s3Client,
+          testResultTable,
+          fatalCleanup: () =>
+            failBuildBeforeExit(screenshotTestId, taskQueueId, screenshotTest, {
+              githubCheckData,
+              gitlabCheckData,
+            }),
+        })
         log.info(
           `Successfully processed all ${Object.keys(stories).length} stories for test ${screenshotTest.id} (build #${screenshotTest.buildNumber})`,
         )
@@ -657,32 +397,10 @@ export async function ingestStorybook(
         screenshotTest.totalChanges = changeCount
         await screenshotTestRepo.save(screenshotTest)
 
-        // Update VCS status with the build results
-        if (githubCheckData) {
-          await updateGitHubCheckRunWithBuildResults(
-            githubCheckData,
-            screenshotTest,
-            testResults,
-            changeCount,
-          )
-        } else if (gitlabCheckData && gitlabConfigured && gitlabHost) {
-          const hasChanges = changeCount > 0
-          if (!hasChanges) {
-            // Only update status to success if no changes - otherwise stay in pending until approved
-            await updateGitLabCommitStatus({
-              ...gitlabCheckData,
-              gitlabHost,
-              state: "success",
-              testId: screenshotTest.id,
-              name: gitlabStatusContext(screenshotTest.project.key),
-              description: "No visual changes detected",
-            })
-          } else {
-            log.info(
-              `GitLab status staying in pending for ${changeCount} unapproved change(s) - approval will set success`,
-            )
-          }
-        }
+        // Update VCS status with the build results (shared with the sharded completion path;
+        // reads the upserted TestResult rows from the database).
+        await completeBuild(screenshotTest, { githubCheckData, gitlabCheckData })
+        return "rendered"
       } finally {
         log.debug("Shutting down local server")
         await new Promise<void>((resolve) => server.close(() => resolve()))
@@ -693,8 +411,10 @@ export async function ingestStorybook(
       // The render phase. Story discovery runs first under its own per-step timeouts; the
       // concurrent render fan-out inside is guarded by the build watchdog (progress stall +
       // derived whole-build ceiling, issue #452).
-      await renderStorybook()
-      recordBuildOutcome("completed", (Date.now() - ingestStartMs) / 1000)
+      shardedHandoff = (await renderStorybook()) === "sharded"
+      if (!shardedHandoff) {
+        recordBuildOutcome("completed", (Date.now() - ingestStartMs) / 1000)
+      }
     } finally {
       log.debug("Closing WebdriverIO browser session pool")
       // Sessions may already be gone if a timeout abort closed them; destroyAll tolerates that so
@@ -750,8 +470,10 @@ export async function ingestStorybook(
     log.debug(`Cleaning up temporary directory: ${tmpDir}`)
     await fsPromises.rm(tmpDir, { recursive: true, force: true })
 
-    // If status is still "running", something went wrong without throwing an error
-    if (screenshotTest.status === "running") {
+    // If status is still "running", something went wrong without throwing an error — unless
+    // this ingest deliberately handed off to render_story_chunk tasks (issue #456, Phase B),
+    // in which case "running" is the correct hand-off state.
+    if (!shardedHandoff && screenshotTest.status === "running") {
       screenshotTest.status = "failed"
       await screenshotTestRepo.save(screenshotTest)
 
@@ -785,60 +507,8 @@ export async function ingestStorybook(
     }
 
     log.info(
-      `Storybook ingestion completed for ${screenshotTest.id} (build #${screenshotTest.buildNumber}) with status: ${screenshotTest.status}`,
+      `Storybook ingestion ${shardedHandoff ? "handed off to render chunks" : "completed"} for ` +
+        `${screenshotTest.id} (build #${screenshotTest.buildNumber}) with status: ${screenshotTest.status}`,
     )
   }
-}
-
-async function updateGitHubCheckRunWithBuildResults(
-  githubCheckData: GitHubCheckData,
-  screenshotTest: ScreenshotTest,
-  testResults: TestResult[],
-  changeCount: number,
-): Promise<void> {
-  const hasChanges = changeCount > 0
-
-  try {
-    // Update GitHub check run "Visual Tests" with the build results
-    const resolveImageUrl = await buildImageUrlResolver(testResults)
-    const { title, summary, text } = createMarkdownForBuildResult(
-      screenshotTest,
-      testResults,
-      resolveImageUrl,
-    )
-    await updateGitHubCheckRun({
-      owner: githubCheckData.owner,
-      repo: githubCheckData.repo,
-      installationId: githubCheckData.installationId,
-      checkRunId: githubCheckData.checkRunId,
-      testId: screenshotTest.id,
-      status: hasChanges ? "queued" : "completed",
-      conclusion: hasChanges ? "action_required" : "success",
-      title,
-      summary,
-      text,
-      // Unfortunately, GitHub does not support actions for check runs that are queued
-      // actions: hasChanges
-      //   ? [
-      //       {
-      //         label: "✅ Approve",
-      //         description: `Approve ${changeCount} visual change${changeCount === 1 ? "" : "s"}`,
-      //         identifier: "approved",
-      //       },
-      //       {
-      //         label: "❌ Deny",
-      //         description: `Deny ${changeCount} visual change${changeCount === 1 ? "" : "s"}`,
-      //         identifier: "denied",
-      //       },
-      //     ]
-      //   : undefined,
-    })
-  } catch (error) {
-    log.error(error, "Failed to update GitHub check run to completed")
-    // Continue even if the GitHub API calls fail
-  }
-}
-
-async function getS3BucketForProjectId(_projectId: string): Promise<string> {
-  return S3_BUCKET_NAME
 }

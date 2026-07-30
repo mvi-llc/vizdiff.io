@@ -104,6 +104,9 @@ Single-host fallback: when `GITLAB_HOSTS` is unset, a single host is derived fro
 | `BUILD_TIMEOUT_FLOOR_MS` | worker | no | `900000` (15 min) | Lower bound on the derived whole-build ceiling, so small storybooks keep the previous 15-minute allowance rather than getting a tiny ceiling. Ignored when `BUILD_TIMEOUT_MS` is set explicitly. |
 | `BUILD_ABORT_GRACE_MS` | worker | no | `10000` | After the build watchdog (progress stall or ceiling) aborts the browser sessions, how long to wait for the in-flight render to actually unwind (running its `finally` blocks, returning sessions to the pool) before declaring it unrecoverable and exiting the worker so the orchestrator restarts a clean process. |
 | `BUILD_MEMORY_WARN_BYTES` | worker | no | `2147483648` (2 GiB) | Resident set size past which a build logs a memory-pressure warning. Purely observational; it does not abort the build. |
+| `WORKER_SHARDING_ENABLED` | worker | no | `false` | Cross-worker build sharding (issue #456, Phase B): split a large build into `render_story_chunk` tasks that any worker replica can claim, instead of rendering everything inside the discovery task. See "Cross-worker sharding" below — including the rolling-deploy caveat: enable only after **every** worker replica runs a version that understands the new task type. |
+| `WORKER_SHARD_CHUNK_SIZE` | worker | no | `50` | Stories per `render_story_chunk` task when sharding is enabled. Smaller chunks spread better across replicas and shrink a browser crash's blast radius to fewer stories, at more per-chunk overhead (browser-pool spin-up, story discovery; the extracted tarball is cached per upload). Values < 1 are clamped to 1. |
+| `WORKER_SHARD_MIN_STORIES` | worker | no | `100` | Minimum discovered story count before a build is sharded; smaller builds render inline in the discovery task, where per-chunk overhead would outweigh the parallelism. Values < 1 are clamped to 1. |
 | `POSTGRES_HOST` | api, worker | no | `localhost` | Postgres host. |
 | `POSTGRES_PORT` | api, worker | no | `5432` | Postgres port. |
 | `POSTGRES_USER` | api, worker | no | `postgres` | Postgres user. |
@@ -162,6 +165,33 @@ cumulatively over long builds — a 700+-story build under a 2 GiB limit was OOM
 each session to bound worst-case growth regardless of storybook size. If Chrome is still
 OOM-killed mid-build, raise the container limit or lower the recycle interval; a killed session is
 detected by the health probe and replaced, with affected stories retried (issues #450/#454).
+
+### Cross-worker sharding
+
+With `WORKER_SHARDING_ENABLED=true`, a build whose storybook contains at least
+`WORKER_SHARD_MIN_STORIES` stories is divided across all worker replicas instead of rendering
+inside a single worker (issue #456, Phase B):
+
+1. The discovery (`ingest_storybook`) task downloads the upload, enumerates its stories, records
+   `expected_story_count` on the build, and enqueues one `render_story_chunk` task per
+   `WORKER_SHARD_CHUNK_SIZE` stories — then releases its worker.
+2. Any worker claims chunk tasks (oldest-first, `SKIP LOCKED`), so every replica contributes to
+   the same build. Each chunk reuses a per-upload extracted-tarball cache under the OS temp dir
+   (downloading from S3 only on the first chunk a given worker sees; stale cache dirs are swept
+   after an hour), renders only its story ids, and upserts one result row per story.
+3. The last-finishing chunk "wins" a single-statement completion reconcile (guarded on
+   `status = 'running'`, so exactly one winner) and posts the final GitHub/GitLab status.
+
+A chunk-level failure is retried with backoff like any task; when a chunk exhausts its retry
+budget its remaining stories are recorded as failed results and the build completes with partial
+failures — a browser crash or watchdog abort costs one chunk, not the whole build. Per-chunk
+render timeouts derive from the chunk's story count (`WORKER_PER_STORY_BUDGET_MS` /
+`BUILD_TIMEOUT_FLOOR_MS`), and all chunks feed the same build-level progress heartbeat that the
+stuck-build sweeper watches.
+
+**Rolling-deploy caveat:** workers older than this feature fail `render_story_chunk` tasks with
+"Unknown task type". Leave `WORKER_SHARDING_ENABLED` off (the default) until **every** worker
+replica has been upgraded, then flip it on.
 
 ## Worker metrics
 

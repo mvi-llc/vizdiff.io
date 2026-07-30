@@ -306,6 +306,26 @@ export const WORKER_STUCK_RUNNING_MINUTES = intEnv("WORKER_STUCK_RUNNING_MINUTES
 // builds legitimately queue behind other work, so this stays conservative. Default: 240 minutes
 // (4 hours).
 export const WORKER_STUCK_PENDING_MINUTES = intEnv("WORKER_STUCK_PENDING_MINUTES", 240)
+
+// --- Cross-worker sharding (issue #456, Phase B) ------------------------------------------------
+
+// Split large builds across worker replicas: the discovery (ingest) task enumerates stories and
+// enqueues one `render_story_chunk` task per chunk, any worker claims chunks, and the
+// last-finishing chunk completes the build. Off by default; enable only once EVERY worker
+// replica runs a version that understands the `render_story_chunk` task type (older workers
+// error on it). See docs/CONFIGURATION.md "Cross-worker sharding".
+export const WORKER_SHARDING_ENABLED = process.env.WORKER_SHARDING_ENABLED === "true"
+
+// Number of stories per render_story_chunk task. Smaller chunks spread better across replicas
+// and shrink the blast radius of a browser crash to fewer stories, at the cost of more
+// per-chunk overhead (tarball reuse, browser-pool spin-up, discovery). Values < 1 are clamped
+// to 1. Default: 50.
+export const WORKER_SHARD_CHUNK_SIZE = Math.max(1, intEnv("WORKER_SHARD_CHUNK_SIZE", 50))
+
+// Minimum discovered story count before a build is sharded; smaller builds render inline in the
+// discovery task, where per-chunk overhead would outweigh the parallelism. Values < 1 are
+// clamped to 1. Default: 100.
+export const WORKER_SHARD_MIN_STORIES = Math.max(1, intEnv("WORKER_SHARD_MIN_STORIES", 100))
 // --- Screenshot retention reaper (#79) ---
 // The reaper deletes screenshot builds (and their S3 objects) older than the retention window,
 // while always keeping the most recent N builds per project so a rarely-built project is never
