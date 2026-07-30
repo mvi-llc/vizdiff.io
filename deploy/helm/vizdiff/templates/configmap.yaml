@@ -50,6 +50,18 @@ data:
   {{- with .Values.worker.chromeExtraArgs }}
   WORKER_CHROME_EXTRA_ARGS: {{ . | quote }}
   {{- end }}
+  {{- with .Values.worker.fatalFailsafeTimeoutMs }}
+  WORKER_FATAL_FAILSAFE_TIMEOUT_MS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.worker.maxTaskAttempts }}
+  WORKER_MAX_TASK_ATTEMPTS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.worker.stuckRunningMinutes }}
+  WORKER_STUCK_RUNNING_MINUTES: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.worker.stuckPendingMinutes }}
+  WORKER_STUCK_PENDING_MINUTES: {{ . | quote }}
+  {{- end }}
   {{- with .Values.worker.storyRenderTimeoutMs }}
   WORKER_STORY_RENDER_TIMEOUT_MS: {{ . | quote }}
   {{- end }}

@@ -11,10 +11,14 @@ import {
   IS_TEST,
   RETENTION_REAPER_ENABLED,
   RETENTION_SWEEP_INTERVAL_MS,
+  WORKER_MAX_TASK_ATTEMPTS,
+  WORKER_STUCK_PENDING_MINUTES,
+  WORKER_STUCK_RUNNING_MINUTES,
 } from "./environment"
 import type { GitHubCheckData } from "./github"
 import type { GitLabCheckData } from "./gitlab"
 import { markTaskFinished, markTaskStarted, startHealthServer } from "./health"
+import { WORKER_ID } from "./identity"
 import { ingestStorybook, isBaselineBuildPending } from "./ingest"
 import { log } from "./log"
 import { runRetentionSweep } from "./retention"
@@ -25,6 +29,7 @@ import {
   DependencyNotReadyError,
 } from "./tasks"
 import { BuildTimeoutError } from "./timeout"
+import { parseBuildCheckData, postBuildFailedStatus, type BuildCheckData } from "./vcsStatus"
 
 type IngestStorybookPayload = {
   projectId: string
@@ -40,13 +45,19 @@ const RETRY_INTERVAL_MS = 1000 * 15
 
 const MAX_RETRY_COUNT = 5 // Maximum number of retries before giving up
 const MAX_BACKOFF_MS = 1000 * 60 * 30 // 30 minutes max backoff
-// Consider a build stuck if it's been running for more than this amount of time
-const STUCK_RUNNING_THRESHOLD_MINUTES = 120 // 2 hours
+// Consider a build stuck if its last activity (COALESCE(last_progress_at, updated_at)) is older
+// than this while "running". Minutes-scale relative to BUILD_TIMEOUT_MS (issue #451), not hours.
+const STUCK_RUNNING_THRESHOLD_MINUTES = WORKER_STUCK_RUNNING_MINUTES
 // Consider a build stuck if it's been pending for more than this amount of time
-const STUCK_PENDING_THRESHOLD_MINUTES = 240 // 4 hours
-// Minimum interval between stuck-build sweeps. The idle poll tick is frequent (POLL_INTERVAL_MS);
-// the sweep only needs to run periodically since its thresholds are measured in hours.
+const STUCK_PENDING_THRESHOLD_MINUTES = WORKER_STUCK_PENDING_MINUTES
+// Minimum interval between stuck-build sweeps. maybeSweepStuckBuilds() is invoked both from the
+// idle poll tick and from a dedicated 1-minute timer (so sweeps still happen while a long build
+// is in flight); this throttle bounds the actual sweep rate.
 const STUCK_BUILD_SWEEP_INTERVAL_MS = 1000 * 60 * 5 // 5 minutes
+// How often the dedicated stuck-build sweep timer fires. Each tick goes through the
+// STUCK_BUILD_SWEEP_INTERVAL_MS throttle above, so the timer's job is only to guarantee sweeps
+// keep happening when the worker is busy (the idle tick never fires mid-build).
+const STUCK_BUILD_TIMER_INTERVAL_MS = 60_000
 
 // How long to defer a render task each time its dependent (baseline) build is
 // still pending/in-progress, before re-checking. This is the length of the
@@ -134,6 +145,21 @@ function activeBackoffTaskIds(now: number): Set<number> {
 
 async function main() {
   startHealthServer()
+
+  // Reclaim builds this worker owned before a crash/restart (issue #451) BEFORE subscribing for
+  // new tasks, so an orphaned "running" build is requeued or failed instead of sitting in
+  // "running" until the sweeper's threshold. Best-effort: a transient DB error must not
+  // crash-loop the worker at boot.
+  try {
+    await reclaimOrphanedBuilds(WORKER_ID)
+  } catch (err) {
+    log.error(err, "Error reclaiming orphaned builds at startup")
+  }
+
+  // Sweep for stuck builds on a dedicated timer as well as on idle poll ticks: the idle tick
+  // never fires while a build is in flight, so without this a wedged sibling worker's build
+  // would only be swept when this worker went idle. The call is throttled internally.
+  startStuckBuildSweepTimer()
 
   subscriber.notifications.on(TASKS_CHANNEL, (payload) => {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- pg-listen payload is untyped
@@ -232,6 +258,17 @@ export function maybeSweepStuckBuilds(): void {
     .finally(() => {
       stuckBuildSweepInFlight = false
     })
+}
+
+/**
+ * Register the dedicated stuck-build sweep timer (issue #451). Unlike the idle poll tick, this
+ * fires even while a (possibly wedged) build is in flight, so stuck builds are swept on a
+ * minutes-scale cadence regardless of worker business. Each tick goes through
+ * maybeSweepStuckBuilds()'s throttle, which bounds the actual sweep rate. Unref'd so it never
+ * keeps a shutting-down process alive.
+ */
+export function startStuckBuildSweepTimer(): NodeJS.Timeout {
+  return setInterval(() => maybeSweepStuckBuilds(), STUCK_BUILD_TIMER_INTERVAL_MS).unref()
 }
 
 export function pollForNewTasks(): void {
@@ -450,6 +487,9 @@ export async function processTask(
           uploadId,
           githubCheckData,
           gitlabCheckData,
+          // Pass the queue row id so the fatal fast-fail path (issue #451) can delete it before
+          // process.exit — a wedged build is non-retryable.
+          currentTaskId,
         )
 
         // Task completed successfully, delete it from the queue
@@ -524,6 +564,25 @@ export function handleShutdownSignal(signal: NodeJS.Signals): void {
       }
     }
 
+    // Reset any build this worker owns that is still "running" back to "pending" (issue #451):
+    // the released task can then be picked up by another worker without tripping the startup
+    // reclaim or the stuck-build sweeper.
+    try {
+      const client = await DatabasePool()
+      try {
+        await client.query(
+          `UPDATE screenshot_tests
+           SET status = 'pending', worker_id = NULL, updated_at = NOW()
+           WHERE status = 'running' AND worker_id = $1`,
+          [WORKER_ID],
+        )
+      } finally {
+        client.release()
+      }
+    } catch (err) {
+      log.error(err, "Error resetting in-flight build to pending during shutdown")
+    }
+
     try {
       await closeDatabasePool()
     } catch (err) {
@@ -594,8 +653,129 @@ export async function giveUpOnTask(taskQueueId: number): Promise<void> {
 }
 
 /**
+ * Reclaim builds orphaned by a previous incarnation of this worker (issue #451): builds still
+ * marked "running" with our worker id after a crash/OOM-kill/fatal exit. Called once at startup,
+ * before the worker subscribes for new tasks.
+ *
+ * For each orphaned build: if its queue row survives and its attempt budget
+ * (WORKER_MAX_TASK_ATTEMPTS) is not exhausted, requeue it (unlock the task, flip the build back
+ * to pending) so it is retried; otherwise fail the build, drop any queue row, and best-effort
+ * post the failed VCS status so CI is unblocked immediately.
+ */
+export async function reclaimOrphanedBuilds(workerId: string): Promise<void> {
+  const client = await DatabasePool()
+  try {
+    const res = await client.query(
+      `SELECT id FROM screenshot_tests WHERE status = 'running' AND worker_id = $1`,
+      [workerId],
+    )
+    if ((res.rowCount ?? 0) === 0) {
+      log.debug(`No orphaned running builds owned by ${workerId}`)
+      return
+    }
+    log.warn(`Found ${res.rowCount} orphaned running build(s) owned by ${workerId}; reclaiming`)
+
+    for (const row of res.rows as Array<{ id: number }>) {
+      const buildId = row.id
+      const taskRes = await client.query(
+        `SELECT id, attempts FROM task_queue
+         WHERE screenshot_test_id = $1 AND task_type = 'ingest_storybook'
+         ORDER BY id DESC
+         LIMIT 1`,
+        [buildId],
+      )
+      const task =
+        (taskRes.rowCount ?? 0) > 0
+          ? (taskRes.rows[0] as { id: number; attempts: number })
+          : undefined
+
+      if (task && task.attempts < WORKER_MAX_TASK_ATTEMPTS) {
+        // Requeue: unlock the task and flip the build back to pending so any worker (including
+        // this one) can pick it up again.
+        log.warn(
+          `Requeueing orphaned build ${buildId} (task ${task.id}, attempt ${task.attempts}/${WORKER_MAX_TASK_ATTEMPTS})`,
+        )
+        await client.query(
+          `UPDATE task_queue SET locked_at = NULL, locked_by = NULL WHERE id = $1`,
+          [task.id],
+        )
+        await client.query(
+          `UPDATE screenshot_tests
+           SET status = 'pending', worker_id = NULL, updated_at = NOW()
+           WHERE id = $1 AND status = 'running'`,
+          [buildId],
+        )
+      } else {
+        // The queue row is gone (the task cannot run again) or the attempt budget is exhausted
+        // (the build reliably kills a worker): fail the build instead of crash-looping on it.
+        log.warn(
+          task
+            ? `Failing orphaned build ${buildId}: attempt budget exhausted (${task.attempts}/${WORKER_MAX_TASK_ATTEMPTS})`
+            : `Failing orphaned build ${buildId}: its task queue row is gone`,
+        )
+        const upd = await client.query(
+          `UPDATE screenshot_tests
+           SET status = 'failed', worker_id = NULL, updated_at = NOW()
+           WHERE id = $1 AND status = 'running'
+           RETURNING id`,
+          [buildId],
+        )
+        let checkData: BuildCheckData | undefined
+        if (task) {
+          const del = await client.query(`DELETE FROM task_queue WHERE id = $1 RETURNING data`, [
+            task.id,
+          ])
+          checkData = parseBuildCheckData((del.rows[0] as { data?: unknown } | undefined)?.data)
+        }
+        if ((upd.rowCount ?? 0) > 0) {
+          await postFailedStatusForBuildId(
+            buildId,
+            "Build was orphaned by a worker restart and could not be retried",
+            checkData,
+          )
+        }
+      }
+    }
+  } finally {
+    client.release()
+  }
+}
+
+/**
+ * Load a build through TypeORM (for its eager project + user relations) and best-effort post the
+ * failed VCS status for it. Used by the startup reclaim and the stuck-build sweeper, where only
+ * the build id (and possibly salvaged task check data) is at hand. Never throws.
+ */
+async function postFailedStatusForBuildId(
+  buildId: number,
+  reason: string,
+  checkData?: BuildCheckData,
+): Promise<void> {
+  try {
+    const db = await Database()
+    const screenshotTest = await db.getRepository(ScreenshotTest).findOneBy({ id: buildId })
+    if (!screenshotTest) {
+      log.warn(`Cannot post failed VCS status for build ${buildId}: build not found`)
+      return
+    }
+    await postBuildFailedStatus(screenshotTest, reason, checkData)
+  } catch (err) {
+    log.error(err, `Error posting failed VCS status for build ${buildId}`)
+  }
+}
+
+/**
  * Checks for screenshot tests that have been in "running" or "pending" status for too long
  * and marks them as "failed".
+ *
+ * A "running" build is stuck once its last activity — COALESCE(last_progress_at, updated_at);
+ * last_progress_at is reserved for the render progress watchdog (#452) and not yet written — is
+ * older than WORKER_STUCK_RUNNING_MINUTES. A "pending" build is stuck once updated_at is older
+ * than WORKER_STUCK_PENDING_MINUTES.
+ *
+ * Each stuck build is failed via a conditional UPDATE (`WHERE id = $1 AND status = <observed>`),
+ * so when several workers sweep concurrently only the one whose UPDATE returns the row deletes
+ * the build's queue rows and posts the failed VCS status — at most one status post per build.
  *
  * @returns Promise with the number of stuck builds that were updated
  */
@@ -608,29 +788,24 @@ export async function sweepStuckBuilds(): Promise<number> {
     const db = await Database()
     const screenshotTestRepo = db.getRepository(ScreenshotTest)
 
-    // Calculate threshold dates for running and pending builds
-    const runningThresholdDate = new Date()
-    runningThresholdDate.setMinutes(
-      runningThresholdDate.getMinutes() - STUCK_RUNNING_THRESHOLD_MINUTES,
-    )
-
-    const pendingThresholdDate = new Date()
-    pendingThresholdDate.setMinutes(
-      pendingThresholdDate.getMinutes() - STUCK_PENDING_THRESHOLD_MINUTES,
-    )
-
-    // Find stuck "running" builds
+    // Find stuck "running" builds by last activity (progress heartbeat when available, else the
+    // last status write).
     const stuckRunningBuilds = await screenshotTestRepo
       .createQueryBuilder("test")
       .where("test.status = :status", { status: "running" })
-      .andWhere("test.updated_at < :thresholdDate", { thresholdDate: runningThresholdDate })
+      .andWhere(
+        "COALESCE(test.last_progress_at, test.updated_at) < NOW() - (:minutes * INTERVAL '1 minute')",
+        { minutes: STUCK_RUNNING_THRESHOLD_MINUTES },
+      )
       .getMany()
 
     // Find stuck "pending" builds
     const stuckPendingBuilds = await screenshotTestRepo
       .createQueryBuilder("test")
       .where("test.status = :status", { status: "pending" })
-      .andWhere("test.updated_at < :thresholdDate", { thresholdDate: pendingThresholdDate })
+      .andWhere("test.updated_at < NOW() - (:minutes * INTERVAL '1 minute')", {
+        minutes: STUCK_PENDING_THRESHOLD_MINUTES,
+      })
       .getMany()
 
     // Combine both lists
@@ -640,22 +815,58 @@ export async function sweepStuckBuilds(): Promise<number> {
       return 0
     }
 
-    // Update stuck builds to "failed" status
     log.info(
       `Found ${stuckBuilds.length} stuck builds to update (${stuckRunningBuilds.length} running, ${stuckPendingBuilds.length} pending)`,
     )
 
-    for (const build of stuckBuilds) {
-      const runningDurationHours = (Date.now() - build.updatedAt.getTime()) / (1000 * 60 * 60)
-      log.warn(
-        `Marking stuck build ${build.id} as failed (stuck in "${build.status}" for ${runningDurationHours.toFixed(1)} hours)`,
-      )
+    let sweptCount = 0
+    const client = await DatabasePool()
+    try {
+      for (const build of stuckBuilds) {
+        // Conditional flip: only proceed if the build is still in the status we observed. A
+        // concurrent sweeper (or the build finishing) loses/wins this race atomically, so the
+        // queue-row cleanup and VCS status post below happen exactly once.
+        const upd = await client.query(
+          `UPDATE screenshot_tests SET status = 'failed', updated_at = NOW()
+           WHERE id = $1 AND status = $2
+           RETURNING id`,
+          [build.id, build.status],
+        )
+        if ((upd.rowCount ?? 0) === 0) {
+          continue
+        }
+        sweptCount++
 
-      build.status = "failed"
-      await screenshotTestRepo.save(build)
+        const lastActivityAt = build.lastProgressAt ?? build.updatedAt
+        const stuckDurationHours = (Date.now() - lastActivityAt.getTime()) / (1000 * 60 * 60)
+        log.warn(
+          `Marking stuck build ${build.id} as failed (stuck in "${build.status}" for ${stuckDurationHours.toFixed(1)} hours)`,
+        )
+
+        // Drop any queue rows so the dead build cannot be re-selected, salvaging the stored VCS
+        // check data for the status post.
+        const del = await client.query(
+          `DELETE FROM task_queue WHERE screenshot_test_id = $1 RETURNING data`,
+          [build.id],
+        )
+        let checkData: BuildCheckData | undefined
+        for (const delRow of del.rows as Array<{ data?: unknown }>) {
+          checkData ??= parseBuildCheckData(delRow.data)
+        }
+
+        // Re-load through find (not the query builder) so eager relations (project, user) are
+        // populated for check-data reconstruction.
+        await postFailedStatusForBuildId(
+          build.id,
+          `Build was stuck in "${build.status}" and marked failed by the stuck-build sweeper`,
+          checkData,
+        )
+      }
+    } finally {
+      client.release()
     }
 
-    return stuckBuilds.length
+    return sweptCount
   } catch (error) {
     log.error(error, "Error while sweeping for stuck builds")
     throw error

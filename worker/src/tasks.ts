@@ -1,10 +1,12 @@
 import { DatabasePool } from "./database"
+import { WORKER_ID } from "./identity"
 import { log } from "./log"
 
 type Task = {
   task_type: string
   screenshot_test_id: number
   data: Record<string, unknown>
+  attempts: number
 }
 
 const LOCK_TIMEOUT_MINUTES = 60
@@ -123,15 +125,18 @@ export async function latestTaskQueueId(
 export async function fetchTask(taskQueueId: number): Promise<Task | undefined> {
   const client = await DatabasePool()
   try {
-    // First try to acquire the lock atomically, respecting the lock timeout
+    // First try to acquire the lock atomically, respecting the lock timeout. The claim records
+    // the stable WORKER_ID (hostname, not pid — issue #451) so a restarted worker can recognize
+    // its own orphaned work, and bumps `attempts` so the startup reclaim can bound how many
+    // times a crashing build is requeued.
     const lockRes = await client.query(
-      `UPDATE task_queue 
-       SET locked_at = NOW(), locked_by = $1
-       WHERE id = $2 
-         AND (locked_at IS NULL 
+      `UPDATE task_queue
+       SET locked_at = NOW(), locked_by = $1, attempts = attempts + 1
+       WHERE id = $2
+         AND (locked_at IS NULL
            OR locked_at < NOW() - INTERVAL '${LOCK_TIMEOUT_MINUTES} minutes')
-       RETURNING task_type, screenshot_test_id, data`,
-      [`worker-${process.pid}`, taskQueueId],
+       RETURNING task_type, screenshot_test_id, data, attempts`,
+      [WORKER_ID, taskQueueId],
     )
 
     // If no rows were updated, the task was already locked or doesn't exist
@@ -163,9 +168,11 @@ export async function fetchTask(taskQueueId: number): Promise<Task | undefined> 
       !("task_type" in row) ||
       !("screenshot_test_id" in row) ||
       !("data" in row) ||
+      !("attempts" in row) ||
       typeof row.task_type !== "string" ||
       typeof row.screenshot_test_id !== "number" ||
-      typeof row.data !== "object"
+      typeof row.data !== "object" ||
+      typeof row.attempts !== "number"
     ) {
       throw new Error(`Task ${taskQueueId} has invalid row: ${JSON.stringify(row)}`)
     }

@@ -199,6 +199,32 @@ export const BUILD_MEMORY_WARN_BYTES = parseInt(
   process.env.BUILD_MEMORY_WARN_BYTES ?? `${2 * 1024 * 1024 * 1024}`,
   10,
 )
+
+// --- Build lifecycle hardening (issue #451) ----------------------------------------------------
+
+// Upper bound on the best-effort "fail the build + post the failed VCS status" work that runs
+// just before a fatal `process.exit(1)` (wedged render after a build timeout). The exit must not
+// be delayed indefinitely by a slow database or VCS API, so the failsafe is raced against this
+// timer. Default: 5 seconds.
+export const WORKER_FATAL_FAILSAFE_TIMEOUT_MS = intEnv("WORKER_FATAL_FAILSAFE_TIMEOUT_MS", 5000)
+
+// Maximum number of times a task may be claimed (task_queue.attempts) before the startup orphan
+// reclaim fails the build outright instead of requeueing it. Bounds the crash loop where a build
+// reliably wedges the worker: each restart re-runs the build until this many attempts have been
+// burned. Default: 3.
+export const WORKER_MAX_TASK_ATTEMPTS = intEnv("WORKER_MAX_TASK_ATTEMPTS", 3)
+
+// Consider a "running" build stuck once its last activity (COALESCE(last_progress_at,
+// updated_at)) is older than this many minutes. Minutes-scale relative to BUILD_TIMEOUT_MS (15
+// minutes by default): a healthy build either finishes or is failed by the timeout well within
+// this window, so anything older is orphaned. Replaces the former fixed 2-hour threshold.
+// Default: 15 minutes.
+export const WORKER_STUCK_RUNNING_MINUTES = intEnv("WORKER_STUCK_RUNNING_MINUTES", 15)
+
+// Consider a "pending" build stuck once updated_at is older than this many minutes. Pending
+// builds legitimately queue behind other work, so this stays conservative. Default: 240 minutes
+// (4 hours).
+export const WORKER_STUCK_PENDING_MINUTES = intEnv("WORKER_STUCK_PENDING_MINUTES", 240)
 // --- Screenshot retention reaper (#79) ---
 // The reaper deletes screenshot builds (and their S3 objects) older than the retention window,
 // while always keeping the most recent N builds per project so a rarely-built project is never

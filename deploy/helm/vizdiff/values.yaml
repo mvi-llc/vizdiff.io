@@ -175,6 +175,20 @@ worker:
   # -- Whitespace-separated extra Chrome flags appended to the worker's screenshot sessions,
   # after the hardening and WebGL flags (WORKER_CHROME_EXTRA_ARGS).
   chromeExtraArgs: ""
+  # -- Upper bound (ms) on the best-effort "fail the build + post the failed VCS status" work
+  # that runs before the worker's fatal exit on a wedged render (issue #451,
+  # WORKER_FATAL_FAILSAFE_TIMEOUT_MS). Empty uses the built-in default (5000).
+  fatalFailsafeTimeoutMs: ""
+  # -- Maximum number of times a task may be claimed before the startup orphan reclaim fails the
+  # build instead of requeueing it (issue #451, WORKER_MAX_TASK_ATTEMPTS). Empty uses the
+  # built-in default (3).
+  maxTaskAttempts: ""
+  # -- Stuck-build sweeper threshold (minutes) for "running" builds (issue #451,
+  # WORKER_STUCK_RUNNING_MINUTES). Empty uses the built-in default (15).
+  stuckRunningMinutes: ""
+  # -- Stuck-build sweeper threshold (minutes) for "pending" builds (issue #451,
+  # WORKER_STUCK_PENDING_MINUTES). Empty uses the built-in default (240).
+  stuckPendingMinutes: ""
   # -- Per-story render timeout in ms (WORKER_STORY_RENDER_TIMEOUT_MS, issue #458). After
   # navigation the worker waits for Storybook's story-render lifecycle to complete before
   # capturing; a story that never completes is marked failed. Empty uses the default (30000).
