@@ -196,6 +196,21 @@ worker:
   # -- Cap in ms on a story's opt-in pre-capture delay, parameters.vizdiff.delay /
   # parameters.chromatic.delay (WORKER_STORY_DELAY_MAX_MS). Empty uses the default (15000).
   storyDelayMaxMs: ""
+  # -- Recycle each pooled Chrome session after this many rendered stories to bound cumulative
+  # memory growth over long builds (issue #453, WORKER_SESSION_RECYCLE_STORIES). "0" disables
+  # recycling. Empty uses the built-in default (150).
+  sessionRecycleStories: ""
+  # -- Timeout in ms for the between-stories browser-session health probe that detects a dead
+  # (e.g. OOM-killed) Chrome session so it can be replaced (issue #450,
+  # WORKER_SESSION_PROBE_TIMEOUT_MS). Empty uses the built-in default (5000).
+  sessionProbeTimeoutMs: ""
+  # -- Replace a pooled session after this many consecutive infrastructure-classified story
+  # failures (issue #450, WORKER_SESSION_MAX_INFRA_FAILURES). Empty uses the built-in default (2).
+  sessionMaxInfraFailures: ""
+  # -- Maximum render attempts per story; infra-classified failures are retried on a healthy
+  # session before being recorded (issue #454, WORKER_STORY_MAX_ATTEMPTS). Empty uses the
+  # built-in default (2).
+  storyMaxAttempts: ""
 
 # Per-service container resource requests/limits.
 resources:

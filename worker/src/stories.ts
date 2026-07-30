@@ -13,13 +13,17 @@ import {
 import type { Repository } from "typeorm"
 import type { Browser } from "webdriverio"
 
+import type { BrowserPool } from "./browserPool"
 import {
   MAX_STORY_IDENTIFIER_LENGTH,
   WORKER_CHANGED_MIN_PIXELS,
   WORKER_CHANGED_THRESHOLD,
+  WORKER_STORY_MAX_ATTEMPTS,
 } from "./environment"
+import { classifyStoryError, StorageError, type ClassifiedStoryError } from "./errorClassify"
 import { diffImages, diffImagesNoMask } from "./images"
 import { log } from "./log"
+import { probeSession } from "./sessionHealth"
 import { waitForStoryReady } from "./storyReady"
 import type { SetViewportOptions, Story, StorybookWindow } from "./types"
 
@@ -378,7 +382,115 @@ export async function captureStableScreenshot(
   return outputFilePath
 }
 
-export async function processStory({
+/** Max stored length of a failed result's `errorMessage` column. */
+const MAX_ERROR_MESSAGE_LENGTH = 2000
+
+/**
+ * Renders one story with per-story retry on infrastructure failures (issues #450/#454).
+ *
+ * Each attempt checks a session out of the pool, health-probes it (replacing it if dead — a dead
+ * session would otherwise burn the webdriver package's hardcoded 60 s BiDi command timeout per
+ * command), and renders via {@link renderStory}. On failure the error is classified:
+ *
+ *  - story-class (the story threw, never became ready, or an unrecognized error): recorded
+ *    immediately as a `failed` TestResult with its error kind — retrying would just fail again.
+ *  - infra-class (dead session, command timeout, storage): the session's failure counter is
+ *    bumped (condemning it for replacement at the pool's threshold) and the story is retried on
+ *    the next attempt, up to WORKER_STORY_MAX_ATTEMPTS total attempts.
+ *
+ * Exactly one TestResult row is persisted per story in all paths, and this never throws for
+ * per-story failures — one story (or one dead session) must not abort the whole build.
+ */
+export async function processStoryWithRetry(
+  info: Omit<StoryInfo, "browser"> & { pool: BrowserPool },
+): Promise<TestResult> {
+  const { pool, ...storyInfo } = info
+  const { story, projectId, uploadId } = storyInfo
+  const maxAttempts = Math.max(1, WORKER_STORY_MAX_ATTEMPTS)
+  const logChild = log.child({ projectId, uploadId, storyId: story.id })
+
+  let lastInfraError: ClassifiedStoryError | undefined
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const session = await pool.acquire()
+    try {
+      // Detect a dead session cheaply before paying a full per-story command-timeout chain
+      // (issue #450). replace() swaps in a fresh browser in place.
+      if (!(await probeSession(session.browser))) {
+        logChild.warn(
+          { sessionId: session.id, attempt },
+          "Browser session failed health probe; replacing it",
+        )
+        await pool.replace(session, "probe-failed")
+      }
+      // Read the browser AFTER probe/replace so a replacement is picked up.
+      const testResult = await renderStory({ ...storyInfo, browser: session.browser })
+      session.consecutiveInfraFailures = 0
+      session.storiesRendered++
+      return testResult
+    } catch (err) {
+      const classified = classifyStoryError(err)
+      if (classified.errorClass === "story") {
+        logChild.error(
+          { err, kind: classified.kind, attempt },
+          `Story ${story.id} failed to render (${classified.kind}); recording failed result`,
+        )
+        return await recordErrorTestResult(storyInfo, classified)
+      }
+      // Infra-class: condemn the session towards replacement and retry on the next attempt.
+      session.consecutiveInfraFailures++
+      lastInfraError = classified
+      logChild.warn(
+        { err, kind: classified.kind, attempt, maxAttempts, sessionId: session.id },
+        `Infra failure rendering story ${story.id} (${classified.kind}); ` +
+          (attempt < maxAttempts ? "retrying on a healthy session" : "attempt budget exhausted"),
+      )
+    } finally {
+      await pool.release(session)
+    }
+  }
+
+  // Attempt budget exhausted: record the last infra failure so reviewers can distinguish
+  // "the harness failed" from "the story is broken" (issue #454).
+  return await recordErrorTestResult(
+    storyInfo,
+    lastInfraError ?? { errorClass: "infra", kind: "unknown", message: "Unknown infra failure" },
+  )
+}
+
+/**
+ * Persists the single `failed` TestResult row for a story that could not be rendered (issue #152
+ * failure isolation: the build keeps going). `newImageUrl` is NOT NULL with no screenshot for a
+ * failed story, so it is stored as an empty string. `errorKind`/`errorMessage` (issue #454) let
+ * the API/UI distinguish infra failures from genuine story failures.
+ */
+async function recordErrorTestResult(
+  { story, screenshotTest, testResultTable }: Omit<StoryInfo, "browser">,
+  classified: ClassifiedStoryError,
+): Promise<TestResult> {
+  const testResult = new TestResult()
+  testResult.name = getStoryName(story)
+  testResult.screenshotTest = screenshotTest
+  testResult.storyId = story.id
+  testResult.story = story
+  testResult.newImageUrl = ""
+  testResult.baselineImageUrl = null
+  testResult.diffImageUrl = null
+  testResult.diffRatio = null
+  testResult.changeStatus = "failed"
+  testResult.errorKind = classified.kind
+  testResult.errorMessage = classified.message.slice(0, MAX_ERROR_MESSAGE_LENGTH)
+  await testResultTable.save(testResult)
+  return testResult
+}
+
+/**
+ * Renders one story against the given browser session and persists its TestResult: capture a
+ * stable screenshot, upload it, compare against the baseline (when present), upload the diff, and
+ * save the row. THROWS on failure (screenshot capture, S3 persistence) — error recording and
+ * retry policy live in {@link processStoryWithRetry}. A missing/corrupt baseline is NOT a
+ * failure: it downgrades the result to "new".
+ */
+export async function renderStory({
   story,
   screenshotTest,
   baseTestResult,
@@ -400,54 +512,34 @@ export async function processStory({
   const screenshotTempDir = path.join(tmpDir, "stabilization") // Subdir for temp files
   await fsPromises.mkdir(screenshotTempDir, { recursive: true })
 
-  try {
-    await captureStableScreenshot(
-      browser,
-      story,
-      viewport,
-      port,
-      screenshotTempDir,
-      localScreenshotPath,
-    )
-  } catch (err) {
-    logChild.error(
-      { err, buildNumber: screenshotTest.buildNumber },
-      `Failed to capture stable screenshot for story ${storyId}`,
-    )
-    // Record a minimal failed TestResult and KEEP GOING (issue #152 failure isolation): one story
-    // that fails to render must not abort the whole build. The build still completes and reports;
-    // build-level failure is reserved for setup errors (download/extract/session init) raised in
-    // ingest.ts, outside this per-story path. `newImageUrl` is NOT NULL with no screenshot for a
-    // failed story, so it is stored as an empty string.
-    const name = getStoryName(story)
-    const testResult = new TestResult()
-    testResult.name = name
-    testResult.screenshotTest = screenshotTest
-    testResult.storyId = storyId
-    testResult.story = story
-    testResult.newImageUrl = ""
-    testResult.baselineImageUrl = null
-    testResult.diffImageUrl = null
-    testResult.diffRatio = null
-    testResult.changeStatus = "failed"
-    await testResultTable.save(testResult)
-    return testResult
-  }
+  await captureStableScreenshot(
+    browser,
+    story,
+    viewport,
+    port,
+    screenshotTempDir,
+    localScreenshotPath,
+  )
 
   // Read the saved screenshot buffer for upload and comparison
   const screenshotBuffer = await fsPromises.readFile(localScreenshotPath)
 
-  // Upload screenshot to S3
+  // Upload screenshot to S3. Wrapped in StorageError so an upload failure is classified as a
+  // retryable infra failure instead of aborting the whole build (issue #454).
   const screenshotKey = buildScreenshotKey(projectId, uploadId, storyId)
   logChild.debug({ screenshotKey }, `Uploading screenshot to S3: ${screenshotKey}`)
-  await s3Client.send(
-    new PutObjectCommand({
-      Bucket: bucket,
-      Key: screenshotKey,
-      Body: screenshotBuffer,
-      ContentType: "image/png",
-    }),
-  )
+  try {
+    await s3Client.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: screenshotKey,
+        Body: screenshotBuffer,
+        ContentType: "image/png",
+      }),
+    )
+  } catch (err) {
+    throw new StorageError(`Failed to upload screenshot for story ${storyId} to S3`, err)
+  }
   // Store the S3 object key (not a public URL); the bucket is private and images are served via
   // presigned URLs generated at read time (see api/src/s3.ts, worker/src/s3.ts).
   const newImageUrl = screenshotKey
@@ -514,14 +606,20 @@ export async function processStory({
           await fsPromises.writeFile(diffPath, PNG.sync.write(diffRes.diffMask))
           const diffKey = diffImageKey(projectId, uploadId, storyId)
           logChild.debug({ diffKey }, "Uploading diff image to S3")
-          await s3Client.send(
-            new PutObjectCommand({
-              Bucket: bucket,
-              Key: diffKey,
-              Body: await fsPromises.readFile(diffPath),
-              ContentType: "image/png",
-            }),
-          )
+          // Wrapped in StorageError (outside the baseline try/catch below via rethrow) so a diff
+          // upload failure is a retryable infra failure, not a silent "new" downgrade.
+          try {
+            await s3Client.send(
+              new PutObjectCommand({
+                Bucket: bucket,
+                Key: diffKey,
+                Body: await fsPromises.readFile(diffPath),
+                ContentType: "image/png",
+              }),
+            )
+          } catch (err) {
+            throw new StorageError(`Failed to upload diff image for story ${storyId} to S3`, err)
+          }
           diffImageUrl = diffKey
           logChild.info(
             { diffImageUrl, diffImageBytes: diffRes.diffMask.data.byteLength },
@@ -529,6 +627,11 @@ export async function processStory({
           )
         }
       } catch (err) {
+        // A diff-upload StorageError is a real infra failure and must propagate to the retry
+        // loop; only baseline download/decode problems downgrade the result to "new".
+        if (err instanceof StorageError) {
+          throw err
+        }
         logChild.warn({ err }, "Baseline screenshot not available")
         changeStatus = "new"
       }

@@ -90,6 +90,10 @@ Single-host fallback: when `GITLAB_HOSTS` is unset, a single host is derived fro
 | `WORKER_STUCK_PENDING_MINUTES` | worker | no | `240` | Stuck-build sweeper threshold for `pending` builds (issue #451): a pending build not updated for this many minutes is marked failed. Conservative because pending builds legitimately queue behind other work. |
 | `WORKER_STORY_RENDER_TIMEOUT_MS` | worker | no | `30000` | Per-story render timeout (issue #458). After navigating to a story the worker waits for Storybook's story-render lifecycle to complete (a `storyRendered`/`docsRendered` channel event, or Storybook 8's `currentRender` phase reaching `completed`) before the visual-stability capture loop starts, so async/Suspense stories are not captured as loading spinners. A story that neither completes nor errors within this window is marked **failed**. See "Story readiness" below. |
 | `WORKER_STORY_DELAY_MAX_MS` | worker | no | `15000` | Upper bound on a story's opt-in pre-capture delay (`parameters.vizdiff.delay` / `parameters.chromatic.delay`). Story parameters come from untrusted uploads, so larger requested delays are clamped to this cap to keep one story from stalling a build. |
+| `WORKER_SESSION_RECYCLE_STORIES` | worker | no | `150` | Recycle (close + relaunch) each pooled Chrome session after it has rendered this many stories (issue #453). Chrome's memory grows cumulatively over long builds until the kernel OOM-kills it; periodic recycling bounds worst-case memory regardless of storybook size, at ~1–2 s per recycle. `0` disables recycling. See "Worker memory sizing" below. |
+| `WORKER_SESSION_PROBE_TIMEOUT_MS` | worker | no | `5000` | Timeout for the cheap between-stories browser-session health probe (issue #450): a trivial script raced against this local timer. A dead session (e.g. Chrome OOM-killed mid-build) otherwise burns the webdriver package's hardcoded 60 s command timeout per command; the probe detects death within this window instead, and the worker replaces the session. |
+| `WORKER_SESSION_MAX_INFRA_FAILURES` | worker | no | `2` | Treat a pooled session as dead after this many *consecutive* infrastructure-classified story failures (issue #450): the pool replaces it with a fresh Chrome session before handing it to the next render. `0` disables the threshold (probe-based replacement still applies). |
+| `WORKER_STORY_MAX_ATTEMPTS` | worker | no | `2` | Maximum render attempts per story (issue #454). Only infrastructure-classified failures (dead session, command timeout, storage) are retried on a healthy session; story-classified failures (the story threw, or never became ready) are recorded immediately since retrying would just fail again. When the budget is exhausted the story is recorded as **failed** with its infra `errorKind`, so reviewers can distinguish "the harness failed" from "the story is broken". |
 | `POSTGRES_HOST` | api, worker | no | `localhost` | Postgres host. |
 | `POSTGRES_PORT` | api, worker | no | `5432` | Postgres port. |
 | `POSTGRES_USER` | api, worker | no | `postgres` | Postgres user. |
@@ -137,6 +141,17 @@ Single-host fallback: when `GITLAB_HOSTS` is unset, a single host is derived fro
 
 \* Credentials may be supplied via IRSA, instance profiles, or the standard AWS credential chain
 instead of static keys.
+
+### Worker memory sizing
+
+Size the worker's container memory limit against `WORKER_STORY_CONCURRENCY`: budget the worker's
+base footprint plus roughly **1–1.5 GiB per concurrent Chrome session** (more when
+`WORKER_ENABLE_WEBGL` is on, since SwiftShader rasterizes in-process). Chrome's memory grows
+cumulatively over long builds — a 700+-story build under a 2 GiB limit was OOM-killed around story
+150–200 (issue #453) — so `WORKER_SESSION_RECYCLE_STORIES` (default 150) periodically relaunches
+each session to bound worst-case growth regardless of storybook size. If Chrome is still
+OOM-killed mid-build, raise the container limit or lower the recycle interval; a killed session is
+detected by the health probe and replaced, with affected stories retried (issues #450/#454).
 
 ## Story readiness
 

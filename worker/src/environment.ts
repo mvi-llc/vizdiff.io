@@ -181,6 +181,31 @@ export const WORKER_STORY_RENDER_TIMEOUT_MS = intEnv("WORKER_STORY_RENDER_TIMEOU
 // `parameters.chromatic.delay`). Story parameters come from untrusted uploads, so larger requested
 // delays are clamped to this cap to keep one story from stalling a build. Default: 15 seconds.
 export const WORKER_STORY_DELAY_MAX_MS = intEnv("WORKER_STORY_DELAY_MAX_MS", 15_000)
+// --- Browser-session resilience (issues #450/#453/#454) ----------------------------------------
+
+// Replace (close + relaunch) a pooled Chrome session after it has rendered this many stories
+// (issue #453). Chrome's renderer/GPU-process memory grows cumulatively over long builds until the
+// kernel OOM-kills it (observed around story 150-200 under a 2 GiB cgroup limit); periodic
+// recycling bounds worst-case memory regardless of storybook size at a cost of ~1-2 s per recycle.
+// 0 disables recycling. Default: 150.
+export const WORKER_SESSION_RECYCLE_STORIES = intEnv("WORKER_SESSION_RECYCLE_STORIES", 150)
+
+// Timeout for the cheap between-stories session health probe (issue #450): a trivial `execute`
+// raced against this local timer. A dead session makes every command burn the webdriver package's
+// hardcoded 60 s BiDi command timeout, so the probe detects death in at most this many ms instead.
+// Default: 5 seconds.
+export const WORKER_SESSION_PROBE_TIMEOUT_MS = intEnv("WORKER_SESSION_PROBE_TIMEOUT_MS", 5000)
+
+// Treat a session as dead after this many consecutive infra-classified story failures (issue
+// #450): the pool replaces it before handing it to the next renderer. Default: 2.
+export const WORKER_SESSION_MAX_INFRA_FAILURES = intEnv("WORKER_SESSION_MAX_INFRA_FAILURES", 2)
+
+// Maximum number of render attempts per story (issue #454). Only infra-classified failures (dead
+// session, command timeout, storage) are retried — story-classified failures (the story threw or
+// never became ready) are recorded immediately, since retrying them would just fail again.
+// Default: 2 (one retry).
+export const WORKER_STORY_MAX_ATTEMPTS = intEnv("WORKER_STORY_MAX_ATTEMPTS", 2)
+
 // Maximum wall-clock duration for a single storybook build before it is aborted. A build that
 // exceeds this is almost always stuck or pathologically large, so the task is treated as a
 // non-retryable failure (see worker.ts). Default: 15 minutes.
