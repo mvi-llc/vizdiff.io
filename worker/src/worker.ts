@@ -12,6 +12,7 @@ import {
   RETENTION_REAPER_ENABLED,
   RETENTION_SWEEP_INTERVAL_MS,
   WORKER_MAX_TASK_ATTEMPTS,
+  WORKER_PROGRESS_TIMEOUT_MS,
   WORKER_STUCK_PENDING_MINUTES,
   WORKER_STUCK_RUNNING_MINUTES,
 } from "./environment"
@@ -46,8 +47,14 @@ const RETRY_INTERVAL_MS = 1000 * 15
 const MAX_RETRY_COUNT = 5 // Maximum number of retries before giving up
 const MAX_BACKOFF_MS = 1000 * 60 * 30 // 30 minutes max backoff
 // Consider a build stuck if its last activity (COALESCE(last_progress_at, updated_at)) is older
-// than this while "running". Minutes-scale relative to BUILD_TIMEOUT_MS (issue #451), not hours.
-const STUCK_RUNNING_THRESHOLD_MINUTES = WORKER_STUCK_RUNNING_MINUTES
+// than this while "running". Minutes-scale (issue #451), not hours. Floored at 3 progress-
+// watchdog windows (issue #452): last_progress_at is heartbeated on story completion, so the
+// cross-worker sweeper must never fire faster than the owning worker's own in-process stall
+// watchdog (which aborts after one WORKER_PROGRESS_TIMEOUT_MS window) can act.
+const STUCK_RUNNING_THRESHOLD_MINUTES = Math.max(
+  WORKER_STUCK_RUNNING_MINUTES,
+  (3 * WORKER_PROGRESS_TIMEOUT_MS) / 60_000,
+)
 // Consider a build stuck if it's been pending for more than this amount of time
 const STUCK_PENDING_THRESHOLD_MINUTES = WORKER_STUCK_PENDING_MINUTES
 // Minimum interval between stuck-build sweeps. maybeSweepStuckBuilds() is invoked both from the
@@ -769,9 +776,10 @@ async function postFailedStatusForBuildId(
  * and marks them as "failed".
  *
  * A "running" build is stuck once its last activity — COALESCE(last_progress_at, updated_at);
- * last_progress_at is reserved for the render progress watchdog (#452) and not yet written — is
- * older than WORKER_STUCK_RUNNING_MINUTES. A "pending" build is stuck once updated_at is older
- * than WORKER_STUCK_PENDING_MINUTES.
+ * last_progress_at is the story-completion heartbeat written by progress.ts (#452) — is older
+ * than the running threshold: WORKER_STUCK_RUNNING_MINUTES floored at 3 progress-watchdog
+ * windows. A "pending" build is stuck once updated_at is older than
+ * WORKER_STUCK_PENDING_MINUTES.
  *
  * Each stuck build is failed via a conditional UPDATE (`WHERE id = $1 AND status = <observed>`),
  * so when several workers sweep concurrently only the one whose UPDATE returns the row deletes

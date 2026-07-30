@@ -23,6 +23,7 @@ import { downloadWithTimeout } from "./download"
 import {
   BUILD_ABORT_GRACE_MS,
   BUILD_MEMORY_WARN_BYTES,
+  BUILD_TIMEOUT_FLOOR_MS,
   BUILD_TIMEOUT_MS,
   CHROMEDRIVER_PORT,
   MAX_STORIES_PER_UPLOAD,
@@ -31,6 +32,8 @@ import {
   WORKER_CHROME_EXTRA_ARGS,
   WORKER_ENABLE_WEBGL,
   WORKER_FATAL_FAILSAFE_TIMEOUT_MS,
+  WORKER_PER_STORY_BUDGET_MS,
+  WORKER_PROGRESS_TIMEOUT_MS,
   WORKER_SESSION_MAX_INFRA_FAILURES,
   WORKER_SESSION_RECYCLE_STORIES,
   WORKER_STORY_CONCURRENCY,
@@ -40,6 +43,7 @@ import { updateGitHubCheckRun, type GitHubCheckData } from "./github"
 import { getGitLabHostConfig, updateGitLabCommitStatus, type GitLabCheckData } from "./gitlab"
 import { WORKER_ID } from "./identity"
 import { log } from "./log"
+import { beginBuildProgress, endBuildProgress } from "./progress"
 import { buildImageUrlResolver } from "./s3"
 import {
   hardenedChromeArgs,
@@ -63,6 +67,31 @@ function logBuildMemoryUsage(phase: string, screenshotTestId: number): void {
   } else {
     log.debug(ctx, `Build memory usage (RSS ${(rss / 1024 / 1024).toFixed(0)} MiB)`)
   }
+}
+
+/**
+ * Compute the whole-build timeout ceiling (issue #452), applied to the render fan-out only
+ * (story discovery runs beforehand under its own per-step timeouts).
+ *
+ * When `explicitEnvMs` (BUILD_TIMEOUT_MS) is set, it is returned verbatim — back-compat for
+ * deployments that tuned the flat cap. Otherwise the ceiling scales with the discovered story
+ * count: `max(BUILD_TIMEOUT_FLOOR_MS, ceil(storyCount * WORKER_PER_STORY_BUDGET_MS /
+ * concurrency))`, so a large-but-healthy storybook is never killed just for being large. The
+ * ceiling is a backstop; the progress watchdog (WORKER_PROGRESS_TIMEOUT_MS) is the primary
+ * stall detector.
+ */
+export function computeBuildTimeoutMs(
+  storyCount: number,
+  concurrency: number,
+  explicitEnvMs: number | undefined,
+): number {
+  if (explicitEnvMs != undefined) {
+    return explicitEnvMs
+  }
+  return Math.max(
+    BUILD_TIMEOUT_FLOOR_MS,
+    Math.ceil((storyCount * WORKER_PER_STORY_BUDGET_MS) / Math.max(1, concurrency)),
+  )
 }
 
 /**
@@ -380,6 +409,11 @@ export async function ingestStorybook(
       )
 
       try {
+        // Discovery phase. Runs BEFORE the build watchdog below (issue #452): navigation, story
+        // discovery, and the baseline prefetch each carry their own bounded internal timeouts
+        // (10-30 s), and the whole-build ceiling can only be derived once the story count is
+        // known.
+        //
         // Discover the stories with the primary session (single-threaded, before the concurrent
         // render phase begins, so it doesn't contend with the pool).
         await primaryBrowser.setViewport({ width: 1200, height: 900, devicePixelRatio: 1 })
@@ -427,6 +461,17 @@ export async function ingestStorybook(
           log.info(`Found ${baseTestResults.size} base test results`)
         }
 
+        // Derive the whole-build ceiling now that the story count is known (issue #452): an
+        // explicit BUILD_TIMEOUT_MS is used verbatim; otherwise the ceiling scales with the
+        // story count so a large-but-healthy storybook is never killed by a flat cap.
+        const buildTimeoutMs = computeBuildTimeoutMs(storyCount, pool.size, BUILD_TIMEOUT_MS)
+        log.info(
+          `Build timeout ceiling: ${buildTimeoutMs}ms for ${storyCount} stories` +
+            (WORKER_PROGRESS_TIMEOUT_MS > 0
+              ? `, progress watchdog: ${WORKER_PROGRESS_TIMEOUT_MS}ms`
+              : ""),
+        )
+
         // Render stories concurrently across the session pool (issue #152, Phase 1b). The limit
         // equals the pool size, so a slot rarely waits on acquire(). Session checkout, health
         // probing, infra-error retry, and failure recording all live inside
@@ -434,25 +479,110 @@ export async function ingestStorybook(
         // TestResult and resolves, so one bad story (or one dead session) cannot abort the build.
         const limit = pLimit(pool.size)
         log.info(`Rendering ${Object.keys(stories).length} stories across ${pool.size} session(s)`)
-        const testResults = await Promise.all(
-          Object.values(stories).map((story) =>
-            limit(() =>
-              processStoryWithRetry({
-                story,
-                screenshotTest,
-                baseTestResult: baseTestResults.get(story.id),
-                bucket,
-                tmpDir,
-                projectId,
-                uploadId,
-                port,
-                s3Client,
-                testResultTable,
-                pool,
+
+        // Track render progress (issue #452): every settled story — success or recorded failure
+        // — counts as forward progress. The in-process stall watchdog polls lastProgressAtMs,
+        // and a throttled last_progress_at heartbeat lets the cross-worker stuck-build sweeper
+        // distinguish a large-but-healthy build from a wedged one.
+        const progress = beginBuildProgress(screenshotTest.id, storyCount)
+        let testResults: TestResult[]
+        try {
+          const renderAllStories = Promise.all(
+            Object.values(stories).map((story) =>
+              limit(async () => {
+                try {
+                  return await processStoryWithRetry({
+                    story,
+                    screenshotTest,
+                    baseTestResult: baseTestResults.get(story.id),
+                    bucket,
+                    tmpDir,
+                    projectId,
+                    uploadId,
+                    port,
+                    s3Client,
+                    testResultTable,
+                    pool,
+                  })
+                } finally {
+                  progress.completeStory()
+                }
               }),
             ),
-          ),
-        )
+          )
+
+          // Wrap the render fan-out in the build watchdog. Two triggers share one abort path
+          // (issue #452): the progress watchdog fires when no story has completed for
+          // WORKER_PROGRESS_TIMEOUT_MS (a wedged build is detected in minutes regardless of
+          // size), and the derived ceiling above is the whole-build backstop. On either trigger
+          // we force-close every pooled session so the in-flight WebDriver commands reject and
+          // the stack unwinds. Crucially, withTimeout then waits for the fan-out to actually
+          // settle before surfacing the error — the per-story `finally` that returns each
+          // session to the pool must run before the worker is freed to accept a new build. If
+          // the render fails to unwind within the grace period, a session is wedged beyond
+          // in-process recovery, so withTimeout exits the worker (default onUnrecoverable) and
+          // the orchestrator restarts a clean process. BuildTimeoutError (and its subclass
+          // BuildStalledError) is treated as a non-retryable failure by the task scheduler.
+          testResults = await withTimeout(
+            renderAllStories,
+            buildTimeoutMs,
+            () => {
+              log.warn(
+                `Build ${screenshotTest.id} (#${screenshotTest.buildNumber}) hit the build watchdog ` +
+                  `(ceiling ${buildTimeoutMs}ms, ${progress.completedStories}/${storyCount} stories ` +
+                  `completed); aborting and closing browser session(s)`,
+              )
+              // Force-close every pooled session so in-flight WebDriver commands reject.
+              return pool.destroyAll()
+            },
+            {
+              abortGraceMs: BUILD_ABORT_GRACE_MS,
+              onUnrecoverable: (err) => {
+                log.fatal(
+                  err,
+                  `Build ${screenshotTest.id} (#${screenshotTest.buildNumber}) did not unwind within ` +
+                    `${BUILD_ABORT_GRACE_MS}ms after abort; a render is wedged. Exiting worker so the ` +
+                    `orchestrator restarts a clean process.`,
+                )
+                // Before exiting, best-effort fail the build and post the failed VCS status
+                // (issue #451) so CI is unblocked immediately instead of waiting for the
+                // stuck-build sweeper. Bounded by WORKER_FATAL_FAILSAFE_TIMEOUT_MS so a slow
+                // database or VCS API cannot stall the restart; process.exit(1) runs regardless.
+                void (async () => {
+                  try {
+                    await Promise.race([
+                      failBuildBeforeExit(screenshotTestId, taskQueueId, screenshotTest, {
+                        githubCheckData,
+                        gitlabCheckData,
+                      }),
+                      new Promise<void>((resolve) => {
+                        setTimeout(resolve, WORKER_FATAL_FAILSAFE_TIMEOUT_MS).unref()
+                      }),
+                    ])
+                  } catch (failErr) {
+                    log.error(
+                      failErr,
+                      `Failed to fail build ${screenshotTest.id} before fatal exit`,
+                    )
+                  } finally {
+                    process.exit(1)
+                  }
+                })()
+              },
+              // The progress watchdog; 0 disables it, leaving only the ceiling.
+              ...(WORKER_PROGRESS_TIMEOUT_MS > 0
+                ? {
+                    stall: {
+                      getLastProgressMs: () => progress.lastProgressAtMs,
+                      stallTimeoutMs: WORKER_PROGRESS_TIMEOUT_MS,
+                    },
+                  }
+                : {}),
+            },
+          )
+        } finally {
+          endBuildProgress()
+        }
         log.info(
           `Successfully processed all ${Object.keys(stories).length} stories for test ${screenshotTest.id} (build #${screenshotTest.buildNumber})`,
         )
@@ -504,59 +634,10 @@ export async function ingestStorybook(
     }
 
     try {
-      // Wrap the entire render phase in a max-duration guard. A build that exceeds this is
-      // almost always stuck or pathologically large; on timeout we force-close every pooled
-      // session so the in-flight WebDriver commands reject and the stack unwinds. Crucially,
-      // withTimeout then waits for renderStorybook() to actually settle before surfacing the
-      // BuildTimeoutError — its `finally` blocks (and the per-story `finally` that returns each
-      // session to the pool) must run before the worker is freed to accept a new build. If the
-      // render fails to unwind within the grace period, a session is wedged beyond in-process
-      // recovery, so withTimeout exits the worker (default onUnrecoverable) and the orchestrator
-      // restarts a clean process. BuildTimeoutError is treated as a non-retryable failure by the
-      // task scheduler.
-      await withTimeout(
-        renderStorybook(),
-        BUILD_TIMEOUT_MS,
-        () => {
-          log.warn(
-            `Build ${screenshotTest.id} (#${screenshotTest.buildNumber}) exceeded ${BUILD_TIMEOUT_MS}ms; aborting and closing browser session(s)`,
-          )
-          // Force-close every pooled session so in-flight WebDriver commands reject.
-          return pool.destroyAll()
-        },
-        {
-          abortGraceMs: BUILD_ABORT_GRACE_MS,
-          onUnrecoverable: (err) => {
-            log.fatal(
-              err,
-              `Build ${screenshotTest.id} (#${screenshotTest.buildNumber}) did not unwind within ` +
-                `${BUILD_ABORT_GRACE_MS}ms after abort; a render is wedged. Exiting worker so the ` +
-                `orchestrator restarts a clean process.`,
-            )
-            // Before exiting, best-effort fail the build and post the failed VCS status (issue
-            // #451) so CI is unblocked immediately instead of waiting for the stuck-build
-            // sweeper. Bounded by WORKER_FATAL_FAILSAFE_TIMEOUT_MS so a slow database or VCS API
-            // cannot stall the restart; process.exit(1) runs regardless.
-            void (async () => {
-              try {
-                await Promise.race([
-                  failBuildBeforeExit(screenshotTestId, taskQueueId, screenshotTest, {
-                    githubCheckData,
-                    gitlabCheckData,
-                  }),
-                  new Promise<void>((resolve) => {
-                    setTimeout(resolve, WORKER_FATAL_FAILSAFE_TIMEOUT_MS).unref()
-                  }),
-                ])
-              } catch (failErr) {
-                log.error(failErr, `Failed to fail build ${screenshotTest.id} before fatal exit`)
-              } finally {
-                process.exit(1)
-              }
-            })()
-          },
-        },
-      )
+      // The render phase. Story discovery runs first under its own per-step timeouts; the
+      // concurrent render fan-out inside is guarded by the build watchdog (progress stall +
+      // derived whole-build ceiling, issue #452).
+      await renderStorybook()
     } finally {
       log.debug("Closing WebdriverIO browser session pool")
       // Sessions may already be gone if a timeout abort closed them; destroyAll tolerates that so

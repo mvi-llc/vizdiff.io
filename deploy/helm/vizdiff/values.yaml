@@ -211,6 +211,24 @@ worker:
   # session before being recorded (issue #454, WORKER_STORY_MAX_ATTEMPTS). Empty uses the
   # built-in default (2).
   storyMaxAttempts: ""
+  # -- Progress watchdog (issue #452, WORKER_PROGRESS_TIMEOUT_MS): abort a build once no story
+  # has completed for this many ms. "0" disables the watchdog. Empty uses the built-in default
+  # (300000, 5 minutes).
+  progressTimeoutMs: ""
+  # -- Per-story render budget in ms used to derive the whole-build timeout ceiling when
+  # buildTimeoutMs is unset (issue #452, WORKER_PER_STORY_BUDGET_MS). Empty uses the built-in
+  # default (5000).
+  perStoryBudgetMs: ""
+  # -- Whole-build render timeout ceiling in ms (BUILD_TIMEOUT_MS). Empty derives the ceiling
+  # from the discovered story count (issue #452); an explicit value is used verbatim.
+  buildTimeoutMs: ""
+  # -- Lower bound in ms on the derived whole-build ceiling (issue #452, BUILD_TIMEOUT_FLOOR_MS).
+  # Empty uses the built-in default (900000, 15 minutes).
+  buildTimeoutFloorMs: ""
+  # -- How long in ms to wait for an aborted render to unwind before the worker exits so the
+  # orchestrator restarts a clean process (BUILD_ABORT_GRACE_MS). Empty uses the built-in
+  # default (10000).
+  buildAbortGraceMs: ""
 
 # Per-service container resource requests/limits.
 resources:

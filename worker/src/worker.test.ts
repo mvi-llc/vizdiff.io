@@ -33,7 +33,12 @@ import { remote } from "webdriverio"
 
 import { Database, DatabasePool } from "./database"
 import { WORKER_ID } from "./identity"
-import { failBuildBeforeExit, ingestStorybook, isBaselineBuildPending } from "./ingest"
+import {
+  computeBuildTimeoutMs,
+  failBuildBeforeExit,
+  ingestStorybook,
+  isBaselineBuildPending,
+} from "./ingest"
 import { log } from "./log"
 import { processStoryWithRetry } from "./stories"
 import {
@@ -837,6 +842,33 @@ describe("worker", () => {
       )
       expect(mockTestResultSave).not.toHaveBeenCalled()
     })
+  })
+
+  describe("computeBuildTimeoutMs (#452)", () => {
+    // The environment mock leaves BUILD_TIMEOUT_FLOOR_MS (900000) and WORKER_PER_STORY_BUDGET_MS
+    // (5000) at their real defaults; only the explicit-env parameter is varied per case.
+    it.each([
+      // [storyCount, concurrency, explicitEnvMs, expected]
+      // Explicit BUILD_TIMEOUT_MS is used verbatim (back-compat), regardless of story count.
+      [743, 4, 50, 50],
+      [10, 1, 1_800_000, 1_800_000],
+      [1000, 1, 1, 1],
+      // Floor dominates small storybooks: 100 * 5000 = 500000 < 900000.
+      [100, 1, undefined, 900_000],
+      // Formula scales with story count: 743 * 5000 = 3715000.
+      [743, 1, undefined, 3_715_000],
+      // Concurrency divides the budget: ceil(3715000 / 4) = 928750 (> floor).
+      [743, 4, undefined, 928_750],
+      // Fractional division rounds up: ceil(1001 * 5000 / 3) = 1668334.
+      [1001, 3, undefined, 1_668_334],
+      // Concurrency 0 (or below) is clamped to 1 rather than dividing by zero.
+      [1000, 0, undefined, 5_000_000],
+    ] as const)(
+      "storyCount=%s concurrency=%s explicit=%s -> %s",
+      (storyCount, concurrency, explicitEnvMs, expected) => {
+        expect(computeBuildTimeoutMs(storyCount, concurrency, explicitEnvMs)).toBe(expected)
+      },
+    )
   })
 
   // --- Build lifecycle hardening (issue #451) --------------------------------------------------

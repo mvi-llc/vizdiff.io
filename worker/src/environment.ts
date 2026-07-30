@@ -206,10 +206,33 @@ export const WORKER_SESSION_MAX_INFRA_FAILURES = intEnv("WORKER_SESSION_MAX_INFR
 // Default: 2 (one retry).
 export const WORKER_STORY_MAX_ATTEMPTS = intEnv("WORKER_STORY_MAX_ATTEMPTS", 2)
 
-// Maximum wall-clock duration for a single storybook build before it is aborted. A build that
-// exceeds this is almost always stuck or pathologically large, so the task is treated as a
-// non-retryable failure (see worker.ts). Default: 15 minutes.
-export const BUILD_TIMEOUT_MS = parseInt(process.env.BUILD_TIMEOUT_MS ?? `${15 * 60 * 1000}`, 10)
+// Progress watchdog (issue #452): abort a build once no story has completed for this long. A
+// build that is steadily completing stories is healthy no matter how large it is, while a wedged
+// build (issue #450) is detected within minutes instead of at the whole-build ceiling. The
+// timed-out task is treated as a non-retryable failure (see worker.ts). 0 disables the watchdog
+// (only the whole-build ceiling then applies). Default: 5 minutes.
+export const WORKER_PROGRESS_TIMEOUT_MS = intEnv("WORKER_PROGRESS_TIMEOUT_MS", 5 * 60 * 1000)
+
+// Per-story render budget used to derive the whole-build timeout ceiling when BUILD_TIMEOUT_MS
+// is unset: ceiling = max(BUILD_TIMEOUT_FLOOR_MS, ceil(storyCount * budget / concurrency)).
+// Deliberately generous versus the observed ~1.5-2 s happy-path story cost — the ceiling is a
+// backstop; the progress watchdog above is the primary stall detector. Default: 5 seconds.
+export const WORKER_PER_STORY_BUDGET_MS = intEnv("WORKER_PER_STORY_BUDGET_MS", 5000)
+
+// Lower bound on the derived whole-build timeout ceiling, so small storybooks keep the previous
+// 15-minute allowance rather than getting a tiny ceiling. Default: 15 minutes.
+export const BUILD_TIMEOUT_FLOOR_MS = intEnv("BUILD_TIMEOUT_FLOOR_MS", 15 * 60 * 1000)
+
+// Maximum wall-clock duration for a single storybook build before it is aborted. When unset (the
+// default), the ceiling is derived per build from the discovered story count (issue #452; see
+// computeBuildTimeoutMs in ingest.ts and the two variables above) so a large-but-healthy
+// storybook is never killed by a flat cap. When set explicitly, the value is used verbatim
+// (back-compat with pre-#452 deployments that tuned it). Either way, a build that exceeds the
+// ceiling is treated as a non-retryable failure (see worker.ts).
+export const BUILD_TIMEOUT_MS: number | undefined =
+  process.env.BUILD_TIMEOUT_MS != undefined && process.env.BUILD_TIMEOUT_MS.trim() !== ""
+    ? parseInt(process.env.BUILD_TIMEOUT_MS, 10)
+    : undefined
 
 // After a build timeout aborts the browser sessions, how long to wait for the in-flight render to
 // actually unwind (running its `finally` blocks, which return each session to the browser pool)
@@ -240,10 +263,11 @@ export const WORKER_FATAL_FAILSAFE_TIMEOUT_MS = intEnv("WORKER_FATAL_FAILSAFE_TI
 export const WORKER_MAX_TASK_ATTEMPTS = intEnv("WORKER_MAX_TASK_ATTEMPTS", 3)
 
 // Consider a "running" build stuck once its last activity (COALESCE(last_progress_at,
-// updated_at)) is older than this many minutes. Minutes-scale relative to BUILD_TIMEOUT_MS (15
-// minutes by default): a healthy build either finishes or is failed by the timeout well within
-// this window, so anything older is orphaned. Replaces the former fixed 2-hour threshold.
-// Default: 15 minutes.
+// updated_at); last_progress_at is the render heartbeat written by progress.ts, issue #452) is
+// older than this many minutes. Minutes-scale: a healthy build heartbeats every few seconds and
+// a wedged one is aborted by the progress watchdog, so anything older is orphaned. The effective
+// threshold is floored at 3 × WORKER_PROGRESS_TIMEOUT_MS (see worker.ts) so the cross-worker
+// sweeper never fires faster than three in-process stall windows. Default: 15 minutes.
 export const WORKER_STUCK_RUNNING_MINUTES = intEnv("WORKER_STUCK_RUNNING_MINUTES", 15)
 
 // Consider a "pending" build stuck once updated_at is older than this many minutes. Pending
