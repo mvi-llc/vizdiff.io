@@ -31,6 +31,8 @@ import {
   WORKER_CHROME_EXTRA_ARGS,
   WORKER_ENABLE_WEBGL,
   WORKER_FATAL_FAILSAFE_TIMEOUT_MS,
+  WORKER_SESSION_MAX_INFRA_FAILURES,
+  WORKER_SESSION_RECYCLE_STORIES,
   WORKER_STORY_CONCURRENCY,
 } from "./environment"
 import { safeExtract } from "./extract"
@@ -45,7 +47,7 @@ import {
   installNetworkEgressBlock,
 } from "./safeguards"
 import { startStaticServer } from "./server"
-import { getStorybookStories, navigateToStorybook, processStory } from "./stories"
+import { getStorybookStories, navigateToStorybook, processStoryWithRetry } from "./stories"
 import { installStoryRenderStateHook } from "./storyReady"
 import { NonRetryableTaskError, isPermanentS3FetchError } from "./tasks"
 import { withTimeout } from "./timeout"
@@ -318,6 +320,10 @@ export async function ingestStorybook(
         },
       },
       logLevel: "warn",
+      // Fail HTTP-level WebDriver requests against a dead driver faster than the 120 s default,
+      // so session replacement (issue #450) is detected and resolved promptly. (The 60 s BiDi
+      // command timeout is hardcoded in the webdriver package and not configurable here.)
+      connectionRetryTimeout: 30_000,
       // Strip forbidden headers WebdriverIO injects so sessions work under
       // Node 26's undici 7 (see wdio.ts).
       transformRequest: nodeCompatTransformRequest,
@@ -327,15 +333,29 @@ export async function ingestStorybook(
     // the page-level safeguards installed up front (disable real-time transports + off-origin
     // fetch/XHR/window.open at the JS layer) before it navigates to any untrusted story; the hard
     // network egress boundary is installed per session below, once the static-server origin is known.
-    const pool = await createBrowserPool(WORKER_STORY_CONCURRENCY, async () => {
-      const session = await remote(config)
-      await installBrowserSafeguards(session)
-      // Record Storybook's story-render lifecycle in the page (issue #458) so capture waits for
-      // render completion instead of screenshotting an async story's loading fallback.
-      await installStoryRenderStateHook(session)
-      return session
-    })
-    const primaryBrowser = pool.browsers[0]
+    // Sessions are recycled after WORKER_SESSION_RECYCLE_STORIES stories (bounding Chrome's
+    // cumulative memory growth, issue #453) and replaced after WORKER_SESSION_MAX_INFRA_FAILURES
+    // consecutive infra failures (dead-session recovery, issue #450).
+    const pool = await createBrowserPool(
+      WORKER_STORY_CONCURRENCY,
+      async () => {
+        const session = await remote(config)
+        await installBrowserSafeguards(session)
+        // Record Storybook's story-render lifecycle in the page (issue #458) so capture waits for
+        // render completion instead of screenshotting an async story's loading fallback.
+        await installStoryRenderStateHook(session)
+        return session
+      },
+      {
+        recycleAfterStories: WORKER_SESSION_RECYCLE_STORIES,
+        maxConsecutiveInfraFailures: WORKER_SESSION_MAX_INFRA_FAILURES,
+      },
+    )
+    const primarySession = pool.sessions[0]
+    if (!primarySession) {
+      throw new Error("Browser pool initialized with no sessions") // unreachable: size >= 1
+    }
+    const primaryBrowser = primarySession.browser
     screenshotTest.browserVersion = `${primaryBrowser.capabilities.browserName}-${primaryBrowser.capabilities.platformName}-${primaryBrowser.capabilities.browserVersion}`
     log.info(
       { capabilities: primaryBrowser.capabilities, poolSize: pool.size },
@@ -350,11 +370,13 @@ export async function ingestStorybook(
 
       // Install the hard network egress boundary on EVERY pooled session: fail every off-origin
       // request (sub-resource, navigation, fetch, XHR, WebSocket, beacon) so an untrusted story
-      // bundle cannot exfiltrate data. Must run before navigating to any story.
+      // bundle cannot exfiltrate data. Must run before navigating to any story. Sessions created
+      // later as replacements (probe failure / recycling, issues #450/#453) get the same boundary
+      // via the pool's session-init callback.
+      const origin = `http://localhost:${port}`
+      pool.setSessionInit((browser) => installNetworkEgressBlock(browser, origin))
       await Promise.all(
-        pool.browsers.map((session) =>
-          installNetworkEgressBlock(session, `http://localhost:${port}`),
-        ),
+        pool.sessions.map((session) => installNetworkEgressBlock(session.browser, origin)),
       )
 
       try {
@@ -405,35 +427,30 @@ export async function ingestStorybook(
           log.info(`Found ${baseTestResults.size} base test results`)
         }
 
-        // Render stories concurrently across the session pool (issue #152, Phase 1b): each slot
-        // checks out one session for the full render of one story and returns it when done. The
-        // limit equals the pool size, so a slot never waits on acquire(). A single story's render
-        // failure is isolated inside processStory (it records a `failed` TestResult and returns),
-        // so one bad story cannot abort the build.
+        // Render stories concurrently across the session pool (issue #152, Phase 1b). The limit
+        // equals the pool size, so a slot rarely waits on acquire(). Session checkout, health
+        // probing, infra-error retry, and failure recording all live inside
+        // processStoryWithRetry (issues #450/#454): a single story's failure records a `failed`
+        // TestResult and resolves, so one bad story (or one dead session) cannot abort the build.
         const limit = pLimit(pool.size)
         log.info(`Rendering ${Object.keys(stories).length} stories across ${pool.size} session(s)`)
         const testResults = await Promise.all(
           Object.values(stories).map((story) =>
-            limit(async () => {
-              const session = await pool.acquire()
-              try {
-                return await processStory({
-                  story,
-                  screenshotTest,
-                  baseTestResult: baseTestResults.get(story.id),
-                  bucket,
-                  tmpDir,
-                  projectId,
-                  uploadId,
-                  port,
-                  s3Client,
-                  testResultTable,
-                  browser: session,
-                })
-              } finally {
-                pool.release(session)
-              }
-            }),
+            limit(() =>
+              processStoryWithRetry({
+                story,
+                screenshotTest,
+                baseTestResult: baseTestResults.get(story.id),
+                bucket,
+                tmpDir,
+                projectId,
+                uploadId,
+                port,
+                s3Client,
+                testResultTable,
+                pool,
+              }),
+            ),
           ),
         )
         log.info(

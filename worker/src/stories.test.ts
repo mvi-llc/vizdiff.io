@@ -6,18 +6,22 @@ import { Readable } from "stream"
 import type { Repository } from "typeorm"
 import { expect, describe, it, vi, beforeEach } from "vitest"
 
-import { processStory } from "./stories"
+import type { BrowserPool, PooledSession } from "./browserPool"
+import { processStoryWithRetry, renderStory } from "./stories"
 import { createMockBrowser, defaultMockPageState } from "./testing/mockBrowser"
 
 /**
  * Test suite for the screenshot comparison functionality.
  *
- * The processStory function:
+ * The renderStory function:
  * 1. Takes a screenshot of a Storybook story
  * 2. Uploads it to S3
  * 3. Downloads the baseline image (if it exists)
  * 4. Compares the images and determines if there are changes
  * 5. Saves the results to the database
+ *
+ * processStoryWithRetry wraps renderStory with session checkout, health probing, infra-error
+ * classification/retry, and failed-result recording (issues #450/#454).
  */
 
 // Mock function declarations for all external dependencies
@@ -232,7 +236,7 @@ vi.mock("pngjs", () => {
   return { PNG: MockPNG }
 })
 
-describe("processStory", () => {
+describe("stories", () => {
   // Mock story data that would come from Storybook
   const mockStory = {
     id: "stories-components-teststory--mycomponent",
@@ -315,7 +319,7 @@ describe("processStory", () => {
    * - Result is marked as "new"
    */
   it("should process a new story without baseline", async () => {
-    const testResult = await processStory({
+    const testResult = await renderStory({
       story: mockStory,
       screenshotTest: mockScreenshotTest,
       bucket: "test-bucket",
@@ -391,7 +395,7 @@ describe("processStory", () => {
       changeStatus: "new",
     })
 
-    const testResult = await processStory({
+    const testResult = await renderStory({
       story: mockStory,
       screenshotTest: mockScreenshotTest,
       baseTestResult,
@@ -437,7 +441,7 @@ describe("processStory", () => {
       changeStatus: "unchanged",
     })
 
-    const testResult = await processStory({
+    const testResult = await renderStory({
       story: mockStory,
       screenshotTest: mockScreenshotTest,
       baseTestResult,
@@ -472,7 +476,7 @@ describe("processStory", () => {
       .mockResolvedValueOnce(Buffer.from("mock screenshot"))
       .mockResolvedValueOnce(Buffer.from("mock screenshot 2")) // For stability check
 
-    await processStory({
+    await renderStory({
       story: mockStory,
       screenshotTest: mockScreenshotTest,
       bucket: "test-bucket",
@@ -497,40 +501,32 @@ describe("processStory", () => {
   })
 
   /**
-   * Failure isolation (issue #152): a story that fails to render must NOT abort the whole build.
-   * processStory records a `failed` TestResult and resolves with it instead of throwing.
+   * renderStory THROWS on render failure (issue #454 restructure): error recording and retry
+   * policy live in processStoryWithRetry, so renderStory must surface the raw error.
    */
-  it("isolates a render failure: returns a failed TestResult instead of throwing", async () => {
+  it("throws on a render failure instead of recording a failed result", async () => {
     // Make navigation to the story fail, so captureStableScreenshot throws.
     mockBrowserUrl.mockRejectedValueOnce(new Error("navigation blew up"))
 
-    const saved: TestResult[] = []
-    const testResult = await processStory({
-      story: mockStory,
-      screenshotTest: mockScreenshotTest,
-      bucket: "test-bucket",
-      tmpDir: "/tmp/test",
-      projectId: "test-project",
-      uploadId: "123",
-      port: 9009,
-      s3Client: new S3Client({}),
-      testResultTable: {
-        save: mockTestResultSave.mockImplementation(async (data: TestResult) => {
-          saved.push(data)
-          return data
-        }),
-      } as unknown as Repository<TestResult>,
-      browser: mockBrowser,
-    })
+    await expect(
+      renderStory({
+        story: mockStory,
+        screenshotTest: mockScreenshotTest,
+        bucket: "test-bucket",
+        tmpDir: "/tmp/test",
+        projectId: "test-project",
+        uploadId: "123",
+        port: 9009,
+        s3Client: new S3Client({}),
+        testResultTable: {
+          save: mockTestResultSave.mockImplementation(async (data: TestResult) => data),
+        } as unknown as Repository<TestResult>,
+        browser: mockBrowser,
+      }),
+    ).rejects.toThrow("navigation blew up")
 
-    // Resolves (does not throw) with a failed result so the build can continue.
-    expect(testResult.changeStatus).toBe("failed")
-    expect(testResult.storyId).toBe(mockStory.id)
-    // `new_image_url` is NOT NULL; a failed story has no screenshot, stored as empty string.
-    expect(testResult.newImageUrl).toBe("")
-    // The failed TestResult was persisted.
-    expect(saved.some((r) => r.changeStatus === "failed")).toBe(true)
-    // No screenshot was uploaded for the failed story.
+    // Nothing was persisted or uploaded for the failed render.
+    expect(mockTestResultSave).not.toHaveBeenCalled()
     expect(mockSend).not.toHaveBeenCalledWith(expect.any(PutObjectCommand))
   })
 
@@ -549,7 +545,7 @@ describe("processStory", () => {
     // The mock page consumes one array element per measuring execute call (the last one sticks).
     mockPageState.contentHeight = [800, TALL_CONTENT_HEIGHT]
 
-    await processStory({
+    await renderStory({
       story: mockStory,
       screenshotTest: mockScreenshotTest,
       bucket: "test-bucket",
@@ -607,7 +603,7 @@ describe("processStory", () => {
       return {}
     })
 
-    const testResult = await processStory({
+    const testResult = await renderStory({
       story: mockStory,
       screenshotTest: mockScreenshotTest,
       baseTestResult,
@@ -625,5 +621,168 @@ describe("processStory", () => {
 
     expect(testResult.changeStatus).toBe("new")
     expect(testResult.diffRatio).toBe(0)
+  })
+
+  /**
+   * processStoryWithRetry (issues #450/#454): session checkout + health probing + infra-error
+   * retry + failure recording around renderStory. Driven with a single-session fake pool whose
+   * release() mimics the real pool's threshold-based replacement.
+   */
+  describe("processStoryWithRetry", () => {
+    /** Single-session fake pool; release() replaces after `maxConsecutiveInfraFailures`. */
+    function createFakePool(opts: { maxConsecutiveInfraFailures?: number } = {}) {
+      const session: PooledSession = {
+        id: 0,
+        browser: mockBrowser,
+        storiesRendered: 0,
+        consecutiveInfraFailures: 0,
+      }
+      const replace = vi.fn(async (_session: PooledSession, _reason: string) => {
+        session.storiesRendered = 0
+        session.consecutiveInfraFailures = 0
+      })
+      const max = opts.maxConsecutiveInfraFailures ?? 0
+      const acquire = vi.fn(async () => session)
+      const release = vi.fn(async (released: PooledSession) => {
+        if (max > 0 && released.consecutiveInfraFailures >= max) {
+          await replace(released, "infra-failures")
+        }
+      })
+      const pool = {
+        size: 1,
+        sessions: [session],
+        acquire,
+        release,
+        replace,
+        setSessionInit: vi.fn(),
+        destroyAll: vi.fn(async () => undefined),
+      } as unknown as BrowserPool
+      return { pool, session, replace, acquire, release }
+    }
+
+    function baseInfo(saved: TestResult[], pool: BrowserPool) {
+      return {
+        story: mockStory,
+        screenshotTest: mockScreenshotTest,
+        bucket: "test-bucket",
+        tmpDir: "/tmp/test",
+        projectId: "test-project",
+        uploadId: "123",
+        port: 9009,
+        s3Client: new S3Client({}),
+        testResultTable: {
+          save: mockTestResultSave.mockImplementation(async (data: TestResult) => {
+            saved.push(data)
+            return data
+          }),
+        } as unknown as Repository<TestResult>,
+        pool,
+      }
+    }
+
+    it("retries an infra failure and succeeds on the second attempt (session condemned)", async () => {
+      // Attempt 1 burns a BiDi command timeout (infra-class); attempt 2 renders normally.
+      mockBrowserUrl.mockRejectedValueOnce(
+        new Error("Command browsingContext.setViewport with id 13494 timed out"),
+      )
+      const { pool, replace, acquire } = createFakePool({ maxConsecutiveInfraFailures: 1 })
+      const saved: TestResult[] = []
+
+      const testResult = await processStoryWithRetry(baseInfo(saved, pool))
+
+      // Exactly ONE result row, and it is the successful render, not a failure.
+      expect(testResult.changeStatus).toBe("new")
+      expect(saved).toHaveLength(1)
+      expect(saved[0]?.changeStatus).toBe("new")
+      // The condemned session was replaced between the attempts.
+      expect(replace).toHaveBeenCalledWith(expect.objectContaining({ id: 0 }), "infra-failures")
+      expect(acquire).toHaveBeenCalledTimes(2)
+    })
+
+    it("replaces a session that fails the health probe before rendering", async () => {
+      // The probe's trivial execute hits a dead session once; the story then renders fine.
+      mockBrowserFns.execute.mockRejectedValueOnce(new Error("invalid session id"))
+      const { pool, replace } = createFakePool()
+      const saved: TestResult[] = []
+
+      const testResult = await processStoryWithRetry(baseInfo(saved, pool))
+
+      expect(testResult.changeStatus).toBe("new")
+      expect(replace).toHaveBeenCalledWith(expect.objectContaining({ id: 0 }), "probe-failed")
+      expect(saved).toHaveLength(1)
+    })
+
+    it("records a story-class failure immediately without retrying (StoryRenderError)", async () => {
+      // Storybook reports the story threw: waitForStoryReady raises StoryRenderError.
+      mockPageState.events = [{ type: "storyThrewException", message: "component blew up" }]
+      const { pool, replace, acquire } = createFakePool({ maxConsecutiveInfraFailures: 1 })
+      const saved: TestResult[] = []
+
+      const testResult = await processStoryWithRetry(baseInfo(saved, pool))
+
+      expect(testResult.changeStatus).toBe("failed")
+      expect(testResult.errorKind).toBe("story-error")
+      expect(testResult.errorMessage).toContain("component blew up")
+      expect(testResult.newImageUrl).toBe("")
+      expect(testResult.diffRatio).toBeNull()
+      // No retry for a story-class failure, and the session is not condemned.
+      expect(acquire).toHaveBeenCalledTimes(1)
+      expect(replace).not.toHaveBeenCalled()
+      // Exactly one persisted row.
+      expect(saved).toHaveLength(1)
+      expect(saved[0]?.changeStatus).toBe("failed")
+    })
+
+    it("records the last infra kind once the attempt budget is exhausted", async () => {
+      // Every attempt burns a command timeout (WORKER_STORY_MAX_ATTEMPTS defaults to 2). Two
+      // `Once` rejections rather than a persistent one so the base implementation survives for
+      // later tests (`clearAllMocks` clears calls, not implementations).
+      mockBrowserUrl
+        .mockRejectedValueOnce(new Error("Command script.callFunction with id 13493 timed out"))
+        .mockRejectedValueOnce(new Error("Command script.callFunction with id 13493 timed out"))
+      const { pool, acquire } = createFakePool({ maxConsecutiveInfraFailures: 1 })
+      const saved: TestResult[] = []
+
+      const testResult = await processStoryWithRetry(baseInfo(saved, pool))
+
+      expect(acquire).toHaveBeenCalledTimes(2)
+      expect(testResult.changeStatus).toBe("failed")
+      expect(testResult.errorKind).toBe("browser-timeout")
+      expect(testResult.errorMessage).toContain("timed out")
+      expect(saved).toHaveLength(1)
+    })
+
+    it("classifies an S3 upload failure as retryable storage infra and does not throw", async () => {
+      // Screenshot capture succeeds, but every PutObjectCommand send rejects.
+      mockSend.mockImplementation(async (command) => {
+        if (command instanceof PutObjectCommand) {
+          throw new Error("S3 is down")
+        }
+        return {}
+      })
+      const { pool, acquire } = createFakePool({ maxConsecutiveInfraFailures: 1 })
+      const saved: TestResult[] = []
+
+      // Resolves — a storage failure must not abort the whole build (previously the uncaught
+      // screenshot-upload rejection did exactly that).
+      const testResult = await processStoryWithRetry(baseInfo(saved, pool))
+
+      expect(acquire).toHaveBeenCalledTimes(2) // storage is infra-class: it was retried
+      expect(testResult.changeStatus).toBe("failed")
+      expect(testResult.errorKind).toBe("storage")
+      expect(saved).toHaveLength(1)
+    })
+
+    it("resets the failure counter and counts the story on success", async () => {
+      const { pool, session, release } = createFakePool()
+      session.consecutiveInfraFailures = 1 // pre-existing strike from an earlier story
+      const saved: TestResult[] = []
+
+      await processStoryWithRetry(baseInfo(saved, pool))
+
+      expect(session.consecutiveInfraFailures).toBe(0)
+      expect(session.storiesRendered).toBe(1)
+      expect(release).toHaveBeenCalledTimes(1)
+    })
   })
 })

@@ -35,7 +35,7 @@ import { Database, DatabasePool } from "./database"
 import { WORKER_ID } from "./identity"
 import { failBuildBeforeExit, ingestStorybook, isBaselineBuildPending } from "./ingest"
 import { log } from "./log"
-import { processStory } from "./stories"
+import { processStoryWithRetry } from "./stories"
 import {
   DependencyNotReadyError,
   NonRetryableTaskError,
@@ -252,7 +252,7 @@ vi.mock("./stories", () => ({
     log.debug("getStorybookStories called")
     return mockStories
   }),
-  processStory: vi
+  processStoryWithRetry: vi
     .fn()
     .mockImplementation(
       async ({
@@ -714,14 +714,15 @@ describe("worker", () => {
       log.warn = vi.fn()
 
       // Simulate a story stuck in a WebDriver op that only unsticks when the browser session is
-      // force-closed by the timeout abort. processStory hangs until deleteSession() is called,
+      // force-closed by the timeout abort. processStoryWithRetry hangs until deleteSession() is
+      // called,
       // then rejects — mirroring how force-teardown makes the stuck command reject and the
       // render's `finally` (returning the session to the browser pool) run. This verifies
       // withTimeout waits for that unwind before surfacing BuildTimeoutError instead of freeing
       // the worker eagerly.
       let rejectStuckStory: ((err: Error) => void) | undefined
       let storyRejected = false
-      vi.mocked(processStory).mockImplementationOnce(
+      vi.mocked(processStoryWithRetry).mockImplementationOnce(
         () =>
           new Promise((_resolve, reject) => {
             rejectStuckStory = (err: Error) => {
@@ -1188,7 +1189,7 @@ describe("worker", () => {
         vi.mocked(DatabasePool).mockImplementation(() => new Promise(() => undefined))
 
         // A story wedged beyond recovery: it never settles, even when its session is closed.
-        vi.mocked(processStory).mockImplementationOnce(() => new Promise(() => undefined))
+        vi.mocked(processStoryWithRetry).mockImplementationOnce(() => new Promise(() => undefined))
 
         // Swallow the (never-delivered) rejection; the promise dangles by design (withTimeout
         // never resolves while the wedged render holds resources).

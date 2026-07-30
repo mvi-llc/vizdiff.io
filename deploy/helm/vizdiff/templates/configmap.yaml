@@ -68,3 +68,15 @@ data:
   {{- with .Values.worker.storyDelayMaxMs }}
   WORKER_STORY_DELAY_MAX_MS: {{ . | quote }}
   {{- end }}
+  {{- with .Values.worker.sessionRecycleStories }}
+  WORKER_SESSION_RECYCLE_STORIES: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.worker.sessionProbeTimeoutMs }}
+  WORKER_SESSION_PROBE_TIMEOUT_MS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.worker.sessionMaxInfraFailures }}
+  WORKER_SESSION_MAX_INFRA_FAILURES: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.worker.storyMaxAttempts }}
+  WORKER_STORY_MAX_ATTEMPTS: {{ . | quote }}
+  {{- end }}
