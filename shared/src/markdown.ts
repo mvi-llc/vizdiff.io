@@ -1,5 +1,6 @@
 import type { ScreenshotTest } from "./entity/ScreenshotTest"
 import type { TestResult } from "./entity/TestResult"
+import { isInfraErrorKind } from "./entity/types"
 import type { VCSProvider } from "./entity/types"
 
 const EMPTY_IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/5/59/Empty.png"
@@ -99,7 +100,11 @@ export function createMarkdownForBuildResult(
 ): { title: string; summary: string; text: string } {
   const testCount = testResults.length
   const changeCount = getChangeCount(testResults)
-  const failedCount = testResults.filter((r) => r.changeStatus === "failed").length
+  const failedResults = testResults.filter((r) => r.changeStatus === "failed")
+  const failedCount = failedResults.length
+  // Infra-class failures (dead browser session, storage) mean the harness failed, not the story
+  // (issue #454) — call them out so reviewers don't read them as product regressions.
+  const infraFailedCount = failedResults.filter((r) => isInfraErrorKind(r.errorKind)).length
 
   // Create the title that shows up inline in the Pull Request list of status checks
   const title =
@@ -115,7 +120,11 @@ export function createMarkdownForBuildResult(
     `|Tests|Changes|Status|\n\n` +
     `Review [build #${build.buildNumber}](${appUrl()}/build?id=${build.id}) for a detailed comparison.`
   if (failedCount > 0) {
-    summary += `\n\n---\n ⚠️ ${failedCount} test${failedCount === 1 ? "" : "s"} failed to render.`
+    const infraSuffix =
+      infraFailedCount > 0
+        ? ` (${infraFailedCount} due to infrastructure error${infraFailedCount === 1 ? "" : "s"})`
+        : ""
+    summary += `\n\n---\n ⚠️ ${failedCount} test${failedCount === 1 ? "" : "s"} failed to render${infraSuffix}.`
   }
 
   // Sort test results to show failed/changed/new/unchanged in that order
@@ -210,7 +219,8 @@ function getChangeStatusText(testResult: TestResult): string {
       return `🟡 Changed${changePct}`
     }
     case "failed":
-      return `🔴 Failed`
+      // Distinguish infra-caused failures (issue #454) from genuine story failures.
+      return isInfraErrorKind(testResult.errorKind) ? `🔴 Failed (infrastructure)` : `🔴 Failed`
     default:
       throw new Error(`Unknown change status: ${testResult.changeStatus}`)
   }

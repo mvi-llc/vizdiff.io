@@ -236,6 +236,8 @@ export const get: RequestHandler = async (req, res) => {
       ancestorScreenshotUrl: (await presignImageUrlOrNull(result.baselineImageUrl)) ?? undefined,
       diffMaskUrl: (await presignImageUrlOrNull(result.diffImageUrl)) ?? undefined,
       diffRatio: result.diffRatio ?? undefined,
+      errorKind: result.errorKind ?? undefined,
+      errorMessage: result.errorMessage ?? undefined,
       createdStampSec: toSeconds(result.createdAt),
     })),
   )
