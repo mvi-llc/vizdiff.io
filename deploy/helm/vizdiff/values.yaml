@@ -267,4 +267,14 @@ dbWaitHook:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+# -- Annotations applied to every pod (api, worker, frontend). To have an annotation-based
+# Prometheus setup scrape the worker's metrics endpoint (issue #457; served on the health port
+# next to /health), uncomment:
+# podAnnotations:
+#   prometheus.io/scrape: "true"
+#   prometheus.io/port: "3003"
+#   prometheus.io/path: "/metrics"
+# Note these annotations are chart-global, so a scraper matching them will also probe the api and
+# frontend pods (which do not listen on 3003); most annotation scrapers tolerate that, but a
+# label-selector-based scrape config targeting app.kubernetes.io/component=worker is cleaner.
 podAnnotations: {}

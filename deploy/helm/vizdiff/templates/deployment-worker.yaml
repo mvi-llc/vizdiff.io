@@ -65,9 +65,14 @@ spec:
               port: health
             periodSeconds: 10
             timeoutSeconds: 3
+          # Liveness uses the bare event-loop-alive endpoint, NOT /health: /health reports
+          # "degraded" for a stalled build (issue #457), and restarting the pod is the wrong
+          # response to a stall — the in-process progress watchdog (issue #452) aborts the build
+          # with proper failure bookkeeping. /health stays HTTP 200 either way, but keeping
+          # liveness on a dumb endpoint makes that decoupling explicit.
           livenessProbe:
             httpGet:
-              path: /health
+              path: /health/live
               port: health
             periodSeconds: 20
             timeoutSeconds: 3

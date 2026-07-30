@@ -163,6 +163,72 @@ each session to bound worst-case growth regardless of storybook size. If Chrome 
 OOM-killed mid-build, raise the container limit or lower the recycle interval; a killed session is
 detected by the health probe and replaced, with affected stories retried (issues #450/#454).
 
+## Worker metrics
+
+The worker serves Prometheus metrics at `GET /metrics` on the health port (`WORKER_HEALTH_PORT`,
+default `3003`), next to the existing `/health` endpoint (issue #457). Metrics are always enabled —
+there is no env var to turn them on or off. Node.js process/runtime metrics are also exported with
+the `vizdiff_worker_` prefix.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `vizdiff_worker_builds_total` | counter | `outcome` = `completed` \| `failed` \| `aborted` | Builds processed. `aborted` means the build watchdog fired (progress stall or whole-build ceiling, issue #452). |
+| `vizdiff_worker_build_duration_seconds` | histogram | — | Wall-clock build ingestion duration (download through render/finalize). |
+| `vizdiff_worker_stories_total` | counter | `outcome` = `ok` \| `infra_error` \| `story_error` | Stories processed. A spike in `infra_error` (dead browser session, command timeout, storage) is the wedged-session signature. |
+| `vizdiff_worker_story_duration_seconds` | histogram | `phase` = `capture` \| `finalize` | Per-story phase duration. `capture` p95 pinned at the 60 s command timeout means the browser is dead. |
+| `vizdiff_worker_browser_relaunches_total` | counter | — | Pooled Chrome sessions replaced (dead-session probe, consecutive infra failures, or periodic recycling; issues #450/#453). |
+| `vizdiff_worker_queue_depth` | gauge | — | Claimable tasks in `task_queue` (unlocked, or lock expired). Sampled at scrape time with a 2 s query timeout; serves the last-known value if the database is slow. |
+| `vizdiff_worker_last_story_completed_timestamp` | gauge | — | Unix time (seconds) of the last observed story progress. |
+
+The worker's `/health` endpoint also reports `status: "ok" | "degraded"` (plus a `degradedReason`
+and a build-progress snapshot) in its JSON body. It intentionally stays HTTP 200 while degraded:
+the Kubernetes liveness probe uses `/health/live`, and restarting the pod is the wrong response to
+a stalled build — the in-process progress watchdog (`WORKER_PROGRESS_TIMEOUT_MS`, issue #452)
+aborts the stall with proper build-failure bookkeeping. `degraded` means a build is active but no
+story has made progress for longer than the watchdog window.
+
+To scrape with an annotation-based Prometheus setup, add pod annotations (see `podAnnotations` in
+the Helm chart's `values.yaml`):
+
+```yaml
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "3003"
+  prometheus.io/path: "/metrics"
+```
+
+Example alert rules:
+
+```yaml
+groups:
+  - name: vizdiff-worker
+    rules:
+      # Wedged-session signature: infra-classified story failures spiking.
+      - alert: VizdiffWorkerInfraErrors
+        expr: sum(rate(vizdiff_worker_stories_total{outcome="infra_error"}[10m])) > 0.1
+        for: 10m
+        annotations:
+          summary: "vizdiff worker is recording infra-classified story failures"
+
+      # No story has completed for 5 minutes while stories were recently flowing. The gauge
+      # persists across idle gaps, so the `and` clause ("stories were completing within the last
+      # 15 minutes") keeps a long-idle worker from paging; cross-check the /health JSON
+      # (`status: "degraded"`) to confirm a build is actually active.
+      - alert: VizdiffWorkerBuildStalled
+        expr: >
+          (time() - vizdiff_worker_last_story_completed_timestamp > 300)
+          and (increase(vizdiff_worker_stories_total[15m]) > 0)
+        annotations:
+          summary: "vizdiff worker build has made no progress for 5+ minutes"
+
+      # Crash loop (the issue #457 incident: 44 restarts over 14 h), via kube-state-metrics.
+      - alert: VizdiffWorkerCrashLooping
+        expr: >
+          increase(kube_pod_container_status_restarts_total{container="worker"}[1h]) > 3
+        annotations:
+          summary: "vizdiff worker container is restarting repeatedly"
+```
+
 ## Story readiness
 
 The worker captures a story only after Storybook reports its render lifecycle complete

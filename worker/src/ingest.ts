@@ -44,6 +44,7 @@ import { updateGitHubCheckRun, type GitHubCheckData } from "./github"
 import { getGitLabHostConfig, updateGitLabCommitStatus, type GitLabCheckData } from "./gitlab"
 import { WORKER_ID } from "./identity"
 import { log } from "./log"
+import { recordBuildOutcome, recordStoryPhaseDuration, recordStoryResult } from "./metrics"
 import { runStoryPipeline, settlePrewarmedPool } from "./pipeline"
 import { beginBuildProgress, endBuildProgress } from "./progress"
 import { buildImageUrlResolver } from "./s3"
@@ -61,7 +62,7 @@ import {
 } from "./stories"
 import { installStoryRenderStateHook } from "./storyReady"
 import { NonRetryableTaskError, isPermanentS3FetchError } from "./tasks"
-import { withTimeout } from "./timeout"
+import { BuildTimeoutError, withTimeout } from "./timeout"
 import type { Story } from "./types"
 import { postBuildFailedStatus, type BuildCheckData } from "./vcsStatus"
 import { nodeCompatTransformRequest } from "./wdio"
@@ -193,6 +194,9 @@ export async function ingestStorybook(
   taskQueueId?: number,
 ): Promise<void> {
   log.info(`Starting storybook ingestion for project ${projectId}, upload ${uploadId}`)
+  // Wall-clock start for vizdiff_worker_build_duration_seconds (issue #457): measures actual
+  // processing (download through render/finalize), not time spent queued.
+  const ingestStartMs = Date.now()
 
   // Fetch the screenshot test record (project and user loaded via eager relations)
   const db = await Database()
@@ -531,9 +535,25 @@ export async function ingestStorybook(
             captureConcurrency: pool.size,
             finalizeConcurrency: WORKER_FINALIZE_CONCURRENCY,
             queueLimit: WORKER_FINALIZE_QUEUE_LIMIT,
-            capture: (story) => captureStoryWithRetry({ ...storyInfoFor(story), pool }),
-            finalize: (story, captured) =>
-              finalizeStoryWithRecording(storyInfoFor(story), captured),
+            capture: async (story) => {
+              const outcome = await captureStoryWithRetry({ ...storyInfoFor(story), pool })
+              // Story metrics (issue #457): a `captured` outcome reports its capture-phase
+              // duration (its final ok/failed outcome is recorded at finalize); a `recorded`
+              // outcome IS the story's final (failed) result, so record it now.
+              if (outcome.kind === "captured") {
+                recordStoryPhaseDuration("capture", outcome.captured.captureDurationMs / 1000)
+              } else {
+                recordStoryResult(outcome.result)
+              }
+              return outcome
+            },
+            finalize: async (story, captured) => {
+              const finalizeStartMs = Date.now()
+              const result = await finalizeStoryWithRecording(storyInfoFor(story), captured)
+              recordStoryPhaseDuration("finalize", (Date.now() - finalizeStartMs) / 1000)
+              recordStoryResult(result)
+              return result
+            },
             hooks: {
               onCaptureComplete: () => {
                 progress.touch()
@@ -674,6 +694,7 @@ export async function ingestStorybook(
       // concurrent render fan-out inside is guarded by the build watchdog (progress stall +
       // derived whole-build ceiling, issue #452).
       await renderStorybook()
+      recordBuildOutcome("completed", (Date.now() - ingestStartMs) / 1000)
     } finally {
       log.debug("Closing WebdriverIO browser session pool")
       // Sessions may already be gone if a timeout abort closed them; destroyAll tolerates that so
@@ -685,6 +706,12 @@ export async function ingestStorybook(
     log.error(
       error,
       `Failed to process storybook in test ${screenshotTest.id} (build #${screenshotTest.buildNumber})`,
+    )
+    // Build metrics (issue #457): "aborted" = the build watchdog fired (whole-build ceiling or
+    // progress stall, both BuildTimeoutError); everything else is "failed".
+    recordBuildOutcome(
+      error instanceof BuildTimeoutError ? "aborted" : "failed",
+      (Date.now() - ingestStartMs) / 1000,
     )
     screenshotTest.status = "failed"
     await screenshotTestRepo.save(screenshotTest)

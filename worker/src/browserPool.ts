@@ -1,6 +1,7 @@
 import type { Browser } from "webdriverio"
 
 import { log } from "./log"
+import { recordBrowserRelaunch } from "./metrics"
 
 /**
  * A fixed-size pool of independent WebdriverIO browser sessions used to render the stories of a
@@ -132,6 +133,7 @@ export async function createBrowserPool(
   let sessionInit: ((browser: Browser) => Promise<void>) | undefined
 
   async function replace(session: PooledSession, reason: string): Promise<void> {
+    recordBrowserRelaunch()
     log.info(
       { sessionId: session.id, reason, storiesRendered: session.storiesRendered },
       `browserPool: replacing session ${session.id} (${reason})`,
