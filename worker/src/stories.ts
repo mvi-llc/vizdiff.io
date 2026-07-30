@@ -417,6 +417,29 @@ export async function captureStableScreenshot(
 const MAX_ERROR_MESSAGE_LENGTH = 2000
 
 /**
+ * Idempotently persists a story's TestResult keyed on (screenshot_test_id, story_id) — the
+ * unique `IDX_test_results_test_story` index (issue #456, cross-worker sharding groundwork).
+ * A story retry (or, once sharding lands, a re-run shard) overwrites the previous attempt's row
+ * instead of inserting a duplicate. TypeORM resolves the `screenshotTest` conflict path to the
+ * relation's `screenshot_test_id` join column, includes every defined entity column in the
+ * ON CONFLICT update set (callers must therefore set stale-able columns explicitly, even to
+ * null), and bumps `updated_at` via its column default. The row id (RETURNING) is copied back
+ * onto the entity so callers can log/reference it like a plain save.
+ */
+async function upsertTestResult(
+  testResultTable: Repository<TestResult>,
+  testResult: TestResult,
+): Promise<void> {
+  const insertResult = await testResultTable.upsert(testResult, {
+    conflictPaths: ["screenshotTest", "storyId"],
+  })
+  const id = (insertResult.identifiers[0] as { id?: number } | undefined)?.id
+  if (id != undefined) {
+    testResult.id = id
+  }
+}
+
+/**
  * Captures one story with per-story retry on infrastructure failures (issues #450/#454). This is
  * the session-holding half of the capture/finalize split (issue #456): the retry loop wraps ONLY
  * the browser-facing capture phase, so an infra retry re-captures without repeating any S3 work,
@@ -580,7 +603,7 @@ async function recordErrorTestResult(
   testResult.changeStatus = "failed"
   testResult.errorKind = classified.kind
   testResult.errorMessage = classified.message.slice(0, MAX_ERROR_MESSAGE_LENGTH)
-  await testResultTable.save(testResult)
+  await upsertTestResult(testResultTable, testResult)
   return testResult
 }
 
@@ -797,7 +820,11 @@ export async function finalizeStory(
   testResult.diffImageUrl = diffImageUrl
   testResult.diffRatio = diffRatio
   testResult.changeStatus = changeStatus
-  await testResultTable.save(testResult)
+  // Explicit nulls (not undefined) so the idempotent upsert CLEARS a previous failed attempt's
+  // error columns when the retry succeeds — undefined fields are omitted from the update set.
+  testResult.errorKind = null
+  testResult.errorMessage = null
+  await upsertTestResult(testResultTable, testResult)
   logChild.debug(
     { testResultId: testResult.id, captureDurationMs },
     "Successfully saved test result record",

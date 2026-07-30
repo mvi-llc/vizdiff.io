@@ -1,8 +1,12 @@
 import { DatabasePool } from "./database"
 import { WORKER_ID } from "./identity"
-import { log } from "./log"
 
-type Task = {
+/**
+ * A task-queue row this worker has successfully claimed (locked). `id` is the queue row id —
+ * the handle for releaseLock/deleteTask — and `data` is the row's parsed jsonb payload.
+ */
+export type ClaimedTask = {
+  id: number
   task_type: string
   screenshot_test_id: number
   data: Record<string, unknown>
@@ -85,99 +89,72 @@ export function isPermanentS3FetchError(error: unknown): boolean {
   return false
 }
 
+/** Validates the shape of a claimed task-queue row (jsonb `data` is parsed by node-postgres). */
+function isClaimedTaskRow(row: unknown): row is ClaimedTask {
+  return (
+    row != null &&
+    typeof row === "object" &&
+    "id" in row &&
+    "task_type" in row &&
+    "screenshot_test_id" in row &&
+    "data" in row &&
+    "attempts" in row &&
+    typeof row.id === "number" &&
+    typeof row.task_type === "string" &&
+    typeof row.screenshot_test_id === "number" &&
+    typeof row.data === "object" &&
+    row.data != null &&
+    typeof row.attempts === "number"
+  )
+}
+
 /**
- * Returns the id of the newest unlocked task in the queue, optionally excluding
- * a set of task ids that the caller is temporarily deferring (e.g. tasks waiting
- * on a dependent build). Excluding them here lets the worker pick the next-best
- * task (typically the older dependency) instead of repeatedly re-selecting the
- * deferred one.
+ * Atomically claims the OLDEST eligible task in the queue (issue #456, cross-worker sharding
+ * groundwork): selection and lock acquisition are one statement, so two workers polling
+ * concurrently can never claim the same row.
+ *
+ *  - Oldest-first (`ORDER BY id ASC`): dependencies (e.g. a baseline build) are naturally
+ *    processed before the dependents enqueued after them, and no task starves behind a stream
+ *    of newer arrivals.
+ *  - `FOR UPDATE SKIP LOCKED`: a row another transaction is mid-claim on is skipped instead of
+ *    waited on, so concurrent workers contend without blocking each other.
+ *  - Eligibility: unlocked rows, plus rows whose lock has expired (LOCK_TIMEOUT_MINUTES —
+ *    crashed-worker recovery), minus `excludeIds` (tasks the caller is temporarily deferring or
+ *    backing off, so the next-best task is claimed instead of re-selecting an ineligible one).
+ *
+ * The claim records the stable WORKER_ID (hostname, not pid — issue #451) so a restarted worker
+ * can recognize its own orphaned work, and bumps `attempts` so the startup reclaim can bound
+ * how many times a crashing build is requeued.
+ *
+ * Returns the claimed task, or undefined when no eligible task exists.
  */
-export async function latestTaskQueueId(
-  excludeIds: ReadonlySet<number> = new Set(),
-): Promise<number | undefined> {
+export async function claimNextTask(
+  excludeIds: readonly number[] = [],
+): Promise<ClaimedTask | undefined> {
   const client = await DatabasePool()
   try {
-    const params: unknown[] = []
-    let excludeClause = ""
-    if (excludeIds.size > 0) {
-      const placeholders = [...excludeIds].map((_, i) => `$${i + 1}`).join(", ")
-      excludeClause = `AND id NOT IN (${placeholders})`
-      params.push(...excludeIds)
-    }
     const res = await client.query(
-      `SELECT id FROM task_queue
-       WHERE (locked_at IS NULL
-          OR locked_at < NOW() - INTERVAL '${LOCK_TIMEOUT_MINUTES} minutes')
-         ${excludeClause}
-       ORDER BY id DESC
-       LIMIT 1`,
-      params,
+      `UPDATE task_queue
+       SET locked_at = NOW(), locked_by = $1, attempts = attempts + 1
+       WHERE id = (
+         SELECT id FROM task_queue
+         WHERE (locked_at IS NULL
+            OR locked_at < NOW() - INTERVAL '${LOCK_TIMEOUT_MINUTES} minutes')
+           AND NOT (id = ANY($2::int[]))
+         ORDER BY id ASC
+         LIMIT 1
+         FOR UPDATE SKIP LOCKED)
+       RETURNING id, task_type, screenshot_test_id, data, attempts`,
+      [WORKER_ID, [...excludeIds]],
     )
     if (res.rowCount === 0) {
       return undefined
     }
-    return (res.rows[0] as { id: number }).id
-  } finally {
-    client.release()
-  }
-}
-
-export async function fetchTask(taskQueueId: number): Promise<Task | undefined> {
-  const client = await DatabasePool()
-  try {
-    // First try to acquire the lock atomically, respecting the lock timeout. The claim records
-    // the stable WORKER_ID (hostname, not pid — issue #451) so a restarted worker can recognize
-    // its own orphaned work, and bumps `attempts` so the startup reclaim can bound how many
-    // times a crashing build is requeued.
-    const lockRes = await client.query(
-      `UPDATE task_queue
-       SET locked_at = NOW(), locked_by = $1, attempts = attempts + 1
-       WHERE id = $2
-         AND (locked_at IS NULL
-           OR locked_at < NOW() - INTERVAL '${LOCK_TIMEOUT_MINUTES} minutes')
-       RETURNING task_type, screenshot_test_id, data, attempts`,
-      [WORKER_ID, taskQueueId],
-    )
-
-    // If no rows were updated, the task was already locked or doesn't exist
-    if (lockRes.rowCount === 0) {
-      const checkRes = await client.query(
-        "SELECT locked_at, locked_by FROM task_queue WHERE id = $1",
-        [taskQueueId],
-      )
-      if (checkRes.rowCount === 0) {
-        // The task row is gone (e.g. deleted by another worker after finishing
-        // it). This is not a failure of ours to retry; the caller clears any
-        // in-memory retry/deferral state for the id.
-        log.warn(`Task not found: ${taskQueueId} (likely completed by another worker)`)
-        return undefined
-      }
-      const task = checkRes.rows[0] as { locked_by: string; locked_at: Date }
-      const lockAge = Math.floor((Date.now() - task.locked_at.getTime()) / (1000 * 60))
-      log.warn(
-        `Task ${taskQueueId} is locked by ${task.locked_by} since ${task.locked_at} (${lockAge} minutes ago)`,
-      )
-      return undefined
+    const row = res.rows[0] as unknown
+    if (!isClaimedTaskRow(row)) {
+      throw new Error(`Claimed task has invalid row: ${JSON.stringify(row)}`)
     }
-
-    // Validate the task entry has the expected fields and types
-    const row = lockRes.rows[0] as unknown
-    if (
-      !row ||
-      typeof row !== "object" ||
-      !("task_type" in row) ||
-      !("screenshot_test_id" in row) ||
-      !("data" in row) ||
-      !("attempts" in row) ||
-      typeof row.task_type !== "string" ||
-      typeof row.screenshot_test_id !== "number" ||
-      typeof row.data !== "object" ||
-      typeof row.attempts !== "number"
-    ) {
-      throw new Error(`Task ${taskQueueId} has invalid row: ${JSON.stringify(row)}`)
-    }
-
-    return row as Task
+    return row
   } finally {
     client.release()
   }

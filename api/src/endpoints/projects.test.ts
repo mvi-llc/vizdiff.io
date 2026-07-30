@@ -81,20 +81,26 @@ describe("project stats endpoints", () => {
           screenshotTest.id,
         ])
         for (const name of testNames) {
-          const testResult = manager.create(TestResult, {
-            name,
-            screenshotTest,
-            storyId: name,
-            newImageUrl: `https://example.com/${name}.png`,
-            changeStatus: "unchanged",
-          })
-          await manager.save(testResult)
+          // Since issue #456 (unique (screenshot_test_id, story_id) index) a retried story
+          // upload is an idempotent upsert — duplicate rows can no longer exist. Seed the same
+          // way the worker writes so repeated names exercise the overwrite path.
+          await manager.upsert(
+            TestResult,
+            {
+              name,
+              screenshotTest,
+              storyId: name,
+              newImageUrl: `https://example.com/${name}.png`,
+              changeStatus: "unchanged",
+            },
+            { conflictPaths: ["screenshotTest", "storyId"] },
+          )
         }
       }
 
-      // Older finished build: 3 distinct names, "c" uploaded twice (retry).
+      // Older finished build: 3 distinct names, "c" uploaded twice (retry, upserted in place).
       await createBuild(1, "approved", build1Time, ["a", "b", "c", "c"])
-      // Latest finished build: 2 distinct names, "a" uploaded twice (retry).
+      // Latest finished build: 2 distinct names, "a" uploaded twice (retry, upserted in place).
       await createBuild(2, "unapproved", build2Time, ["a", "a", "b"])
       // Newer but unfinished build: must not count toward builds, tests, or last build time.
       await createBuild(3, "pending", build3Time, ["w", "x", "y", "z"])

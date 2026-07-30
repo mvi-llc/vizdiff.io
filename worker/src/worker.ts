@@ -24,10 +24,10 @@ import { ingestStorybook, isBaselineBuildPending } from "./ingest"
 import { log } from "./log"
 import { runRetentionSweep } from "./retention"
 import {
-  latestTaskQueueId,
-  fetchTask,
+  claimNextTask,
   NonRetryableTaskError,
   DependencyNotReadyError,
+  type ClaimedTask,
 } from "./tasks"
 import { BuildTimeoutError } from "./timeout"
 import { parseBuildCheckData, postBuildFailedStatus, type BuildCheckData } from "./vcsStatus"
@@ -74,11 +74,13 @@ const DEFER_INTERVAL_MS = 1000 * 5 // 5 seconds
 // How long to wait before re-polling after a deferral. This MUST be strictly
 // less than DEFER_INTERVAL_MS so that when the worker re-polls, the deferred
 // task is still inside its exclusion window (now < nextRetryTime) and therefore
-// still excluded from selection. That guarantees the older dependency (lower id)
-// is the only eligible candidate at the re-poll and gets picked next — without
-// this gap, the re-poll fires exactly at nextRetryTime, the deferred (newer,
-// higher-id) task is no longer excluded, and descending-id selection re-picks it
-// instead of the dependency.
+// still excluded from selection. That guarantees the unfinished dependency is
+// the only eligible candidate at the re-poll and gets claimed next. Oldest-first
+// claiming (issue #456) already picks a lower-id dependency before its dependent,
+// but this gap is still needed for out-of-order enqueues (a dependency that got
+// a HIGHER queue id than its dependent): without it, the re-poll fires exactly
+// at nextRetryTime, the deferred (older, lower-id) task is no longer excluded,
+// and ascending-id selection re-claims it instead of the dependency.
 const DEFER_REPOLL_MS = 1000 * 2 // 2 seconds
 // Maximum number of times a task may be deferred for an unfinished dependency
 // before we give up waiting and process it anyway. This bounds the wait and
@@ -90,6 +92,11 @@ const MAX_DEFER_COUNT = 60
 const subscriber = createPgSubscriber({ connectionString: CONN_STRING })
 // Current task being processed, if any
 let currentTaskId: number | undefined
+// Set while a claim round-trip is in flight (issue #456). The claim itself decides which task
+// is taken (oldest-first SKIP LOCKED — there is no per-id fetch anymore), so this synchronous
+// guard keeps the poll loop and the NOTIFY path from both claiming a row: a single-task worker
+// could only run one of them, and the loser's row would sit locked for LOCK_TIMEOUT_MINUTES.
+let claimInFlight = false
 // Set once a shutdown signal (SIGTERM/SIGINT) has been received; stops the worker from
 // accepting any new tasks while the graceful shutdown runs.
 let shuttingDown = false
@@ -118,13 +125,13 @@ function clearDeferredTaskId(taskId: number): void {
 }
 
 // Set of task ids that are currently deferred and not yet due for retry. These
-// are excluded from task selection so the worker can pick the dependent build
-// (typically an older, lower-id task) instead of re-selecting the deferred one.
+// are excluded from the claim so the worker can pick the unfinished dependency
+// instead of re-claiming the deferred task.
 //
 // The exclusion window is [deferStart, nextRetryTime). Because the post-deferral
 // re-poll is scheduled at DEFER_REPOLL_MS < DEFER_INTERVAL_MS (i.e. strictly
 // before nextRetryTime), the deferred task is guaranteed to still be excluded at
-// that re-poll, leaving the older dependency as the only eligible candidate.
+// that re-poll, leaving the dependency as the only eligible candidate.
 function activeDeferredTaskIds(now: number): Set<number> {
   const ids = new Set<number>()
   for (const [taskId, info] of deferredTasksMap) {
@@ -136,10 +143,12 @@ function activeDeferredTaskIds(now: number): Set<number> {
 }
 
 // Set of task ids that are inside a failure-backoff window and not yet due for
-// retry. These are excluded from task selection the same way deferred tasks are,
-// so a single failing task (with up to 30 minutes of backoff) cannot starve the
-// queue: latestTaskQueueId() returns the next eligible task instead of
-// repeatedly returning the backing-off one and stalling.
+// retry. These are excluded from the claim the same way deferred tasks are, so
+// a single failing task (with up to 30 minutes of backoff) cannot stall the
+// queue: claimNextTask() claims the next eligible task instead of repeatedly
+// re-claiming the backing-off one. Under oldest-first claiming this matters for
+// any failing task that is OLDER than runnable work — without the exclusion it
+// would be re-claimed on every poll and everything behind it would starve.
 function activeBackoffTaskIds(now: number): Set<number> {
   const ids = new Set<number>()
   for (const [taskId, info] of failedTasksMap) {
@@ -148,6 +157,34 @@ function activeBackoffTaskIds(now: number): Set<number> {
     }
   }
   return ids
+}
+
+// The task ids to exclude from the next claim: tasks deferred waiting on a
+// dependent build, plus tasks inside a failure-backoff window.
+function currentExcludeIds(now: number): number[] {
+  const excludeIds = activeDeferredTaskIds(now)
+  for (const taskId of activeBackoffTaskIds(now)) {
+    excludeIds.add(taskId)
+  }
+  return [...excludeIds]
+}
+
+/**
+ * Claims the oldest eligible task if this worker can take on work right now. Synchronous
+ * single-flight guards (shutting down / already processing / claim already in flight) run
+ * BEFORE the claim statement, so this worker never locks a row it cannot immediately process.
+ * Returns undefined when no task was claimed.
+ */
+async function claimTaskIfIdle(excludeIds: readonly number[]): Promise<ClaimedTask | undefined> {
+  if (shuttingDown || currentTaskId != undefined || claimInFlight) {
+    return undefined
+  }
+  claimInFlight = true
+  try {
+    return await claimNextTask(excludeIds)
+  } finally {
+    claimInFlight = false
+  }
 }
 
 async function main() {
@@ -187,7 +224,19 @@ async function main() {
       return
     }
 
-    startTask(taskQueueId).catch((err: unknown) => log.error(err, "Error processing task"))
+    // The notification is a wake-up signal, not an assignment: the claim takes the OLDEST
+    // eligible task (issue #456), which may not be the just-notified id — e.g. when older work
+    // is still queued, or when a sibling worker already claimed the notified row (SKIP LOCKED).
+    const now = Date.now()
+    claimTaskIfIdle(currentExcludeIds(now))
+      .then((task) => {
+        if (task == undefined) {
+          log.debug(`No task claimed for notification ${taskQueueId} (busy, or none eligible)`)
+          return
+        }
+        return startTask(task)
+      })
+      .catch((err: unknown) => log.error(err, "Error processing task"))
   })
 
   subscriber.events.on("error", (error) => {
@@ -293,17 +342,14 @@ export function pollForNewTasks(): void {
   }
 
   // Exclude tasks that are deferred waiting on a dependent build, and tasks that
-  // are inside a failure-backoff window, so the worker picks the next eligible
+  // are inside a failure-backoff window, so the worker claims the next eligible
   // task instead of looping on (or stalling behind) an ineligible one.
   const now = Date.now()
-  const excludeIds = activeDeferredTaskIds(now)
-  for (const taskId of activeBackoffTaskIds(now)) {
-    excludeIds.add(taskId)
-  }
+  const excludeIds = currentExcludeIds(now)
 
-  latestTaskQueueId(excludeIds)
-    .then((taskQueueId) => {
-      if (taskQueueId == undefined) {
+  claimTaskIfIdle(excludeIds)
+    .then((task) => {
+      if (task == undefined) {
         log.trace(`No new tasks, checking for stuck builds...`)
         // Idle: opportunistically run the retention reaper and the stuck-build sweep (both
         // throttled and fire-and-forget).
@@ -313,8 +359,9 @@ export function pollForNewTasks(): void {
         return
       }
 
-      log.info(`Found new task: ${taskQueueId}`)
-      startTask(taskQueueId)
+      const taskQueueId = task.id
+      log.info(`Claimed task ${taskQueueId} [${task.task_type}]`)
+      startTask(task)
         .then(() => {
           // Task was processed successfully, immediately check for more tasks
           // Use process.nextTick to avoid growing the stack too much with synchronous tasks
@@ -344,8 +391,8 @@ export function pollForNewTasks(): void {
             )
             // Re-poll sooner than the exclusion window expires (DEFER_REPOLL_MS <
             // DEFER_INTERVAL_MS) so the deferred task is still excluded at the
-            // re-poll and the worker picks the older dependency instead of
-            // re-selecting this (newer, higher-id) task.
+            // re-poll and the worker claims the unfinished dependency instead of
+            // re-claiming this task (see the DEFER_REPOLL_MS comment).
             setTimeout(() => pollForNewTasks(), DEFER_REPOLL_MS)
             return
           }
@@ -403,38 +450,36 @@ export function pollForNewTasks(): void {
         })
     })
     .catch((err: unknown) => {
-      log.error(err, "Error fetching latest task queue ID")
+      log.error(err, "Error claiming next task")
       setTimeout(() => pollForNewTasks(), POLL_INTERVAL_MS)
     })
 }
 
-export async function startTask(taskQueueId: number): Promise<void> {
+/**
+ * Processes a task this worker has already claimed via claimNextTask() (issue #456: the claim
+ * IS the lock acquisition — there is no per-id fetch step anymore). If the worker cannot run
+ * the task after all (shutdown raced the claim, or another task slipped in), the claim's lock
+ * is released so any worker can pick it up immediately instead of waiting out the lock expiry.
+ */
+export async function startTask(task: ClaimedTask): Promise<void> {
+  const taskQueueId = task.id
   // Don't accept new tasks while shutting down
   if (shuttingDown) {
     log.info(`Cannot start task ${taskQueueId}: worker is shutting down`)
+    await releaseLock(taskQueueId)
     return
   }
   // Check if we're already processing a task
   if (currentTaskId != undefined) {
     log.info(`Cannot start task ${taskQueueId}: worker is already processing task ${currentTaskId}`)
+    await releaseLock(taskQueueId)
     return
   }
   currentTaskId = taskQueueId
   markTaskStarted(taskQueueId)
 
   try {
-    const task = await fetchTask(taskQueueId)
-    if (!task) {
-      log.warn(`Not starting task ${taskQueueId}: fetchTask() failed`)
-      // The row may be gone entirely (completed/deleted by another worker), in
-      // which case any in-memory retry/deferral state for it must not linger.
-      clearFailedTaskId(taskQueueId)
-      clearDeferredTaskId(taskQueueId)
-      currentTaskId = undefined
-      return
-    }
-
-    log.debug(`Fetched task ${taskQueueId} [${task.task_type}]`)
+    log.debug(`Starting task ${taskQueueId} [${task.task_type}]`)
     await processTask(task.task_type, task.screenshot_test_id, task.data)
 
     // If we got here, the task was successful, so clear it from the failed tasks map

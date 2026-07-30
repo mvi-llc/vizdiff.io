@@ -98,6 +98,14 @@ export class ScreenshotTest {
   @Column({ name: "last_progress_at", type: "timestamptz", nullable: true })
   lastProgressAt!: Date | null
 
+  // Total number of stories this build is expected to produce TestResult rows for (issue #456,
+  // cross-worker sharding groundwork). Written once the storybook's stories are enumerated;
+  // build completion across shards is then "count of distinct story results == expected".
+  // Nullable: nothing writes it yet (the chunk-task sharding PR will), and pre-sharding builds
+  // never set it.
+  @Column({ name: "expected_story_count", type: "integer", nullable: true })
+  expectedStoryCount!: number | null
+
   @CreateDateColumn({ name: "created_at", type: "timestamptz", nullable: false })
   createdAt!: Date
 
