@@ -220,7 +220,7 @@ export default function TestResultDialog({
             {result.name}
           </Typography>
           <Typography variant="body2" color={changeStatusColor(result.changeStatus)}>
-            {changeStatusMessage(result.changeStatus, result.diffRatio ?? 0)}
+            {changeStatusMessage(result.changeStatus, result.diffRatio ?? 0, result.errorKind)}
           </Typography>
         </Box>
         <Box
@@ -276,55 +276,134 @@ export default function TestResultDialog({
           </IconButton>
         </Box>
       </DialogTitle>
-      <DialogContent sx={{ flex: 1, p: 2, overflow: "hidden", display: "flex" }}>
-        {viewMode === "split" ? (
-          <Box sx={{ display: "flex", width: "100%", gap: 2, overflow: "hidden" }}>
-            <Box
-              sx={{
-                flex: 1,
-                display: "flex",
-                flexDirection: "column",
-                overflow: "hidden",
-                position: "relative",
-                alignItems: "center",
-                justifyContent: "center",
-                bgcolor: "var(--five-percent-opacity)",
-              }}
-            >
-              {ancestorScreenshotError ? (
-                <ReportProblemIcon
-                  color="error"
-                  sx={{ fontSize: 40, color: "var(--text-secondary)" }}
-                />
-              ) : result.ancestorScreenshotUrl ? (
-                <Image
-                  src={result.ancestorScreenshotUrl}
-                  alt={`Base screenshot for ${result.name}`}
-                  fill
-                  sizes="50vw"
-                  style={{ objectFit: "contain" }}
-                  priority
-                  onError={() => setAncestorScreenshotError(true)}
-                />
-              ) : (
-                <Typography variant="caption" sx={{ color: "var(--text-secondary)" }}>
-                  No Base Screenshot
-                </Typography>
-              )}
+      <DialogContent
+        sx={{ flex: 1, p: 2, overflow: "hidden", display: "flex", flexDirection: "column", gap: 2 }}
+      >
+        {result.changeStatus === "failed" && result.errorMessage && (
+          <Box
+            component="pre"
+            sx={{
+              flex: "0 0 auto",
+              m: 0,
+              p: 1.5,
+              maxHeight: "30%",
+              overflow: "auto",
+              fontFamily: "monospace",
+              fontSize: "0.8125rem",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              bgcolor: "var(--five-percent-opacity)",
+              color: "error.main",
+            }}
+          >
+            {result.errorMessage}
+          </Box>
+        )}
+        <Box sx={{ flex: 1, minHeight: 0, display: "flex" }}>
+          {viewMode === "split" ? (
+            <Box sx={{ display: "flex", width: "100%", gap: 2, overflow: "hidden" }}>
+              <Box
+                sx={{
+                  flex: 1,
+                  display: "flex",
+                  flexDirection: "column",
+                  overflow: "hidden",
+                  position: "relative",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  bgcolor: "var(--five-percent-opacity)",
+                }}
+              >
+                {ancestorScreenshotError ? (
+                  <ReportProblemIcon
+                    color="error"
+                    sx={{ fontSize: 40, color: "var(--text-secondary)" }}
+                  />
+                ) : result.ancestorScreenshotUrl ? (
+                  <Image
+                    src={result.ancestorScreenshotUrl}
+                    alt={`Base screenshot for ${result.name}`}
+                    fill
+                    sizes="50vw"
+                    style={{ objectFit: "contain" }}
+                    priority
+                    onError={() => setAncestorScreenshotError(true)}
+                  />
+                ) : (
+                  <Typography variant="caption" sx={{ color: "var(--text-secondary)" }}>
+                    No Base Screenshot
+                  </Typography>
+                )}
+              </Box>
+              <Box
+                sx={{
+                  flex: 1,
+                  display: "flex",
+                  flexDirection: "column",
+                  overflow: "hidden",
+                  position: "relative",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  bgcolor: "var(--five-percent-opacity)",
+                }}
+              >
+                {screenshotError ? (
+                  <ReportProblemIcon
+                    color="error"
+                    sx={{ fontSize: 40, color: "var(--text-secondary)" }}
+                  />
+                ) : result.screenshotUrl ? (
+                  <Image
+                    src={result.screenshotUrl}
+                    alt={`New version of ${result.name}`}
+                    fill
+                    sizes="50vw"
+                    style={{ objectFit: "contain" }}
+                    priority
+                    onError={() => setScreenshotError(true)}
+                  />
+                ) : (
+                  <Typography variant="caption" sx={{ color: "var(--text-secondary)" }}>
+                    No New Screenshot
+                  </Typography>
+                )}
+              </Box>
             </Box>
+          ) : (
             <Box
               sx={{
-                flex: 1,
-                display: "flex",
-                flexDirection: "column",
-                overflow: "hidden",
                 position: "relative",
+                width: "100%",
+                height: "100%",
+                overflow: "hidden",
+                display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
                 bgcolor: "var(--five-percent-opacity)",
               }}
             >
-              {screenshotError ? (
+              {viewMode === "old" ? (
+                ancestorScreenshotError ? (
+                  <ReportProblemIcon
+                    color="error"
+                    sx={{ fontSize: 40, color: "var(--text-secondary)" }}
+                  />
+                ) : result.ancestorScreenshotUrl ? (
+                  <Image
+                    src={result.ancestorScreenshotUrl}
+                    alt={`Base screenshot for ${result.name}`}
+                    fill
+                    sizes="100vw"
+                    style={{ objectFit: "contain" }}
+                    priority
+                    onError={() => setAncestorScreenshotError(true)}
+                  />
+                ) : (
+                  <Typography variant="caption" sx={{ color: "var(--text-secondary)" }}>
+                    No Base Screenshot
+                  </Typography>
+                )
+              ) : screenshotError ? (
                 <ReportProblemIcon
                   color="error"
                   sx={{ fontSize: 40, color: "var(--text-secondary)" }}
@@ -332,102 +411,47 @@ export default function TestResultDialog({
               ) : result.screenshotUrl ? (
                 <Image
                   src={result.screenshotUrl}
-                  alt={`New version of ${result.name}`}
+                  alt={`Screenshot for ${result.name}`}
                   fill
-                  sizes="50vw"
+                  sizes="100vw"
                   style={{ objectFit: "contain" }}
                   priority
                   onError={() => setScreenshotError(true)}
                 />
               ) : (
                 <Typography variant="caption" sx={{ color: "var(--text-secondary)" }}>
-                  No New Screenshot
+                  No Screenshot
                 </Typography>
               )}
-            </Box>
-          </Box>
-        ) : (
-          <Box
-            sx={{
-              position: "relative",
-              width: "100%",
-              height: "100%",
-              overflow: "hidden",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              bgcolor: "var(--five-percent-opacity)",
-            }}
-          >
-            {viewMode === "old" ? (
-              ancestorScreenshotError ? (
-                <ReportProblemIcon
-                  color="error"
-                  sx={{ fontSize: 40, color: "var(--text-secondary)" }}
-                />
-              ) : result.ancestorScreenshotUrl ? (
-                <Image
-                  src={result.ancestorScreenshotUrl}
-                  alt={`Base screenshot for ${result.name}`}
-                  fill
-                  sizes="100vw"
-                  style={{ objectFit: "contain" }}
-                  priority
-                  onError={() => setAncestorScreenshotError(true)}
-                />
-              ) : (
-                <Typography variant="caption" sx={{ color: "var(--text-secondary)" }}>
-                  No Base Screenshot
-                </Typography>
-              )
-            ) : screenshotError ? (
-              <ReportProblemIcon
-                color="error"
-                sx={{ fontSize: 40, color: "var(--text-secondary)" }}
-              />
-            ) : result.screenshotUrl ? (
-              <Image
-                src={result.screenshotUrl}
-                alt={`Screenshot for ${result.name}`}
-                fill
-                sizes="100vw"
-                style={{ objectFit: "contain" }}
-                priority
-                onError={() => setScreenshotError(true)}
-              />
-            ) : (
-              <Typography variant="caption" sx={{ color: "var(--text-secondary)" }}>
-                No Screenshot
-              </Typography>
-            )}
 
-            {viewMode === "diff" && !screenshotError && !diffMaskError && result.diffMaskUrl && (
-              <Box
-                sx={{
-                  position: "absolute",
-                  top: 0,
-                  left: 0,
-                  width: "100%",
-                  height: "100%",
-                  overflow: "hidden",
-                }}
-              >
-                <Image
-                  src={result.diffMaskUrl}
-                  alt={`Diff mask for ${result.name}`}
-                  fill
-                  sizes="100vw"
-                  style={{
-                    objectFit: "contain",
-                    filter: "brightness(0) invert(1) sepia(1) hue-rotate(45deg) saturate(10000%)",
+              {viewMode === "diff" && !screenshotError && !diffMaskError && result.diffMaskUrl && (
+                <Box
+                  sx={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: "100%",
+                    height: "100%",
+                    overflow: "hidden",
                   }}
-                  priority
-                  onError={() => setDiffMaskError(true)}
-                />
-              </Box>
-            )}
-          </Box>
-        )}
+                >
+                  <Image
+                    src={result.diffMaskUrl}
+                    alt={`Diff mask for ${result.name}`}
+                    fill
+                    sizes="100vw"
+                    style={{
+                      objectFit: "contain",
+                      filter: "brightness(0) invert(1) sepia(1) hue-rotate(45deg) saturate(10000%)",
+                    }}
+                    priority
+                    onError={() => setDiffMaskError(true)}
+                  />
+                </Box>
+              )}
+            </Box>
+          )}
+        </Box>
       </DialogContent>
     </Dialog>
   )

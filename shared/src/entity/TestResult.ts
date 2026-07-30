@@ -10,7 +10,7 @@ import {
 } from "typeorm"
 
 import type { ScreenshotTest } from "./ScreenshotTest"
-import type { TestResultStatus } from "./types"
+import type { TestResultErrorKind, TestResultStatus } from "./types"
 
 @Entity("test_results")
 @Index("IDX_test_results_screenshot_test_id", ["screenshotTest.id"])
@@ -51,6 +51,15 @@ export class TestResult {
   // Can be "new", "unchanged", "changed", or "failed"
   @Column({ type: "text", name: "change_status", nullable: false })
   changeStatus!: TestResultStatus
+
+  // Why the result failed (issue #454): distinguishes infrastructure errors (dead browser
+  // session, storage) from genuine story failures. Only set when changeStatus is "failed"
+  @Column({ type: "text", name: "error_kind", nullable: true })
+  errorKind!: TestResultErrorKind | null
+
+  // Human-readable error detail accompanying errorKind. Only set when changeStatus is "failed"
+  @Column({ type: "text", name: "error_message", nullable: true })
+  errorMessage!: string | null
 
   @CreateDateColumn({ name: "created_at", type: "timestamptz", nullable: false })
   createdAt!: Date

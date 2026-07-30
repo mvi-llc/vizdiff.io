@@ -92,6 +92,10 @@ export type TestResultResponse = {
   ancestorScreenshotUrl?: string
   diffMaskUrl?: string
   diffRatio?: number
+  /** Why the result failed (issue #454); a `TestResultErrorKind` value. Only set for failed results. */
+  errorKind?: string
+  /** Human-readable error detail accompanying errorKind. Only set for failed results. */
+  errorMessage?: string
   createdStampSec: number
 }
 
