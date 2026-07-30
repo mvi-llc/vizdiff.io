@@ -107,3 +107,12 @@ data:
   {{- with .Values.worker.buildAbortGraceMs }}
   BUILD_ABORT_GRACE_MS: {{ . | quote }}
   {{- end }}
+  {{- if .Values.worker.shardingEnabled }}
+  WORKER_SHARDING_ENABLED: "true"
+  {{- end }}
+  {{- with .Values.worker.shardChunkSize }}
+  WORKER_SHARD_CHUNK_SIZE: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.worker.shardMinStories }}
+  WORKER_SHARD_MIN_STORIES: {{ . | quote }}
+  {{- end }}

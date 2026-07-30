@@ -245,6 +245,18 @@ worker:
   # orchestrator restarts a clean process (BUILD_ABORT_GRACE_MS). Empty uses the built-in
   # default (10000).
   buildAbortGraceMs: ""
+  # -- Cross-worker build sharding (issue #456, WORKER_SHARDING_ENABLED): split large builds
+  # into render_story_chunk tasks that any worker replica can claim. Off by default. Rolling-
+  # deploy caveat: enable only after EVERY worker replica runs a version that understands the
+  # new task type — older workers error on it.
+  shardingEnabled: false
+  # -- Stories per render chunk task when sharding is enabled (issue #456,
+  # WORKER_SHARD_CHUNK_SIZE). Empty uses the built-in default (50).
+  shardChunkSize: ""
+  # -- Minimum discovered story count before a build is sharded; smaller builds render inline in
+  # the discovery task (issue #456, WORKER_SHARD_MIN_STORIES). Empty uses the built-in default
+  # (100).
+  shardMinStories: ""
 
 # Per-service container resource requests/limits.
 resources:

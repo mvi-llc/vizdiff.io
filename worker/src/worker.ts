@@ -23,6 +23,7 @@ import { WORKER_ID } from "./identity"
 import { ingestStorybook, isBaselineBuildPending } from "./ingest"
 import { log } from "./log"
 import { runRetentionSweep } from "./retention"
+import { giveUpOnChunkTask, parseRenderChunkPayload, runRenderChunk } from "./shard"
 import {
   claimNextTask,
   NonRetryableTaskError,
@@ -550,6 +551,25 @@ export async function processTask(
         }
         break
       }
+      case "render_story_chunk": {
+        // One chunk of a sharded build (issue #456, Phase B). No isBaselineBuildPending gate
+        // here: chunks are only enqueued after the discovery (ingest) task already passed it.
+        const payload = parseRenderChunkPayload(data)
+        if (!payload) {
+          // A malformed payload can never become processable; delete it via the
+          // NonRetryableTaskError path below.
+          throw new NonRetryableTaskError(
+            `Invalid render_story_chunk payload: ${JSON.stringify(data)}`,
+          )
+        }
+        await runRenderChunk(payload, screenshotTestId, currentTaskId)
+
+        // Chunk completed successfully, delete it from the queue
+        if (currentTaskId) {
+          await deleteTask(currentTaskId)
+        }
+        break
+      }
       default:
         throw new Error(`Unknown task type: ${taskType}`)
     }
@@ -565,7 +585,10 @@ export async function processTask(
       } else if (error instanceof BuildTimeoutError) {
         // A timed-out build is almost always stuck or pathologically large. Retrying would just
         // burn another full timeout window, so treat it as terminal: delete the task instead of
-        // releasing the lock. The ScreenshotTest has already been marked "failed" by ingest.
+        // releasing the lock. For an ingest task the ScreenshotTest has already been marked
+        // "failed" by ingest; for a render_story_chunk task the chunk has already recorded
+        // failed results for its stories and reconciled (the build itself is NOT failed —
+        // issue #456, the blast radius of a chunk timeout is one chunk).
         log.warn(`Task ${currentTaskId} exceeded the build timeout; deleting (non-retryable)`)
         await deleteTask(currentTaskId)
       } else {
@@ -673,25 +696,41 @@ export async function deleteTask(taskQueueId: number): Promise<void> {
 
 /**
  * Permanently give up on a task that has exhausted its retry budget: delete the task row from
- * the queue (so it is never re-selected and the retry cycle cannot restart) and mark its build
- * failed if it is still pending/running — mirroring what sweepStuckBuilds() sets for builds
- * that will never produce results.
+ * the queue (so it is never re-selected and the retry cycle cannot restart), then:
+ *
+ *  - ingest tasks: mark the build failed if it is still pending/running — mirroring what
+ *    sweepStuckBuilds() sets for builds that will never produce results.
+ *  - render_story_chunk tasks (issue #456, Phase B): do NOT fail the build — one bad chunk must
+ *    not kill the other chunks' work. Instead record failed TestResults for the chunk's stories
+ *    and reconcile, so the build still converges (with partial failures).
  */
 export async function giveUpOnTask(taskQueueId: number): Promise<void> {
+  let chunkGiveUp: { screenshotTestId: number; data: unknown } | undefined
   const client = await DatabasePool()
   try {
     log.warn(`Giving up on task ${taskQueueId}: deleting it from the queue`)
     const res = await client.query(
-      "DELETE FROM task_queue WHERE id = $1 RETURNING screenshot_test_id",
+      "DELETE FROM task_queue WHERE id = $1 RETURNING screenshot_test_id, task_type, data",
       [taskQueueId],
     )
     if (res.rowCount === 0) {
       return
     }
-    const { screenshot_test_id: screenshotTestId } = res.rows[0] as {
+    const {
+      screenshot_test_id: screenshotTestId,
+      task_type: taskType,
+      data,
+    } = res.rows[0] as {
       screenshot_test_id: number | null
+      task_type: string
+      data: unknown
     }
-    if (screenshotTestId != undefined) {
+    if (screenshotTestId == undefined) {
+      return
+    }
+    if (taskType === "render_story_chunk") {
+      chunkGiveUp = { screenshotTestId, data }
+    } else {
       await client.query(
         `UPDATE screenshot_tests
          SET status = 'failed', updated_at = NOW()
@@ -701,6 +740,9 @@ export async function giveUpOnTask(taskQueueId: number): Promise<void> {
     }
   } finally {
     client.release()
+  }
+  if (chunkGiveUp) {
+    await giveUpOnChunkTask(chunkGiveUp.screenshotTestId, chunkGiveUp.data)
   }
 }
 
