@@ -175,6 +175,13 @@ worker:
   # -- Whitespace-separated extra Chrome flags appended to the worker's screenshot sessions,
   # after the hardening and WebGL flags (WORKER_CHROME_EXTRA_ARGS).
   chromeExtraArgs: ""
+  # -- Per-story render timeout in ms (WORKER_STORY_RENDER_TIMEOUT_MS, issue #458). After
+  # navigation the worker waits for Storybook's story-render lifecycle to complete before
+  # capturing; a story that never completes is marked failed. Empty uses the default (30000).
+  storyRenderTimeoutMs: ""
+  # -- Cap in ms on a story's opt-in pre-capture delay, parameters.vizdiff.delay /
+  # parameters.chromatic.delay (WORKER_STORY_DELAY_MAX_MS). Empty uses the default (15000).
+  storyDelayMaxMs: ""
 
 # Per-service container resource requests/limits.
 resources:

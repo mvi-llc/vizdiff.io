@@ -20,6 +20,7 @@ import {
 } from "./environment"
 import { diffImages, diffImagesNoMask } from "./images"
 import { log } from "./log"
+import { waitForStoryReady } from "./storyReady"
 import type { SetViewportOptions, Story, StorybookWindow } from "./types"
 
 const SCREENSHOT_INTERVAL_MS = 500
@@ -181,7 +182,7 @@ export function getStoryViewport(story: Story): SetViewportOptions {
  * Runs against a single browser-pool session, which the caller checks out for the full render of
  * one story, so no additional locking is needed.
  * @param browser WebDriverIO browser instance
- * @param storyId The ID of the story to capture
+ * @param story The story to capture (id + parameters, used for readiness and delay opt-ins)
  * @param port The port where the Storybook is being served locally
  * @param tempDir A temporary directory for stabilization screenshots
  * @param outputFilePath The final path to save the stabilized screenshot
@@ -189,12 +190,13 @@ export function getStoryViewport(story: Story): SetViewportOptions {
  */
 export async function captureStableScreenshot(
   browser: Browser,
-  storyId: string,
+  story: Story,
   viewport: SetViewportOptions,
   port: number,
   tempDir: string,
   outputFilePath: string,
 ): Promise<string> {
+  const storyId = story.id
   log.debug(`Capturing stable screenshot for story ${storyId}`)
   const tempPath1 = path.join(tempDir, `${storyId}-temp1.png`)
   const tempPath2 = path.join(tempDir, `${storyId}-temp2.png`)
@@ -211,9 +213,10 @@ export async function captureStableScreenshot(
   log.debug(`Navigating to story URL: ${storyUrl}`)
   await browser.url(storyUrl)
 
-  // Wait for the story to load
-  log.debug(`Waiting for story ${storyId} to load...`)
-  await waitForStorybookToLoad(browser)
+  // Wait for the story's render lifecycle to complete (issue #458). Visual quiescence alone is
+  // not enough: async/Suspense stories paint a loading fallback that reads as "stable".
+  log.debug(`Waiting for story ${storyId} to render...`)
+  await waitForStoryReady(browser, story)
 
   // Inject CSS to remove Storybook's body padding
   log.debug(`Injecting CSS to remove body padding for story ${storyId}`)
@@ -400,7 +403,7 @@ export async function processStory({
   try {
     await captureStableScreenshot(
       browser,
-      storyId,
+      story,
       viewport,
       port,
       screenshotTempDir,
@@ -610,41 +613,6 @@ async function downloadImage({
     // Handle the case where the writeStream errors
     writeStream.on("error", (err) => handleSettled(err))
   })
-}
-
-async function waitForStorybookToLoad(browser: Browser): Promise<void> {
-  const STORYBOOK_LOAD_TIMEOUT = 10 * 1000
-  const POST_LOAD_DELAY = 500
-
-  log.debug(`Waiting for Storybook to be ready with ${STORYBOOK_LOAD_TIMEOUT}ms timeout`)
-  await browser.waitUntil(
-    async () => {
-      try {
-        // eslint-disable-next-line prefer-arrow-callback
-        const ready = await browser.execute(function () {
-          // @ts-expect-error: this is javascript
-          // eslint-disable-next-line
-          return !!(window.__STORYBOOK_PREVIEW__ && window.__STORYBOOK_PREVIEW__.ready)
-        })
-        log.debug(`Storybook ready: ${String(ready)}`)
-        return ready
-      } catch (err) {
-        log.error(err, "Error checking Storybook ready state")
-        return false
-      }
-    },
-    {
-      timeout: STORYBOOK_LOAD_TIMEOUT,
-      timeoutMsg: `Story failed to load within ${STORYBOOK_LOAD_TIMEOUT / 1000}s`,
-      interval: 100,
-    },
-  )
-
-  // TASK: Use WebDriver BiDi to wait for "network quiescence"
-
-  // Sleep for an additional fixed delay for final stabilization
-  // log.debug(`Pausing for ${POST_LOAD_DELAY}ms final stabilization delay`)
-  await browser.pause(POST_LOAD_DELAY)
 }
 
 async function takeScreenshotWithRetry(

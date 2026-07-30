@@ -170,6 +170,17 @@ export const MAX_TARBALL_PATH_LENGTH = intEnv("MAX_TARBALL_PATH_LENGTH", 4096)
 
 // Maximum length of a story id / name / title before it is rejected. Default 2048.
 export const MAX_STORY_IDENTIFIER_LENGTH = intEnv("MAX_STORY_IDENTIFIER_LENGTH", 2048)
+
+// Maximum time to wait for a single story's render lifecycle to complete after navigation (issue
+// #458): a `storyRendered`/`docsRendered` channel event, or Storybook 8's `currentRender` phase
+// reaching "completed". A story that neither completes nor errors within this window is marked
+// failed instead of screenshotting its loading fallback. Default: 30 seconds.
+export const WORKER_STORY_RENDER_TIMEOUT_MS = intEnv("WORKER_STORY_RENDER_TIMEOUT_MS", 30_000)
+
+// Upper bound on a story's opt-in pre-capture delay (`parameters.vizdiff.delay`, falling back to
+// `parameters.chromatic.delay`). Story parameters come from untrusted uploads, so larger requested
+// delays are clamped to this cap to keep one story from stalling a build. Default: 15 seconds.
+export const WORKER_STORY_DELAY_MAX_MS = intEnv("WORKER_STORY_DELAY_MAX_MS", 15_000)
 // Maximum wall-clock duration for a single storybook build before it is aborted. A build that
 // exceeds this is almost always stuck or pathologically large, so the task is treated as a
 // non-retryable failure (see worker.ts). Default: 15 minutes.

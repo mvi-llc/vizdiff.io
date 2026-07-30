@@ -84,6 +84,8 @@ Single-host fallback: when `GITLAB_HOSTS` is unset, a single host is derived fro
 | `WORKER_CHANGED_THRESHOLD` | worker | no | `0` | Minimum fraction of differing pixels (0–1) for a story to be marked **changed**, applied together with `WORKER_CHANGED_MIN_PIXELS` (both floors must be met). Defaults to `0` (no ratio floor); raise it as an escape hatch for deployments with nondeterministic stories where a fixed pixel count flags too often on large screenshots. Neither setting affects the capture-stabilization loop. Invalid or out-of-range values fall back to the default. |
 | `WORKER_ENABLE_WEBGL` | worker | no | `false` | Opt-in software (SwiftShader) WebGL for story rendering (issue #447). Off by default because SwiftShader is in-process software rasterization driven by untrusted story content — a larger attack surface than no GL at all. Disabled → screenshot sessions launch with `--disable-webgl` and WebGL-dependent stories (maplibre-gl, deck.gl, three.js, …) fall into their error boundaries; enabled → sessions launch with `--enable-unsafe-swiftshader` and render WebGL deterministically on the CPU (same SwiftShader version → same pixels). |
 | `WORKER_CHROME_EXTRA_ARGS` | worker | no | — | Whitespace-separated extra Chrome flags appended to the screenshot session launch args, after the hardening and WebGL flags (e.g. `--force-color-profile=srgb --lang=de`). Appending can only add flags, not remove the hardening set; use `WORKER_ENABLE_WEBGL` (not this) to control WebGL. |
+| `WORKER_STORY_RENDER_TIMEOUT_MS` | worker | no | `30000` | Per-story render timeout (issue #458). After navigating to a story the worker waits for Storybook's story-render lifecycle to complete (a `storyRendered`/`docsRendered` channel event, or Storybook 8's `currentRender` phase reaching `completed`) before the visual-stability capture loop starts, so async/Suspense stories are not captured as loading spinners. A story that neither completes nor errors within this window is marked **failed**. See "Story readiness" below. |
+| `WORKER_STORY_DELAY_MAX_MS` | worker | no | `15000` | Upper bound on a story's opt-in pre-capture delay (`parameters.vizdiff.delay` / `parameters.chromatic.delay`). Story parameters come from untrusted uploads, so larger requested delays are clamped to this cap to keep one story from stalling a build. |
 | `POSTGRES_HOST` | api, worker | no | `localhost` | Postgres host. |
 | `POSTGRES_PORT` | api, worker | no | `5432` | Postgres port. |
 | `POSTGRES_USER` | api, worker | no | `postgres` | Postgres user. |
@@ -131,6 +133,41 @@ Single-host fallback: when `GITLAB_HOSTS` is unset, a single host is derived fro
 
 \* Credentials may be supplied via IRSA, instance profiles, or the standard AWS credential chain
 instead of static keys.
+
+## Story readiness
+
+The worker captures a story only after Storybook reports its render lifecycle complete
+(`storyRendered`/`docsRendered`, or the Storybook 8 `currentRender` phase reaching `completed`),
+bounded by `WORKER_STORY_RENDER_TIMEOUT_MS`; a story that errors or never completes is marked
+**failed** instead of screenshotting its loading fallback. Two per-story opt-ins refine this:
+
+- **Pre-capture delay** — `parameters.vizdiff.delay` (preferred) or the Chromatic-compatible
+  `parameters.chromatic.delay`, in milliseconds, adds a minimum pause after render completion
+  before capture (for settle animations, font swaps, etc.). `vizdiff.delay` takes precedence when
+  both are set, and the effective delay is clamped to `WORKER_STORY_DELAY_MAX_MS`.
+- **Explicit ready signal** — stories that finish drawing asynchronously (WebGL scenes, async
+  loaders) can set `parameters.useReadySignal: true` (the Chromatic-era Foxglove convention; also
+  honored as `parameters.vizdiff.waitForReady` or `parameters.storyReady`). The worker then also
+  waits for `window.__VIZDIFF_STORY_READY__ === true` before capturing, within the same per-story
+  timeout budget.
+
+For Chromatic-era `useReadySignal` storybooks, bridge the existing ready promise with a preview
+decorator that resets the global per story and sets it when the story's signal resolves:
+
+```ts
+// .storybook/preview.ts — bridge a story's readySignal to vizdiff
+decorators: [
+  (Story, { parameters }) => {
+    ;(window as any).__VIZDIFF_STORY_READY__ = false
+    if (parameters.useReadySignal) {
+      readySignalPromise.then(() => ((window as any).__VIZDIFF_STORY_READY__ = true))
+    } else {
+      ;(window as any).__VIZDIFF_STORY_READY__ = true
+    }
+    return Story()
+  },
+]
+```
 
 ## Screenshot retention reaper
 

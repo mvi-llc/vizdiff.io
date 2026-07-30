@@ -5,9 +5,9 @@ import { TestResult, ScreenshotTest, screenshotKey } from "shared"
 import { Readable } from "stream"
 import type { Repository } from "typeorm"
 import { expect, describe, it, vi, beforeEach } from "vitest"
-import type { Browser } from "webdriverio"
 
 import { processStory } from "./stories"
+import { createMockBrowser, defaultMockPageState } from "./testing/mockBrowser"
 
 /**
  * Test suite for the screenshot comparison functionality.
@@ -23,11 +23,6 @@ import { processStory } from "./stories"
 // Mock function declarations for all external dependencies
 const mockSend = vi.fn()
 const mockTestResultSave = vi.fn()
-const mockBrowserUrl = vi.fn()
-const mockBrowserExecute = vi.fn()
-const mockBrowserSaveScreenshot = vi.fn()
-const mockBrowserSetViewport = vi.fn()
-const mockBrowserPause = vi.fn()
 
 /**
  * Mock S3 client for testing file uploads/downloads
@@ -262,24 +257,15 @@ describe("processStory", () => {
     updatedAt: new Date(),
   })
 
-  // Mock WebdriverIO browser instance for taking screenshots
-  const mockBrowser = {
-    url: mockBrowserUrl,
-    execute: mockBrowserExecute,
-    saveScreenshot: mockBrowserSaveScreenshot.mockImplementation(async () =>
-      Buffer.from("mock screenshot data"),
-    ),
-    setViewport: mockBrowserSetViewport,
-    pause: mockBrowserPause,
-    waitUntil: vi.fn().mockImplementation(async (fn: () => Promise<unknown>) => {
-      await fn()
-      return true
-    }),
-    isMultiremote: false,
-    capabilities: {},
-    sessionId: "mock-session",
-    options: {},
-  } as unknown as Browser
+  // Mock WebdriverIO browser instance for taking screenshots. The shared helper's `waitUntil`
+  // actually polls its predicate, and `execute` runs page functions against a fake window/document
+  // driven by the mutable `mockPageState` (defaulting to "story render completed immediately", so
+  // the story-readiness gate added in issue #458 passes without any extra scripting here).
+  const { browser: mockBrowser, state: mockPageState, fns: mockBrowserFns } = createMockBrowser()
+  const mockBrowserUrl = mockBrowserFns.url
+  const mockBrowserSaveScreenshot = mockBrowserFns.saveScreenshot
+  const mockBrowserSetViewport = mockBrowserFns.setViewport
+  const mockBrowserPause = mockBrowserFns.pause
 
   // Make the mock browser globally available (required by processStory)
   global.browser = mockBrowser
@@ -287,6 +273,9 @@ describe("processStory", () => {
   beforeEach(() => {
     // Reset all mocks before each test
     vi.clearAllMocks()
+
+    // Reset the scripted page state (individual tests mutate it)
+    Object.assign(mockPageState, defaultMockPageState())
 
     // Reset PNG mock state
     ;(PNG as unknown as { setTestMode(mode: string): void }).setTestMode("")
@@ -554,14 +543,11 @@ describe("processStory", () => {
    */
   it("should grow the viewport to fit tall content", async () => {
     const TALL_CONTENT_HEIGHT = 4000
-    // browser.execute is called for: (1) CSS injection (result ignored), (2) the initial
-    // pre-stabilization content-height measurement, which here under-reports because the layout
-    // has not settled, and (3) the post-stabilization measurement, which reports the true tall
+    // The content height is measured twice: the initial pre-stabilization measurement under-reports
+    // (the layout has not settled), and the post-stabilization measurement reports the true tall
     // height. This mirrors the issue #146 scenario where the content height is computed too early.
-    mockBrowserExecute
-      .mockResolvedValueOnce(undefined) // (1) CSS injection
-      .mockResolvedValueOnce(800) // (2) initial measurement: under the 900px viewport, no grow
-      .mockResolvedValue(TALL_CONTENT_HEIGHT) // (3+) post-stabilization measurement: tall content
+    // The mock page consumes one array element per measuring execute call (the last one sticks).
+    mockPageState.contentHeight = [800, TALL_CONTENT_HEIGHT]
 
     await processStory({
       story: mockStory,
