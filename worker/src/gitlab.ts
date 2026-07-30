@@ -40,6 +40,27 @@ export function getGitLabClient(cfg: GitLabHostConfig): InstanceType<typeof Gitl
   })
 }
 
+// GitLab rejects no-op `running` -> `running` status transitions with this message (surfaced by
+// Gitbeaker either as the error message or as the nested `cause.description`).
+const REDUNDANT_RUNNING_TRANSITION = "Cannot transition status via :run from :running"
+
+/**
+ * True iff the error is GitLab rejecting a `running` status update because the commit status is
+ * already `running` (e.g. an upload re-processed after a worker restart). This transition is a
+ * harmless no-op, so it shouldn't be logged as an error.
+ */
+function isRedundantRunningTransition(error: unknown, state: GitLabStatusState): boolean {
+  if (state !== "running" || !(error instanceof Error)) {
+    return false
+  }
+  if (error.message.includes(REDUNDANT_RUNNING_TRANSITION)) {
+    return true
+  }
+  // GitbeakerRequestError nests the GitLab response message in `cause.description`
+  const description = (error.cause as { description?: unknown } | undefined)?.description
+  return typeof description === "string" && description.includes(REDUNDANT_RUNNING_TRANSITION)
+}
+
 /**
  * Update a GitLab commit status with the results of a screenshot test, using the configured
  * per-host service token (resolved from the WorkTask's `gitlabHost`).
@@ -88,7 +109,15 @@ export async function updateGitLabCommitStatus({
       `Successfully updated GitLab commit status for project ${projectId}, commit ${commitSha}: state=${state}`,
     )
   } catch (error) {
-    log.error(error, "Failed to update GitLab commit status")
+    const context = { gitlabHost: cfg.host, projectId, commitSha, state, name }
+    if (isRedundantRunningTransition(error, state)) {
+      log.debug(
+        { err: error, ...context },
+        "GitLab commit status already running; skipping redundant transition",
+      )
+    } else {
+      log.error({ err: error, ...context }, "Failed to update GitLab commit status")
+    }
     // Don't throw - GitLab status update failures shouldn't block the build
   }
 }

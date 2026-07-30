@@ -8,16 +8,22 @@ import {
   updateGitLabCommitStatus,
   type GitLabStatusState,
 } from "./gitlab"
+import { log } from "./log"
 
-// Mock external dependencies
-vi.mock("@gitbeaker/rest")
-vi.mock("./environment", () => ({
+const mockEnvironment = vi.hoisted(() => ({
   GITLAB_HOST: "https://gitlab.com",
   APP_URL: "https://vizdiff.io",
   ENABLE_VCS_STATUS: false, // Disabled in tests by default
   IS_PRODUCTION: false,
   IS_STAGING: false,
   IS_TEST: true,
+}))
+
+// Mock external dependencies
+vi.mock("@gitbeaker/rest")
+vi.mock("./environment", () => mockEnvironment)
+vi.mock("./log", () => ({
+  log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }))
 
 // Configure per-host service tokens before the module's lazy/cached parse of process.env.
@@ -89,6 +95,85 @@ describe("gitlab (worker)", () => {
       })
 
       expect(mockGitlabClient.Commits.editStatus).not.toHaveBeenCalled()
+    })
+
+    describe("with ENABLE_VCS_STATUS enabled", () => {
+      const statusUpdate = {
+        projectId: 123,
+        commitSha: "abc123",
+        gitlabHost: "https://gitlab.com",
+        testId: 1,
+        name: "vizdiff/visual-tests",
+        description: "Tests running",
+      }
+      const transitionMessage =
+        'Cannot transition status via :run from :running (Reason(s): Status cannot transition via "run")'
+
+      beforeEach(() => {
+        mockEnvironment.ENABLE_VCS_STATUS = true
+      })
+
+      afterEach(() => {
+        mockEnvironment.ENABLE_VCS_STATUS = false
+      })
+
+      it("downgrades a redundant running->running transition error to debug", async () => {
+        mockGitlabClient.Commits.editStatus.mockRejectedValue(new Error(transitionMessage))
+
+        await updateGitLabCommitStatus({ ...statusUpdate, state: "running" })
+
+        expect(log.error).not.toHaveBeenCalled()
+        expect(log.debug).toHaveBeenCalledWith(
+          expect.objectContaining({ err: expect.any(Error) as Error, state: "running" }),
+          "GitLab commit status already running; skipping redundant transition",
+        )
+      })
+
+      it("detects the transition error nested in a GitbeakerRequestError cause description", async () => {
+        mockGitlabClient.Commits.editStatus.mockRejectedValue(
+          new Error("Bad Request", { cause: { description: transitionMessage } }),
+        )
+
+        await updateGitLabCommitStatus({ ...statusUpdate, state: "running" })
+
+        expect(log.error).not.toHaveBeenCalled()
+        expect(log.debug).toHaveBeenCalledWith(
+          expect.objectContaining({ state: "running" }),
+          "GitLab commit status already running; skipping redundant transition",
+        )
+      })
+
+      it("still logs an error when the transition error occurs for a non-running state", async () => {
+        mockGitlabClient.Commits.editStatus.mockRejectedValue(new Error(transitionMessage))
+
+        await updateGitLabCommitStatus({ ...statusUpdate, state: "success" })
+
+        expect(log.debug).not.toHaveBeenCalled()
+        expect(log.error).toHaveBeenCalledWith(
+          expect.objectContaining({ state: "success" }),
+          "Failed to update GitLab commit status",
+        )
+      })
+
+      it("logs unrelated errors with structured context", async () => {
+        const unrelated = new Error("500 Internal Server Error")
+        mockGitlabClient.Commits.editStatus.mockRejectedValue(unrelated)
+
+        await updateGitLabCommitStatus({ ...statusUpdate, state: "running" })
+
+        expect(log.debug).not.toHaveBeenCalled()
+        expect(log.error).toHaveBeenCalledWith(
+          expect.objectContaining({
+            err: unrelated,
+            gitlabHost: "https://gitlab.com",
+            projectId: 123,
+            commitSha: "abc123",
+            state: "running",
+            name: "vizdiff/visual-tests",
+          }),
+          "Failed to update GitLab commit status",
+        )
+      })
     })
   })
 
