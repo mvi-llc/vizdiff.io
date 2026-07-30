@@ -62,3 +62,9 @@ data:
   {{- with .Values.worker.stuckPendingMinutes }}
   WORKER_STUCK_PENDING_MINUTES: {{ . | quote }}
   {{- end }}
+  {{- with .Values.worker.storyRenderTimeoutMs }}
+  WORKER_STORY_RENDER_TIMEOUT_MS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.worker.storyDelayMaxMs }}
+  WORKER_STORY_DELAY_MAX_MS: {{ . | quote }}
+  {{- end }}

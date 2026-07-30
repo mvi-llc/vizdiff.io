@@ -46,6 +46,7 @@ import {
 } from "./safeguards"
 import { startStaticServer } from "./server"
 import { getStorybookStories, navigateToStorybook, processStory } from "./stories"
+import { installStoryRenderStateHook } from "./storyReady"
 import { NonRetryableTaskError, isPermanentS3FetchError } from "./tasks"
 import { withTimeout } from "./timeout"
 import { postBuildFailedStatus, type BuildCheckData } from "./vcsStatus"
@@ -329,6 +330,9 @@ export async function ingestStorybook(
     const pool = await createBrowserPool(WORKER_STORY_CONCURRENCY, async () => {
       const session = await remote(config)
       await installBrowserSafeguards(session)
+      // Record Storybook's story-render lifecycle in the page (issue #458) so capture waits for
+      // render completion instead of screenshotting an async story's loading fallback.
+      await installStoryRenderStateHook(session)
       return session
     })
     const primaryBrowser = pool.browsers[0]

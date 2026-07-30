@@ -132,7 +132,7 @@ export default function TestResultCard({
           }}
         />
         <Typography variant="body2">
-          {changeStatusMessage(result.changeStatus, result.diffRatio ?? 0)}
+          {changeStatusMessage(result.changeStatus, result.diffRatio ?? 0, result.errorKind)}
         </Typography>
       </Box>
     </Paper>

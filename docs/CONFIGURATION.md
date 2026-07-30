@@ -88,6 +88,8 @@ Single-host fallback: when `GITLAB_HOSTS` is unset, a single host is derived fro
 | `WORKER_MAX_TASK_ATTEMPTS` | worker | no | `3` | Maximum number of times a task may be claimed before the startup orphan reclaim fails the build outright instead of requeueing it (issue #451). Bounds the crash loop where a build reliably wedges the worker. |
 | `WORKER_STUCK_RUNNING_MINUTES` | worker | no | `15` | Stuck-build sweeper threshold for `running` builds (issue #451): a running build whose last activity (`COALESCE(last_progress_at, updated_at)`) is older than this many minutes is marked failed, its queue rows removed, and a failed VCS status posted. Size it just above `BUILD_TIMEOUT_MS`. |
 | `WORKER_STUCK_PENDING_MINUTES` | worker | no | `240` | Stuck-build sweeper threshold for `pending` builds (issue #451): a pending build not updated for this many minutes is marked failed. Conservative because pending builds legitimately queue behind other work. |
+| `WORKER_STORY_RENDER_TIMEOUT_MS` | worker | no | `30000` | Per-story render timeout (issue #458). After navigating to a story the worker waits for Storybook's story-render lifecycle to complete (a `storyRendered`/`docsRendered` channel event, or Storybook 8's `currentRender` phase reaching `completed`) before the visual-stability capture loop starts, so async/Suspense stories are not captured as loading spinners. A story that neither completes nor errors within this window is marked **failed**. See "Story readiness" below. |
+| `WORKER_STORY_DELAY_MAX_MS` | worker | no | `15000` | Upper bound on a story's opt-in pre-capture delay (`parameters.vizdiff.delay` / `parameters.chromatic.delay`). Story parameters come from untrusted uploads, so larger requested delays are clamped to this cap to keep one story from stalling a build. |
 | `POSTGRES_HOST` | api, worker | no | `localhost` | Postgres host. |
 | `POSTGRES_PORT` | api, worker | no | `5432` | Postgres port. |
 | `POSTGRES_USER` | api, worker | no | `postgres` | Postgres user. |
@@ -135,6 +137,41 @@ Single-host fallback: when `GITLAB_HOSTS` is unset, a single host is derived fro
 
 \* Credentials may be supplied via IRSA, instance profiles, or the standard AWS credential chain
 instead of static keys.
+
+## Story readiness
+
+The worker captures a story only after Storybook reports its render lifecycle complete
+(`storyRendered`/`docsRendered`, or the Storybook 8 `currentRender` phase reaching `completed`),
+bounded by `WORKER_STORY_RENDER_TIMEOUT_MS`; a story that errors or never completes is marked
+**failed** instead of screenshotting its loading fallback. Two per-story opt-ins refine this:
+
+- **Pre-capture delay** — `parameters.vizdiff.delay` (preferred) or the Chromatic-compatible
+  `parameters.chromatic.delay`, in milliseconds, adds a minimum pause after render completion
+  before capture (for settle animations, font swaps, etc.). `vizdiff.delay` takes precedence when
+  both are set, and the effective delay is clamped to `WORKER_STORY_DELAY_MAX_MS`.
+- **Explicit ready signal** — stories that finish drawing asynchronously (WebGL scenes, async
+  loaders) can set `parameters.useReadySignal: true` (the Chromatic-era Foxglove convention; also
+  honored as `parameters.vizdiff.waitForReady` or `parameters.storyReady`). The worker then also
+  waits for `window.__VIZDIFF_STORY_READY__ === true` before capturing, within the same per-story
+  timeout budget.
+
+For Chromatic-era `useReadySignal` storybooks, bridge the existing ready promise with a preview
+decorator that resets the global per story and sets it when the story's signal resolves:
+
+```ts
+// .storybook/preview.ts — bridge a story's readySignal to vizdiff
+decorators: [
+  (Story, { parameters }) => {
+    ;(window as any).__VIZDIFF_STORY_READY__ = false
+    if (parameters.useReadySignal) {
+      readySignalPromise.then(() => ((window as any).__VIZDIFF_STORY_READY__ = true))
+    } else {
+      ;(window as any).__VIZDIFF_STORY_READY__ = true
+    }
+    return Story()
+  },
+]
+```
 
 ## Screenshot retention reaper
 
