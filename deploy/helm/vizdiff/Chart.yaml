@@ -9,12 +9,12 @@ description: |
 type: application
 
 # Chart version. Bump on chart changes independent of the app version.
-version: 2.3.0
+version: 2.4.0
 
 # The default application version — also the default image tag (see values.yaml image.*.tag, which
 # fall back to this). Bump to the release version as a pre-tag step when cutting a release; see
 # RELEASING.md. Must correspond to published ghcr.io/vizdiff-io/vizdiff-*:<appVersion> images.
-appVersion: "2.3.0"
+appVersion: "2.4.0"
 
 home: https://vizdiff.io
 sources:
