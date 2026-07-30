@@ -1,6 +1,6 @@
-import { describe, it, expect, vi } from "vitest"
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 
-import { BuildTimeoutError, withTimeout } from "./timeout"
+import { BuildStalledError, BuildTimeoutError, withTimeout } from "./timeout"
 
 describe("withTimeout", () => {
   it("resolves with the work result when it finishes before the timeout", async () => {
@@ -101,5 +101,129 @@ describe("withTimeout", () => {
     // And withTimeout must NOT have settled, because the work still holds shared state — freeing
     // the worker here would let it accept a build against a poisoned mutex.
     expect(raced).not.toBe(settledMarker)
+  })
+})
+
+describe("withTimeout progress watchdog (#452)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  /** An abortable never-settling work promise, mirroring a stuck WebDriver render. */
+  function abortableWork(): { work: Promise<void>; abort: () => void } {
+    let abort: (() => void) | undefined
+    const inner = new Promise<void>((_resolve, reject) => {
+      abort = () => reject(new Error("aborted"))
+    })
+    return { work: inner.catch(() => undefined), abort: () => abort?.() }
+  }
+
+  it("rejects with BuildStalledError (a BuildTimeoutError) after stallTimeoutMs of no progress, via the abort path", async () => {
+    const progress = { lastMs: Date.now() }
+    const { work, abort } = abortableWork()
+    const onTimeout = vi.fn().mockImplementation(() => abort())
+    const onUnrecoverable = vi.fn()
+
+    const resultPromise = withTimeout(work, 60 * 60_000, onTimeout, {
+      abortGraceMs: 1000,
+      onUnrecoverable,
+      stall: {
+        getLastProgressMs: () => progress.lastMs,
+        stallTimeoutMs: 5 * 60_000,
+        pollIntervalMs: 15_000,
+      },
+    }).catch((e: unknown) => e)
+
+    // One poll past the stall window with no progress: the watchdog fires.
+    await vi.advanceTimersByTimeAsync(5 * 60_000 + 15_000)
+    const error = await resultPromise
+    expect(error).toBeInstanceOf(BuildStalledError)
+    // Subclass relationship: worker.ts's terminal BuildTimeoutError handling applies unchanged.
+    expect(error).toBeInstanceOf(BuildTimeoutError)
+    expect(onTimeout).toHaveBeenCalledTimes(1)
+    // The abort unstuck the work, so the grace period was satisfied.
+    expect(onUnrecoverable).not.toHaveBeenCalled()
+  })
+
+  it("never fires while progress continues, even far past the old flat cap", async () => {
+    const progress = { lastMs: Date.now() }
+    let resolveWork: (() => void) | undefined
+    const work = new Promise<string>((resolve) => {
+      resolveWork = () => resolve("done")
+    })
+    const onTimeout = vi.fn()
+
+    const resultPromise = withTimeout(work, 24 * 60 * 60_000, onTimeout, {
+      stall: {
+        getLastProgressMs: () => progress.lastMs,
+        stallTimeoutMs: 5 * 60_000,
+        pollIntervalMs: 15_000,
+      },
+    })
+
+    // 60 minutes of steady progress — four times the old 15-minute flat cap.
+    for (let i = 0; i < 240; i++) {
+      await vi.advanceTimersByTimeAsync(15_000)
+      progress.lastMs = Date.now()
+    }
+    resolveWork?.()
+    await expect(resultPromise).resolves.toBe("done")
+    expect(onTimeout).not.toHaveBeenCalled()
+  })
+
+  it("the explicit ceiling still fires as BuildTimeoutError even when progress is steady", async () => {
+    const progress = { lastMs: Date.now() }
+    const { work, abort } = abortableWork()
+    const onTimeout = vi.fn().mockImplementation(() => abort())
+
+    const resultPromise = withTimeout(work, 100, onTimeout, {
+      abortGraceMs: 1000,
+      onUnrecoverable: vi.fn(),
+      stall: {
+        getLastProgressMs: () => progress.lastMs,
+        stallTimeoutMs: 60_000,
+        pollIntervalMs: 10,
+      },
+    }).catch((e: unknown) => e)
+
+    for (let i = 0; i < 15; i++) {
+      await vi.advanceTimersByTimeAsync(10)
+      progress.lastMs = Date.now()
+    }
+    const error = await resultPromise
+    expect(error).toBeInstanceOf(BuildTimeoutError)
+    expect(error).not.toBeInstanceOf(BuildStalledError)
+    expect(onTimeout).toHaveBeenCalledTimes(1)
+  })
+
+  it("invokes onUnrecoverable with the stall error when the aborted work never settles", async () => {
+    const progress = { lastMs: Date.now() }
+    const work = new Promise<void>(() => {
+      /* never settles, even after abort */
+    })
+    const onTimeout = vi.fn()
+    const onUnrecoverable = vi.fn()
+
+    const guard = withTimeout(work, 60 * 60_000, onTimeout, {
+      abortGraceMs: 1000,
+      onUnrecoverable,
+      stall: {
+        getLastProgressMs: () => progress.lastMs,
+        stallTimeoutMs: 60_000,
+        pollIntervalMs: 5_000,
+      },
+    })
+    // Swallow the (never-delivered) rejection; the promise dangles by design once the work is
+    // wedged beyond recovery.
+    guard.catch(() => undefined)
+
+    // Stall window elapses with no progress, then the grace period elapses without settlement.
+    await vi.advanceTimersByTimeAsync(60_000 + 5_000 + 1000 + 1)
+    expect(onTimeout).toHaveBeenCalledTimes(1)
+    expect(onUnrecoverable).toHaveBeenCalledTimes(1)
+    expect(onUnrecoverable.mock.calls[0]![0]).toBeInstanceOf(BuildStalledError)
   })
 })

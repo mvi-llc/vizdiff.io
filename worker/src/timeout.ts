@@ -12,6 +12,21 @@ export class BuildTimeoutError extends Error {
 }
 
 /**
+ * Error thrown when the progress watchdog (issue #452) detects that no story has completed for
+ * the configured stall window. Extends {@link BuildTimeoutError} so every consumer that treats a
+ * build timeout as terminal/non-retryable (worker.ts) handles a stalled build identically — a
+ * build that stopped making progress is wedged, and retrying it would just wedge the next
+ * worker.
+ */
+export class BuildStalledError extends BuildTimeoutError {
+  constructor(stallMs: number) {
+    super(stallMs)
+    this.message = `Build made no progress for ${stallMs}ms; aborting as stalled`
+    this.name = "BuildStalledError"
+  }
+}
+
+/**
  * How long, after the abort (`onTimeout`) has run, to wait for the original `work` promise to
  * actually settle before declaring the abort failed. Force-closing the browser sessions should
  * cause the in-flight WebDriver commands to reject almost immediately and unwind the stack
@@ -20,6 +35,27 @@ export class BuildTimeoutError extends Error {
  * unrecoverable in-process.
  */
 const DEFAULT_ABORT_GRACE_MS = 10 * 1000
+
+/**
+ * How often the progress watchdog re-checks for a stall. Coarse relative to the minutes-scale
+ * stall window: the check is a cheap in-process comparison, and a stall being detected up to one
+ * poll interval late is immaterial.
+ */
+const DEFAULT_STALL_POLL_INTERVAL_MS = 15 * 1000
+
+/** Progress-watchdog configuration for {@link withTimeout} (issue #452). */
+export interface StallOptions {
+  /**
+   * Returns the ms timestamp (Date.now() domain) of the most recent forward progress. Values
+   * before withTimeout started are treated as "no progress yet" — the stall clock never starts
+   * earlier than the watchdog itself.
+   */
+  getLastProgressMs: () => number
+  /** Abort the work when no progress has been observed for this long (ms). */
+  stallTimeoutMs: number
+  /** Poll interval (ms). Defaults to {@link DEFAULT_STALL_POLL_INTERVAL_MS}. */
+  pollIntervalMs?: number
+}
 
 export interface WithTimeoutOptions {
   /**
@@ -36,6 +72,13 @@ export interface WithTimeoutOptions {
    * process non-zero so the orchestrator restarts a clean worker. Overridable for testing.
    */
   onUnrecoverable?: (error: Error) => void
+  /**
+   * Progress watchdog (issue #452): when set, the work is also aborted — with
+   * {@link BuildStalledError}, via the same abort/grace/onUnrecoverable path as the flat cap —
+   * once `now - max(start, getLastProgressMs()) > stallTimeoutMs`. When absent, behavior is
+   * identical to the plain flat-cap race.
+   */
+  stall?: StallOptions
 }
 
 function defaultOnUnrecoverable(error: Error): void {
@@ -83,22 +126,47 @@ export async function withTimeout<T>(
   )
 
   let timer: NodeJS.Timeout | undefined
-  const timeoutError = new BuildTimeoutError(timeoutMs)
+  let stallTimer: NodeJS.Timeout | undefined
+  const capError = new BuildTimeoutError(timeoutMs)
+  // Which watchdog error (flat cap or stall) actually fired, if any. Whichever fires first wins;
+  // both are surfaced through the identical abort/grace/onUnrecoverable path below.
+  let firedError: BuildTimeoutError | undefined
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(timeoutError), timeoutMs)
+    timer = setTimeout(() => {
+      firedError ??= capError
+      reject(firedError)
+    }, timeoutMs)
     timer.unref()
+
+    // Progress watchdog (issue #452): an unref'd poll that rejects the race with
+    // BuildStalledError once no progress has been observed for stallTimeoutMs. The stall clock
+    // starts at `startMs`, so a build that never completes a single story stalls out
+    // stallTimeoutMs after the watchdog begins.
+    const stall = options.stall
+    if (stall) {
+      const startMs = Date.now()
+      stallTimer = setInterval(() => {
+        const lastProgressMs = Math.max(startMs, stall.getLastProgressMs())
+        if (Date.now() - lastProgressMs > stall.stallTimeoutMs) {
+          firedError ??= new BuildStalledError(stall.stallTimeoutMs)
+          reject(firedError)
+        }
+      }, stall.pollIntervalMs ?? DEFAULT_STALL_POLL_INTERVAL_MS)
+      stallTimer.unref()
+    }
   })
 
   try {
     return await Promise.race([work, timeout])
   } catch (error) {
-    if (error !== timeoutError) {
-      // `work` rejected on its own before the timeout fired; surface that error directly.
+    if (firedError == undefined || error !== firedError) {
+      // `work` rejected on its own before either watchdog fired; surface that error directly.
       throw error
     }
 
-    // Timeout won. Fire the abort, then wait for the original work to settle so its cleanup
-    // (returning sessions to the browser pool) runs before we hand control back to the caller.
+    // A watchdog won (flat cap or stall). Fire the abort, then wait for the original work to
+    // settle so its cleanup (returning sessions to the browser pool) runs before we hand control
+    // back to the caller.
     try {
       await onTimeout()
     } catch {
@@ -115,7 +183,7 @@ export async function withTimeout<T>(
 
     if (!settledInTime) {
       // The abort did not unstick the render within the grace period. Treat as unrecoverable.
-      onUnrecoverable(timeoutError)
+      onUnrecoverable(firedError)
       // If onUnrecoverable did not terminate the process (e.g. in tests), still wait for the
       // work to settle so we never resolve while it may hold shared state, then surface the
       // timeout. This await may hang if the work truly never settles, which is the correct
@@ -123,10 +191,13 @@ export async function withTimeout<T>(
       await workSettled
     }
 
-    throw timeoutError
+    throw firedError
   } finally {
     if (timer) {
       clearTimeout(timer)
+    }
+    if (stallTimer) {
+      clearInterval(stallTimer)
     }
   }
 }

@@ -80,3 +80,18 @@ data:
   {{- with .Values.worker.storyMaxAttempts }}
   WORKER_STORY_MAX_ATTEMPTS: {{ . | quote }}
   {{- end }}
+  {{- with .Values.worker.progressTimeoutMs }}
+  WORKER_PROGRESS_TIMEOUT_MS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.worker.perStoryBudgetMs }}
+  WORKER_PER_STORY_BUDGET_MS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.worker.buildTimeoutMs }}
+  BUILD_TIMEOUT_MS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.worker.buildTimeoutFloorMs }}
+  BUILD_TIMEOUT_FLOOR_MS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.worker.buildAbortGraceMs }}
+  BUILD_ABORT_GRACE_MS: {{ . | quote }}
+  {{- end }}
