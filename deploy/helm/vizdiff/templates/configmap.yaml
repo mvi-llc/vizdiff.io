@@ -80,6 +80,18 @@ data:
   {{- with .Values.worker.storyMaxAttempts }}
   WORKER_STORY_MAX_ATTEMPTS: {{ . | quote }}
   {{- end }}
+  {{- with .Values.worker.finalizeConcurrency }}
+  WORKER_FINALIZE_CONCURRENCY: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.worker.finalizeQueueLimit }}
+  WORKER_FINALIZE_QUEUE_LIMIT: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.worker.stabilizeIntervalMs }}
+  WORKER_STABILIZE_INTERVAL_MS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.worker.postLoadDelayMs }}
+  WORKER_POST_LOAD_DELAY_MS: {{ . | quote }}
+  {{- end }}
   {{- with .Values.worker.progressTimeoutMs }}
   WORKER_PROGRESS_TIMEOUT_MS: {{ . | quote }}
   {{- end }}

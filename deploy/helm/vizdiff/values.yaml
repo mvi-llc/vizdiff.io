@@ -211,6 +211,22 @@ worker:
   # session before being recorded (issue #454, WORKER_STORY_MAX_ATTEMPTS). Empty uses the
   # built-in default (2).
   storyMaxAttempts: ""
+  # -- Number of per-story finalize tasks (S3 screenshot/diff uploads, baseline diff, DB save)
+  # processed concurrently in the background after capture releases its browser session
+  # (issue #456, WORKER_FINALIZE_CONCURRENCY). Empty uses the built-in default (4).
+  finalizeConcurrency: ""
+  # -- Cap on stories captured but not yet finalized; each buffers one screenshot PNG in memory,
+  # and the next capture waits once the backlog hits this limit (issue #456,
+  # WORKER_FINALIZE_QUEUE_LIMIT). Empty uses the built-in default (16).
+  finalizeQueueLimit: ""
+  # -- Interval in ms between screenshots in the visual-stabilization loop (issue #456,
+  # WORKER_STABILIZE_INTERVAL_MS). Empty uses the built-in default (250; previously a hardcoded
+  # 500 — raise it back for storybooks with slow animations).
+  stabilizeIntervalMs: ""
+  # -- Settle delay in ms after the post-stabilization viewport resize before the final
+  # full-height screenshot (issue #456, WORKER_POST_LOAD_DELAY_MS). Empty uses the built-in
+  # default (250).
+  postLoadDelayMs: ""
   # -- Progress watchdog (issue #452, WORKER_PROGRESS_TIMEOUT_MS): abort a build once no story
   # has completed for this many ms. "0" disables the watchdog. Empty uses the built-in default
   # (300000, 5 minutes).

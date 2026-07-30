@@ -18,16 +18,18 @@ import {
   MAX_STORY_IDENTIFIER_LENGTH,
   WORKER_CHANGED_MIN_PIXELS,
   WORKER_CHANGED_THRESHOLD,
+  WORKER_POST_LOAD_DELAY_MS,
+  WORKER_STABILIZE_INTERVAL_MS,
   WORKER_STORY_MAX_ATTEMPTS,
 } from "./environment"
 import { classifyStoryError, StorageError, type ClassifiedStoryError } from "./errorClassify"
 import { diffImages, diffImagesNoMask } from "./images"
 import { log } from "./log"
+import type { CaptureOutcome } from "./pipeline"
 import { probeSession } from "./sessionHealth"
 import { waitForStoryReady } from "./storyReady"
 import type { SetViewportOptions, Story, StorybookWindow } from "./types"
 
-const SCREENSHOT_INTERVAL_MS = 500
 const SCREENSHOTS_UNCHANGED_TIMEOUT_MS = 10 * 1000
 const IMAGE_UNCHANGED_THRESHOLD = 0.001
 
@@ -242,10 +244,13 @@ export async function captureStableScreenshot(
 
   // Adjust the viewport for the story. This is a best-effort first pass; the layout may not be
   // settled yet, so the post-stabilization adjustment below is authoritative for tall content.
+  // The initial measurement is tracked so the post-stabilization re-measure can be skipped when
+  // nothing suggested the layout was still moving (issue #456).
   log.debug(`Adjusting viewport for story ${storyId}`)
+  const initialContentHeight = await measureContentHeight(browser)
   let currentViewport: SetViewportOptions = {
     ...viewport,
-    height: await adjustViewportForStory(browser, storyId, viewport),
+    height: await adjustViewportForStory(browser, storyId, viewport, initialContentHeight),
   }
 
   // --- Screenshot Stabilization Logic ---
@@ -255,12 +260,12 @@ export async function captureStableScreenshot(
 
   const startTime = Date.now()
   let stabilized = false
-  const MAX_ATTEMPTS = Math.ceil(SCREENSHOTS_UNCHANGED_TIMEOUT_MS / SCREENSHOT_INTERVAL_MS)
+  const MAX_ATTEMPTS = Math.ceil(SCREENSHOTS_UNCHANGED_TIMEOUT_MS / WORKER_STABILIZE_INTERVAL_MS)
   let attempts = 0
 
   while (attempts < MAX_ATTEMPTS && Date.now() - startTime < SCREENSHOTS_UNCHANGED_TIMEOUT_MS) {
     attempts++
-    await browser.pause(SCREENSHOT_INTERVAL_MS)
+    await browser.pause(WORKER_STABILIZE_INTERVAL_MS)
     log.debug(`Taking stabilization screenshot attempt ${attempts}/${MAX_ATTEMPTS}...`)
 
     let currentScreenshotBuffer: Buffer<ArrayBuffer>
@@ -274,27 +279,35 @@ export async function captureStableScreenshot(
       break // Exit while loop, use the previously captured screenshot
     }
 
-    // Compare the previous and current screenshots
-    const previousPng = PNG.sync.read(previousScreenshotBuffer)
-    const currentPng = PNG.sync.read(currentScreenshotBuffer)
+    // Fast path (issue #456): most stories are static, so consecutive captures are usually
+    // byte-identical PNGs — and identical bytes are definitionally identical pixels. A buffer
+    // compare is far cheaper than two PNG decodes plus a pixelmatch pass.
+    let diffRatio: number
+    if (previousScreenshotBuffer.equals(currentScreenshotBuffer)) {
+      diffRatio = 0
+    } else {
+      // Compare the previous and current screenshots
+      const previousPng = PNG.sync.read(previousScreenshotBuffer)
+      const currentPng = PNG.sync.read(currentScreenshotBuffer)
 
-    if (previousPng.width !== currentPng.width || previousPng.height !== currentPng.height) {
-      log.error(
-        `Screenshot dimensions changed from ${previousPng.width}x${previousPng.height} to ` +
-          `${currentPng.width}x${currentPng.height} for story ${storyId}. Continuing stabilization check.`,
-      )
-      // Update the baseline for the next comparison
-      previousScreenshotBuffer = currentScreenshotBuffer
-      finalScreenshotBuffer = currentScreenshotBuffer // Update final screenshot candidate
-      // Swap paths for next iteration
-      ;[previousScreenshotPath, currentScreenshotPath] = [
-        currentScreenshotPath,
-        previousScreenshotPath,
-      ]
-      continue // Skip stability check for this iteration
+      if (previousPng.width !== currentPng.width || previousPng.height !== currentPng.height) {
+        log.error(
+          `Screenshot dimensions changed from ${previousPng.width}x${previousPng.height} to ` +
+            `${currentPng.width}x${currentPng.height} for story ${storyId}. Continuing stabilization check.`,
+        )
+        // Update the baseline for the next comparison
+        previousScreenshotBuffer = currentScreenshotBuffer
+        finalScreenshotBuffer = currentScreenshotBuffer // Update final screenshot candidate
+        // Swap paths for next iteration
+        ;[previousScreenshotPath, currentScreenshotPath] = [
+          currentScreenshotPath,
+          previousScreenshotPath,
+        ]
+        continue // Skip stability check for this iteration
+      }
+
+      diffRatio = diffImagesNoMask(previousPng, currentPng)
     }
-
-    const diffRatio = diffImagesNoMask(previousPng, currentPng)
     log.debug(
       `Stability check for story ${storyId}: diffRatio=${diffRatio} (attempt ${attempts}/${MAX_ATTEMPTS})`,
     )
@@ -318,7 +331,7 @@ export async function captureStableScreenshot(
 
     // Not stable yet, check if we're approaching the timeout
     const timeRemaining = SCREENSHOTS_UNCHANGED_TIMEOUT_MS - (Date.now() - startTime)
-    if (timeRemaining < SCREENSHOT_INTERVAL_MS) {
+    if (timeRemaining < WORKER_STABILIZE_INTERVAL_MS) {
       log.warn(`Approaching timeout for story ${storyId} stabilization, using last screenshot`)
       break
     }
@@ -340,28 +353,46 @@ export async function captureStableScreenshot(
   // the current viewport, then re-capture after a short settle. Bounding the resize to a single
   // post-stabilization pass avoids a feedback loop where each resize triggers a relayout that
   // changes the height again.
-  const settledContentHeight = await measureContentHeight(browser)
-  if (settledContentHeight != undefined) {
-    const fittedHeight = computeFittedHeight(settledContentHeight, currentViewport)
-    // Only grow the viewport; never shrink (shrinking could clip content that was visible in the
-    // captured screenshot, and would not fix the cutoff bug).
-    if (fittedHeight > currentViewport.height) {
-      log.info(
-        `Post-stabilization viewport fit for story ${storyId}: growing height from ` +
-          `${currentViewport.height} to ${fittedHeight} (content: ${settledContentHeight})`,
-      )
-      currentViewport = { ...currentViewport, height: fittedHeight }
-      await browser.setViewport(currentViewport)
-      // Let the relayout settle, then capture the full-height screenshot.
-      await browser.pause(SCREENSHOT_INTERVAL_MS)
-      try {
-        finalScreenshotBuffer = await takeScreenshotWithRetry(browser, previousScreenshotPath)
-      } catch (err) {
-        log.error(
-          err,
-          `Failed to capture full-height screenshot for story ${storyId} after resize. ` +
-            `Using last captured screenshot.`,
+  //
+  // Skip the re-measure when nothing suggested the layout was still moving (issue #456): the
+  // very first stability check already found the page settled AND the initially measured
+  // content height fit within the story's viewport (no growth was needed, so tall-content
+  // correctness is not at stake). A late-settling layout changes pixels between the first two
+  // screenshots, which forces extra attempts and keeps the authoritative pass.
+  const skipSettledMeasure =
+    stabilized &&
+    attempts === 1 &&
+    initialContentHeight != undefined &&
+    initialContentHeight <= viewport.height
+  if (skipSettledMeasure) {
+    log.debug(
+      `Skipping post-stabilization height re-measure for story ${storyId}: stabilized on the ` +
+        `first attempt and content (${initialContentHeight}px) fit the viewport`,
+    )
+  } else {
+    const settledContentHeight = await measureContentHeight(browser)
+    if (settledContentHeight != undefined) {
+      const fittedHeight = computeFittedHeight(settledContentHeight, currentViewport)
+      // Only grow the viewport; never shrink (shrinking could clip content that was visible in the
+      // captured screenshot, and would not fix the cutoff bug).
+      if (fittedHeight > currentViewport.height) {
+        log.info(
+          `Post-stabilization viewport fit for story ${storyId}: growing height from ` +
+            `${currentViewport.height} to ${fittedHeight} (content: ${settledContentHeight})`,
         )
+        currentViewport = { ...currentViewport, height: fittedHeight }
+        await browser.setViewport(currentViewport)
+        // Let the relayout settle, then capture the full-height screenshot.
+        await browser.pause(WORKER_POST_LOAD_DELAY_MS)
+        try {
+          finalScreenshotBuffer = await takeScreenshotWithRetry(browser, previousScreenshotPath)
+        } catch (err) {
+          log.error(
+            err,
+            `Failed to capture full-height screenshot for story ${storyId} after resize. ` +
+              `Using last captured screenshot.`,
+          )
+        }
       }
     }
   }
@@ -386,24 +417,29 @@ export async function captureStableScreenshot(
 const MAX_ERROR_MESSAGE_LENGTH = 2000
 
 /**
- * Renders one story with per-story retry on infrastructure failures (issues #450/#454).
+ * Captures one story with per-story retry on infrastructure failures (issues #450/#454). This is
+ * the session-holding half of the capture/finalize split (issue #456): the retry loop wraps ONLY
+ * the browser-facing capture phase, so an infra retry re-captures without repeating any S3 work,
+ * and the session is back in the pool the moment capture ends.
  *
  * Each attempt checks a session out of the pool, health-probes it (replacing it if dead — a dead
  * session would otherwise burn the webdriver package's hardcoded 60 s BiDi command timeout per
- * command), and renders via {@link renderStory}. On failure the error is classified:
+ * command), and captures via {@link captureStory}. On failure the error is classified:
  *
  *  - story-class (the story threw, never became ready, or an unrecognized error): recorded
  *    immediately as a `failed` TestResult with its error kind — retrying would just fail again.
- *  - infra-class (dead session, command timeout, storage): the session's failure counter is
- *    bumped (condemning it for replacement at the pool's threshold) and the story is retried on
- *    the next attempt, up to WORKER_STORY_MAX_ATTEMPTS total attempts.
+ *  - infra-class (dead session, command timeout): the session's failure counter is bumped
+ *    (condemning it for replacement at the pool's threshold) and the story is retried on the
+ *    next attempt, up to WORKER_STORY_MAX_ATTEMPTS total attempts.
  *
- * Exactly one TestResult row is persisted per story in all paths, and this never throws for
- * per-story failures — one story (or one dead session) must not abort the whole build.
+ * Never throws for per-story failures — one story (or one dead session) must not abort the whole
+ * build. Together with {@link finalizeStoryWithRecording}, exactly one TestResult row is
+ * persisted per story in all paths: a `recorded` outcome IS the story's final (failed) row, and
+ * a `captured` outcome produces its single row during finalize.
  */
-export async function processStoryWithRetry(
+export async function captureStoryWithRetry(
   info: Omit<StoryInfo, "browser"> & { pool: BrowserPool },
-): Promise<TestResult> {
+): Promise<CaptureOutcome<CapturedStory, TestResult>> {
   const { pool, ...storyInfo } = info
   const { story, projectId, uploadId } = storyInfo
   const maxAttempts = Math.max(1, WORKER_STORY_MAX_ATTEMPTS)
@@ -423,10 +459,10 @@ export async function processStoryWithRetry(
         await pool.replace(session, "probe-failed")
       }
       // Read the browser AFTER probe/replace so a replacement is picked up.
-      const testResult = await renderStory({ ...storyInfo, browser: session.browser })
+      const captured = await captureStory({ ...storyInfo, browser: session.browser })
       session.consecutiveInfraFailures = 0
       session.storiesRendered++
-      return testResult
+      return { kind: "captured", captured }
     } catch (err) {
       const classified = classifyStoryError(err)
       if (classified.errorClass === "story") {
@@ -434,14 +470,14 @@ export async function processStoryWithRetry(
           { err, kind: classified.kind, attempt },
           `Story ${story.id} failed to render (${classified.kind}); recording failed result`,
         )
-        return await recordErrorTestResult(storyInfo, classified)
+        return { kind: "recorded", result: await recordErrorTestResult(storyInfo, classified) }
       }
       // Infra-class: condemn the session towards replacement and retry on the next attempt.
       session.consecutiveInfraFailures++
       lastInfraError = classified
       logChild.warn(
         { err, kind: classified.kind, attempt, maxAttempts, sessionId: session.id },
-        `Infra failure rendering story ${story.id} (${classified.kind}); ` +
+        `Infra failure capturing story ${story.id} (${classified.kind}); ` +
           (attempt < maxAttempts ? "retrying on a healthy session" : "attempt budget exhausted"),
       )
     } finally {
@@ -451,10 +487,75 @@ export async function processStoryWithRetry(
 
   // Attempt budget exhausted: record the last infra failure so reviewers can distinguish
   // "the harness failed" from "the story is broken" (issue #454).
-  return await recordErrorTestResult(
-    storyInfo,
-    lastInfraError ?? { errorClass: "infra", kind: "unknown", message: "Unknown infra failure" },
+  return {
+    kind: "recorded",
+    result: await recordErrorTestResult(
+      storyInfo,
+      lastInfraError ?? { errorClass: "infra", kind: "unknown", message: "Unknown infra failure" },
+    ),
+  }
+}
+
+/**
+ * Finalizes a captured story (S3 uploads, baseline diff, TestResult save — no browser held),
+ * recording rather than throwing per-story failures so the build continues (issue #456).
+ *
+ * A {@link StorageError} (S3 screenshot/diff PUT) gets ONE cheap retry — the screenshot buffer
+ * is already in memory, so retrying costs no browser time — then the failure is recorded as a
+ * `failed` TestResult with its classified kind (`storage` for S3 failures) via
+ * {@link recordErrorTestResult}. The story is never re-captured for a finalize failure.
+ */
+export async function finalizeStoryWithRecording(
+  info: Omit<StoryInfo, "browser">,
+  captured: CapturedStory,
+): Promise<TestResult> {
+  const { story, projectId, uploadId } = info
+  const logChild = log.child({ projectId, uploadId, storyId: story.id })
+
+  let lastError: unknown
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      return await finalizeStory(info, captured)
+    } catch (err) {
+      lastError = err
+      if (err instanceof StorageError && attempt === 1) {
+        logChild.warn(
+          { err, attempt },
+          `Storage failure finalizing story ${story.id}; retrying finalize once`,
+        )
+        continue
+      }
+      break
+    }
+  }
+
+  const classified = classifyStoryError(lastError)
+  logChild.error(
+    { err: lastError, kind: classified.kind },
+    `Failed to finalize story ${story.id} (${classified.kind}); recording failed result`,
   )
+  return await recordErrorTestResult(info, classified)
+}
+
+/**
+ * Renders one story end to end: capture (with session checkout, health probing, and infra retry)
+ * followed by finalize (with failure recording). Composition of {@link captureStoryWithRetry}
+ * and {@link finalizeStoryWithRecording} for callers that don't pipeline the two phases; the
+ * concurrent render fan-out in ingest.ts runs the phases through `runStoryPipeline` instead so
+ * the session is released before the S3/diff/DB work begins (issue #456).
+ *
+ * Exactly one TestResult row is persisted per story in all paths, and this never throws for
+ * per-story failures.
+ */
+export async function processStoryWithRetry(
+  info: Omit<StoryInfo, "browser"> & { pool: BrowserPool },
+): Promise<TestResult> {
+  const { pool: _pool, ...storyInfo } = info
+  const outcome = await captureStoryWithRetry(info)
+  if (outcome.kind === "recorded") {
+    return outcome.result
+  }
+  return await finalizeStoryWithRecording(storyInfo, outcome.captured)
 }
 
 /**
@@ -484,29 +585,40 @@ async function recordErrorTestResult(
 }
 
 /**
- * Renders one story against the given browser session and persists its TestResult: capture a
- * stable screenshot, upload it, compare against the baseline (when present), upload the diff, and
- * save the row. THROWS on failure (screenshot capture, S3 persistence) — error recording and
- * retry policy live in {@link processStoryWithRetry}. A missing/corrupt baseline is NOT a
- * failure: it downgrades the result to "new".
+ * The output of a story's session-holding capture phase (issue #456): everything the
+ * browser-free finalize phase needs to upload, diff, and persist the story's result.
  */
-export async function renderStory({
+export interface CapturedStory {
+  story: Story
+  /** Path the stabilized screenshot was written to (under the build's tmp dir). */
+  screenshotPath: string
+  /** The stabilized screenshot bytes, buffered so finalize never re-reads the browser. */
+  screenshotBuffer: Buffer
+  /** The viewport the story was captured at (pre-content-fit adjustments). */
+  viewport: SetViewportOptions
+  /** Wall-clock duration of the capture phase, for logging/telemetry. */
+  captureDurationMs: number
+}
+
+/**
+ * Capture phase (session-holding): navigate to the story, wait for its render lifecycle to
+ * complete (issue #458), stabilize, and save the final screenshot. THROWS on failure — error
+ * classification, recording, and retry policy live in {@link captureStoryWithRetry}. Holds the
+ * browser for the minimum span: no S3 or database work happens here (issue #456).
+ */
+export async function captureStory({
   story,
-  screenshotTest,
-  baseTestResult,
-  bucket,
   tmpDir,
   projectId,
   uploadId,
   port,
-  s3Client,
-  testResultTable,
   browser,
-}: StoryInfo): Promise<TestResult> {
+}: StoryInfo): Promise<CapturedStory> {
   const storyId = story.id
   const viewport = getStoryViewport(story)
-  let logChild = log.child({ projectId, uploadId, storyId, storyName: story.name, viewport })
+  const logChild = log.child({ projectId, uploadId, storyId, storyName: story.name, viewport })
   logChild.info("Processing story")
+  const captureStartMs = Date.now()
 
   const localScreenshotPath = path.join(tmpDir, `${storyId}.png`)
   const screenshotTempDir = path.join(tmpDir, "stabilization") // Subdir for temp files
@@ -524,8 +636,42 @@ export async function renderStory({
   // Read the saved screenshot buffer for upload and comparison
   const screenshotBuffer = await fsPromises.readFile(localScreenshotPath)
 
+  return {
+    story,
+    screenshotPath: localScreenshotPath,
+    screenshotBuffer,
+    viewport,
+    captureDurationMs: Date.now() - captureStartMs,
+  }
+}
+
+/**
+ * Finalize phase (no browser): upload the captured screenshot, compare against the baseline
+ * (when present), upload the diff, and persist the TestResult row. THROWS on failure (S3
+ * persistence is StorageError-wrapped) — error recording lives in
+ * {@link finalizeStoryWithRecording}. A missing/corrupt baseline is NOT a failure: it downgrades
+ * the result to "new".
+ */
+export async function finalizeStory(
+  {
+    story,
+    screenshotTest,
+    baseTestResult,
+    bucket,
+    tmpDir,
+    projectId,
+    uploadId,
+    s3Client,
+    testResultTable,
+  }: Omit<StoryInfo, "browser">,
+  captured: CapturedStory,
+): Promise<TestResult> {
+  const storyId = story.id
+  const { screenshotBuffer, captureDurationMs } = captured
+  let logChild = log.child({ projectId, uploadId, storyId, storyName: story.name })
+
   // Upload screenshot to S3. Wrapped in StorageError so an upload failure is classified as a
-  // retryable infra failure instead of aborting the whole build (issue #454).
+  // storage infra failure instead of aborting the whole build (issue #454).
   const screenshotKey = buildScreenshotKey(projectId, uploadId, storyId)
   logChild.debug({ screenshotKey }, `Uploading screenshot to S3: ${screenshotKey}`)
   try {
@@ -652,9 +798,23 @@ export async function renderStory({
   testResult.diffRatio = diffRatio
   testResult.changeStatus = changeStatus
   await testResultTable.save(testResult)
-  logChild.debug({ testResultId: testResult.id }, "Successfully saved test result record")
+  logChild.debug(
+    { testResultId: testResult.id, captureDurationMs },
+    "Successfully saved test result record",
+  )
 
   return testResult
+}
+
+/**
+ * Renders one story against the given browser session and persists its TestResult: the capture
+ * phase ({@link captureStory}) followed immediately by the finalize phase ({@link finalizeStory})
+ * on the caller's session. THROWS on failure. Kept as the sequential composition of the two
+ * phases; the concurrent fan-out releases the session between the phases instead (issue #456).
+ */
+export async function renderStory(info: StoryInfo): Promise<TestResult> {
+  const captured = await captureStory(info)
+  return await finalizeStory(info, captured)
 }
 
 interface DownloadImageArgs {
@@ -834,9 +994,10 @@ function computeFittedHeight(contentHeight: number, viewport: SetViewportOptions
 }
 
 /**
- * Measures the content height of the loaded story and, if it exceeds the current viewport height,
- * grows the viewport so the full content is captured. Returns the height the viewport was set to
- * (or the original height if no adjustment was made or measurement failed).
+ * Given the measured content height of the loaded story (undefined when measurement failed), if
+ * it exceeds the current viewport height, grows the viewport so the full content is captured.
+ * Returns the height the viewport was set to (or the original height if no adjustment was made
+ * or measurement failed).
  *
  * Note: immediately after a story loads the layout may not have settled, so the content height
  * measured here can be too small (this is the root cause of tall pages being cut off). The
@@ -846,10 +1007,10 @@ async function adjustViewportForStory(
   browser: Browser,
   storyId: string,
   viewport: SetViewportOptions,
+  contentHeight: number | undefined,
 ): Promise<number> {
   const originalHeight = viewport.height
 
-  const contentHeight = await measureContentHeight(browser)
   if (contentHeight == undefined) {
     log.error(
       `Failed to get content height for story ${storyId}. Using original height: ${originalHeight}`,
