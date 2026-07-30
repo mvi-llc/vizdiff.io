@@ -32,6 +32,7 @@ import { expect, describe, it, afterAll, beforeEach, vi, afterEach } from "vites
 import { remote } from "webdriverio"
 
 import { Database, DatabasePool } from "./database"
+import { safeExtract } from "./extract"
 import { WORKER_ID } from "./identity"
 import {
   computeBuildTimeoutMs,
@@ -40,7 +41,7 @@ import {
   isBaselineBuildPending,
 } from "./ingest"
 import { log } from "./log"
-import { processStoryWithRetry } from "./stories"
+import { captureStoryWithRetry } from "./stories"
 import {
   DependencyNotReadyError,
   NonRetryableTaskError,
@@ -248,7 +249,9 @@ vi.mock("./environment", async (importOriginal) => {
   }
 })
 
-// Mock story processing module
+// Mock story processing module. The ingest fan-out now runs the capture/finalize split (issue
+// #456): captureStoryWithRetry holds the browser session and hands a CapturedStory to
+// finalizeStoryWithRecording, which does the S3/diff/DB work and persists the TestResult.
 vi.mock("./stories", () => ({
   navigateToStorybook: vi.fn().mockImplementation(async () => {
     log.debug("navigateToStorybook called")
@@ -257,10 +260,24 @@ vi.mock("./stories", () => ({
     log.debug("getStorybookStories called")
     return mockStories
   }),
-  processStoryWithRetry: vi
+  captureStoryWithRetry: vi
     .fn()
-    .mockImplementation(
-      async ({
+    .mockImplementation(async ({ story }: { story: { id: string; name: string } }) => {
+      log.debug(`captureStoryWithRetry called with story: ${JSON.stringify(story)}`)
+      return {
+        kind: "captured" as const,
+        captured: {
+          story,
+          screenshotPath: `/tmp/test/${story.id}.png`,
+          screenshotBuffer: Buffer.from("mock screenshot"),
+          viewport: { width: 1200, height: 900, devicePixelRatio: 1 },
+          captureDurationMs: 5,
+        },
+      }
+    }),
+  finalizeStoryWithRecording: vi.fn().mockImplementation(
+    async (
+      {
         story,
         testResultTable,
         uploadId,
@@ -268,26 +285,28 @@ vi.mock("./stories", () => ({
         story: { id: string; name: string }
         testResultTable: Repository<TestResult>
         uploadId: string
-      }) => {
-        log.debug(`processStory called with story: ${JSON.stringify(story)}`)
-        const result = {
-          id: 1,
-          name: story.name,
-          storyId: story.id,
-          screenshotTestId: 123,
-          changeStatus: "new" as const,
-          baselineImageUrl: "mock-baseline-url",
-          newImageUrl: `mock-new-url-${uploadId}`,
-          diffImageUrl: "mock-diff-url",
-          diffRatio: 0,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        }
-        log.debug(`processStory returning: ${JSON.stringify(result)}`)
-        await testResultTable.save(result)
-        return result
       },
-    ),
+      _captured: unknown,
+    ) => {
+      log.debug(`finalizeStoryWithRecording called with story: ${JSON.stringify(story)}`)
+      const result = {
+        id: 1,
+        name: story.name,
+        storyId: story.id,
+        screenshotTestId: 123,
+        changeStatus: "new" as const,
+        baselineImageUrl: "mock-baseline-url",
+        newImageUrl: `mock-new-url-${uploadId}`,
+        diffImageUrl: "mock-diff-url",
+        diffRatio: 0,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }
+      log.debug(`finalizeStoryWithRecording returning: ${JSON.stringify(result)}`)
+      await testResultTable.save(result)
+      return result
+    },
+  ),
 }))
 
 // Mock HTTP server for serving Storybook files
@@ -641,6 +660,14 @@ describe("worker", () => {
       expect(S3Client).toHaveBeenCalled()
       expect(mockSend).toHaveBeenCalledWith(expect.any(GetObjectCommand))
 
+      // Prewarm (issue #456): the browser pool starts launching (remote()) BEFORE the tarball is
+      // extracted, so session startup overlaps the download/extract instead of following it.
+      const firstRemoteCall = vi.mocked(remote).mock.invocationCallOrder[0]
+      const firstExtractCall = vi.mocked(safeExtract).mock.invocationCallOrder[0]
+      expect(firstRemoteCall).toBeDefined()
+      expect(firstExtractCall).toBeDefined()
+      expect(firstRemoteCall!).toBeLessThan(firstExtractCall!)
+
       // Verify screenshot test status updates
       expect(mockScreenshotTestSave).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -719,7 +746,7 @@ describe("worker", () => {
       log.warn = vi.fn()
 
       // Simulate a story stuck in a WebDriver op that only unsticks when the browser session is
-      // force-closed by the timeout abort. processStoryWithRetry hangs until deleteSession() is
+      // force-closed by the timeout abort. captureStoryWithRetry hangs until deleteSession() is
       // called,
       // then rejects — mirroring how force-teardown makes the stuck command reject and the
       // render's `finally` (returning the session to the browser pool) run. This verifies
@@ -727,7 +754,7 @@ describe("worker", () => {
       // the worker eagerly.
       let rejectStuckStory: ((err: Error) => void) | undefined
       let storyRejected = false
-      vi.mocked(processStoryWithRetry).mockImplementationOnce(
+      vi.mocked(captureStoryWithRetry).mockImplementationOnce(
         () =>
           new Promise((_resolve, reject) => {
             rejectStuckStory = (err: Error) => {
@@ -803,6 +830,20 @@ describe("worker", () => {
 
       // Verify no test results were created since we couldn't get the stories list
       expect(mockTestResultSave).not.toHaveBeenCalled()
+
+      // Prewarm cleanup (issue #456): the pool was started concurrently with the (failed)
+      // download, so every Chrome session that launched must be torn down — an early build
+      // failure must never leak headless-Chrome processes.
+      const launched = await Promise.all(
+        vi
+          .mocked(remote)
+          .mock.results.filter((r) => r.type === "return")
+          .map((r) => r.value as Promise<MockBrowser>),
+      )
+      expect(launched.length).toBeGreaterThan(0)
+      for (const browser of launched) {
+        expect(browser.deleteSession).toHaveBeenCalled()
+      }
     })
 
     it("should throw NonRetryableTaskError when the upload tarball is gone (NoSuchKey)", async () => {
@@ -1221,7 +1262,7 @@ describe("worker", () => {
         vi.mocked(DatabasePool).mockImplementation(() => new Promise(() => undefined))
 
         // A story wedged beyond recovery: it never settles, even when its session is closed.
-        vi.mocked(processStoryWithRetry).mockImplementationOnce(() => new Promise(() => undefined))
+        vi.mocked(captureStoryWithRetry).mockImplementationOnce(() => new Promise(() => undefined))
 
         // Swallow the (never-delivered) rejection; the promise dangles by design (withTimeout
         // never resolves while the wedged render holds resources).

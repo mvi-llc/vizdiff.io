@@ -206,6 +206,38 @@ export const WORKER_SESSION_MAX_INFRA_FAILURES = intEnv("WORKER_SESSION_MAX_INFR
 // Default: 2 (one retry).
 export const WORKER_STORY_MAX_ATTEMPTS = intEnv("WORKER_STORY_MAX_ATTEMPTS", 2)
 
+// --- Per-story throughput (issue #456, Phase A) -------------------------------------------------
+
+// Number of finalize tasks — the S3 screenshot/diff uploads, baseline download, pixelmatch, and
+// TestResult row save that follow a story's screenshot capture — processed concurrently in the
+// background once the capture phase has released its browser session. Finalize work holds no
+// browser, so this is decoupled from WORKER_STORY_CONCURRENCY; the default keeps a few uploads
+// in flight without saturating the network or the database. Values < 1 are clamped to 1.
+// Default: 4.
+export const WORKER_FINALIZE_CONCURRENCY = Math.max(1, intEnv("WORKER_FINALIZE_CONCURRENCY", 4))
+
+// Upper bound on stories that have finished capture but are not yet finalized. Each such story
+// buffers one screenshot PNG in memory, so this caps the pipeline's extra memory footprint; when
+// the backlog hits the limit, the next capture waits for a finalize to drain before starting.
+// Values < 1 are clamped to 1. Default: 16.
+export const WORKER_FINALIZE_QUEUE_LIMIT = Math.max(1, intEnv("WORKER_FINALIZE_QUEUE_LIMIT", 16))
+
+// Interval between consecutive screenshots in the visual-stabilization loop. Since issue #458
+// capture already waits for Storybook's semantic render-completion signal before this loop
+// starts, so the loop is a final settle check rather than the primary readiness gate — issue
+// #456 halves the previous hardcoded 500 ms default. Raise it back for storybooks with slow
+// animations that need a longer window to register as "still moving". Values < 1 are clamped
+// to 1. Default: 250.
+export const WORKER_STABILIZE_INTERVAL_MS = Math.max(1, intEnv("WORKER_STABILIZE_INTERVAL_MS", 250))
+
+// Fixed settle delay after the post-stabilization viewport resize (growing the viewport to fit
+// tall content) before the final full-height screenshot is captured. (The legacy fixed
+// post-load pause before the *first* screenshot was superseded by the event-driven readiness
+// gate in issue #458; this delay now only applies after a resize-triggered relayout. The
+// degraded-readiness fallback path in storyReady.ts keeps its own fixed delay.) Previously this
+// reused the 500 ms stabilization interval. Default: 250.
+export const WORKER_POST_LOAD_DELAY_MS = intEnv("WORKER_POST_LOAD_DELAY_MS", 250)
+
 // Progress watchdog (issue #452): abort a build once no story has completed for this long. A
 // build that is steadily completing stories is healthy no matter how large it is, while a wedged
 // build (issue #450) is detected within minutes instead of at the whole-build ceiling. The

@@ -7,7 +7,7 @@ import type { Repository } from "typeorm"
 import { expect, describe, it, vi, beforeEach } from "vitest"
 
 import type { BrowserPool, PooledSession } from "./browserPool"
-import { processStoryWithRetry, renderStory } from "./stories"
+import { captureStory, finalizeStory, processStoryWithRetry, renderStory } from "./stories"
 import { createMockBrowser, defaultMockPageState } from "./testing/mockBrowser"
 
 /**
@@ -20,8 +20,10 @@ import { createMockBrowser, defaultMockPageState } from "./testing/mockBrowser"
  * 4. Compares the images and determines if there are changes
  * 5. Saves the results to the database
  *
- * processStoryWithRetry wraps renderStory with session checkout, health probing, infra-error
- * classification/retry, and failed-result recording (issues #450/#454).
+ * Since issue #456 the work is split into a session-holding capture phase (captureStory) and a
+ * browser-free finalize phase (finalizeStory); renderStory is their sequential composition.
+ * processStoryWithRetry adds session checkout, health probing, infra-error classification/retry
+ * (capture only), and failed-result recording (issues #450/#454/#456).
  */
 
 // Mock function declarations for all external dependencies
@@ -165,17 +167,21 @@ vi.unmock("node:fs/promises")
  * Returns:
  * - 0 when images are identical
  * - width * height (all pixels different) when images differ
+ *
+ * Hoisted into a vi.fn so tests can assert whether pixelmatch ran at all (the Buffer.equals
+ * stabilization fast path, issue #456) and force a "still changing" comparison via
+ * mockImplementationOnce.
  */
-vi.mock("pixelmatch", () => {
-  return {
-    default: (
+const mockPixelmatch = vi.hoisted(() =>
+  vi.fn(
+    (
       img1: Buffer,
       img2: Buffer,
       _output: Buffer,
       width: number,
       height: number,
       _options?: unknown,
-    ) => {
+    ): number => {
       // If both buffers contain the same data, return 0 differences
       if (img1.toString() === img2.toString()) {
         return 0
@@ -183,8 +189,9 @@ vi.mock("pixelmatch", () => {
       // Otherwise return width * height (all pixels different)
       return width * height
     },
-  }
-})
+  ),
+)
+vi.mock("pixelmatch", () => ({ default: mockPixelmatch }))
 
 /**
  * Mock PNG operations with different behaviors for test scenarios:
@@ -497,7 +504,9 @@ describe("stories", () => {
     // 3. Stability check attempt (succeeds)
     expect(mockBrowserSaveScreenshot).toHaveBeenCalledTimes(3)
     expect(mockBrowserPause).toHaveBeenCalledWith(1000) // For retry delay
-    expect(mockBrowserPause).toHaveBeenCalledWith(500) // For stability check interval
+    // Stability check interval: WORKER_STABILIZE_INTERVAL_MS (issue #456; default 250, was a
+    // hardcoded 500).
+    expect(mockBrowserPause).toHaveBeenCalledWith(250)
   })
 
   /**
@@ -543,7 +552,9 @@ describe("stories", () => {
     // (the layout has not settled), and the post-stabilization measurement reports the true tall
     // height. This mirrors the issue #146 scenario where the content height is computed too early.
     // The mock page consumes one array element per measuring execute call (the last one sticks).
-    mockPageState.contentHeight = [800, TALL_CONTENT_HEIGHT]
+    // The initial 1500px measurement exceeds the 900px story viewport, so the issue #456 skip
+    // guard does not apply and the authoritative post-stabilization pass must still run.
+    mockPageState.contentHeight = [1500, TALL_CONTENT_HEIGHT]
 
     await renderStory({
       story: mockStory,
@@ -565,6 +576,112 @@ describe("stories", () => {
     expect(mockBrowserSetViewport).toHaveBeenCalledWith(
       expect.objectContaining({ width: 1200, height: TALL_CONTENT_HEIGHT }),
     )
+  })
+
+  /**
+   * Issue #456 (A3): the post-stabilization height re-measure is skipped ONLY when the story
+   * stabilized on the first attempt AND the initially measured content height fit within the
+   * story's viewport. Both guard conditions are exercised: skip when they hold, keep the
+   * authoritative pass when either fails.
+   */
+  describe("post-stabilization height re-measure skip (#456)", () => {
+    function baseRenderInfo() {
+      return {
+        story: mockStory,
+        screenshotTest: mockScreenshotTest,
+        bucket: "test-bucket",
+        tmpDir: "/tmp/test",
+        projectId: "test-project",
+        uploadId: "123",
+        port: 9009,
+        s3Client: new S3Client({}),
+        testResultTable: {
+          save: mockTestResultSave.mockImplementation(async (data: TestResult) => data),
+        } as unknown as Repository<TestResult>,
+        browser: mockBrowser,
+      }
+    }
+
+    it("skips the second measurement when stabilized on attempt 1 and the content fit", async () => {
+      // Initial measurement (800) fits the 900px viewport; the default mock screenshots are
+      // byte-identical, so the story stabilizes on attempt 1. If the second (authoritative)
+      // measurement ran, it would read 4000 and grow the viewport — it must not.
+      mockPageState.contentHeight = [800, 4000]
+
+      await renderStory(baseRenderInfo())
+
+      expect(mockBrowserSetViewport).not.toHaveBeenCalledWith(
+        expect.objectContaining({ height: 4000 }),
+      )
+    })
+
+    it("keeps the authoritative pass when stabilization took more than one attempt", async () => {
+      // Content fits initially (800 <= 900), but the first stability comparison reports a
+      // still-changing page (differing screenshot bytes + a forced pixelmatch mismatch), so
+      // stabilization needs a second attempt and the guard must NOT skip the re-measure.
+      mockPageState.contentHeight = [800, 4000]
+      mockBrowserSaveScreenshot
+        .mockResolvedValueOnce(Buffer.from("frame 1"))
+        .mockResolvedValueOnce(Buffer.from("frame 2"))
+      mockPixelmatch.mockImplementationOnce(() => 10_000) // attempt 1: everything changed
+
+      await renderStory(baseRenderInfo())
+
+      // The second measurement ran and grew the viewport to the settled 4000px height.
+      expect(mockBrowserSetViewport).toHaveBeenCalledWith(
+        expect.objectContaining({ width: 1200, height: 4000 }),
+      )
+    })
+  })
+
+  /**
+   * Issue #456 (A3): when consecutive stabilization screenshots are byte-identical, the loop
+   * must treat them as identical (diffRatio 0) WITHOUT decoding PNGs or running pixelmatch.
+   */
+  describe("stabilization Buffer.equals fast path (#456)", () => {
+    it("skips pixelmatch when consecutive screenshots are byte-identical", async () => {
+      // Default mock screenshots are identical, and a new story (no baseline) does no baseline
+      // diff — so pixelmatch must never run at all.
+      await renderStory({
+        story: mockStory,
+        screenshotTest: mockScreenshotTest,
+        bucket: "test-bucket",
+        tmpDir: "/tmp/test",
+        projectId: "test-project",
+        uploadId: "123",
+        port: 9009,
+        s3Client: new S3Client({}),
+        testResultTable: {
+          save: mockTestResultSave.mockImplementation(async (data: TestResult) => data),
+        } as unknown as Repository<TestResult>,
+        browser: mockBrowser,
+      })
+
+      expect(mockPixelmatch).not.toHaveBeenCalled()
+    })
+
+    it("still runs pixelmatch when consecutive screenshots differ", async () => {
+      mockBrowserSaveScreenshot
+        .mockResolvedValueOnce(Buffer.from("frame 1"))
+        .mockResolvedValueOnce(Buffer.from("frame 2"))
+
+      await renderStory({
+        story: mockStory,
+        screenshotTest: mockScreenshotTest,
+        bucket: "test-bucket",
+        tmpDir: "/tmp/test",
+        projectId: "test-project",
+        uploadId: "123",
+        port: 9009,
+        s3Client: new S3Client({}),
+        testResultTable: {
+          save: mockTestResultSave.mockImplementation(async (data: TestResult) => data),
+        } as unknown as Repository<TestResult>,
+        browser: mockBrowser,
+      })
+
+      expect(mockPixelmatch).toHaveBeenCalled()
+    })
   })
 
   /**
@@ -752,7 +869,7 @@ describe("stories", () => {
       expect(saved).toHaveLength(1)
     })
 
-    it("classifies an S3 upload failure as retryable storage infra and does not throw", async () => {
+    it("records an S3 upload failure as a failed storage result without re-capturing", async () => {
       // Screenshot capture succeeds, but every PutObjectCommand send rejects.
       mockSend.mockImplementation(async (command) => {
         if (command instanceof PutObjectCommand) {
@@ -767,10 +884,18 @@ describe("stories", () => {
       // screenshot-upload rejection did exactly that).
       const testResult = await processStoryWithRetry(baseInfo(saved, pool))
 
-      expect(acquire).toHaveBeenCalledTimes(2) // storage is infra-class: it was retried
+      // The capture/finalize split (issue #456): S3 persistence happens AFTER the browser
+      // session is done, so a storage failure retries the cheap finalize phase once (two
+      // screenshot PUT attempts) but never re-captures.
+      expect(acquire).toHaveBeenCalledTimes(1)
+      const putAttempts = mockSend.mock.calls.filter(
+        ([command]) => command instanceof PutObjectCommand,
+      )
+      expect(putAttempts).toHaveLength(2)
       expect(testResult.changeStatus).toBe("failed")
       expect(testResult.errorKind).toBe("storage")
       expect(saved).toHaveLength(1)
+      expect(saved[0]?.changeStatus).toBe("failed")
     })
 
     it("resets the failure counter and counts the story on success", async () => {
@@ -783,6 +908,107 @@ describe("stories", () => {
       expect(session.consecutiveInfraFailures).toBe(0)
       expect(session.storiesRendered).toBe(1)
       expect(release).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  /**
+   * The capture/finalize split (issue #456): captureStory (session-holding) followed by
+   * finalizeStory (no browser) must compose to the same TestResult the one-shot renderStory
+   * produced, for both the new-story and baseline-comparison fixtures.
+   */
+  describe("captureStory + finalizeStory split (#456)", () => {
+    function storyInfo() {
+      return {
+        story: mockStory,
+        screenshotTest: mockScreenshotTest,
+        bucket: "test-bucket",
+        tmpDir: "/tmp/test",
+        projectId: "test-project",
+        uploadId: "xyz789",
+        port: 9009,
+        s3Client: new S3Client({}),
+        testResultTable: {
+          save: mockTestResultSave.mockImplementation(async (data: TestResult) => data),
+        } as unknown as Repository<TestResult>,
+        browser: mockBrowser,
+      }
+    }
+
+    it("captureStory produces the screenshot artifacts and holds no S3/DB side effects", async () => {
+      const captured = await captureStory(storyInfo())
+
+      expect(captured.story).toBe(mockStory)
+      expect(captured.screenshotPath).toBe(`/tmp/test/${mockStory.id}.png`)
+      expect(Buffer.isBuffer(captured.screenshotBuffer)).toBe(true)
+      expect(captured.viewport).toEqual({ width: 1200, height: 900, devicePixelRatio: 1 })
+      expect(captured.captureDurationMs).toBeGreaterThanOrEqual(0)
+      // The capture phase must not upload anything or persist any row.
+      expect(mockSend).not.toHaveBeenCalledWith(expect.any(PutObjectCommand))
+      expect(mockTestResultSave).not.toHaveBeenCalled()
+    })
+
+    it("capture then finalize composes to the same result as renderStory (unchanged baseline)", async () => {
+      ;(PNG as unknown as { setTestMode(mode: string): void }).setTestMode("unchanged")
+      const baseTestResult = new TestResult()
+      Object.assign(baseTestResult, {
+        id: 789,
+        storyId: "test-story",
+        screenshotTest: { id: 456, uploadId: "xyz789" },
+        changeStatus: "new",
+      })
+      const info = { ...storyInfo(), baseTestResult }
+
+      const captured = await captureStory(info)
+      const testResult = await finalizeStory(info, captured)
+
+      // Same fields renderStory produced for this fixture before the split.
+      expect(testResult.changeStatus).toBe("unchanged")
+      expect(testResult.diffRatio).toBeLessThan(0.001)
+      expect(testResult.name).toBe("components/TestStory/My Component")
+      expect(testResult.storyId).toBe(mockStory.id)
+      expect(testResult.newImageUrl).toBe(screenshotKey("test-project", "xyz789", mockStory.id))
+      expect(mockTestResultSave).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  /**
+   * Issue #456 env knobs are read through the intEnv idiom in environment.ts; verify overrides
+   * are honored (and invalid/low values clamp) via a fresh module-registry import.
+   */
+  describe("throughput env overrides (#456)", () => {
+    it("honors explicit overrides for the new env vars", async () => {
+      vi.stubEnv("WORKER_FINALIZE_CONCURRENCY", "8")
+      vi.stubEnv("WORKER_FINALIZE_QUEUE_LIMIT", "32")
+      vi.stubEnv("WORKER_STABILIZE_INTERVAL_MS", "125")
+      vi.stubEnv("WORKER_POST_LOAD_DELAY_MS", "0")
+      vi.resetModules()
+      try {
+        const env = await import("./environment")
+        expect(env.WORKER_FINALIZE_CONCURRENCY).toBe(8)
+        expect(env.WORKER_FINALIZE_QUEUE_LIMIT).toBe(32)
+        expect(env.WORKER_STABILIZE_INTERVAL_MS).toBe(125)
+        expect(env.WORKER_POST_LOAD_DELAY_MS).toBe(0)
+      } finally {
+        vi.unstubAllEnvs()
+        vi.resetModules()
+      }
+    })
+
+    it("applies defaults and clamps degenerate values", async () => {
+      vi.stubEnv("WORKER_FINALIZE_CONCURRENCY", "0") // clamped to 1
+      vi.stubEnv("WORKER_FINALIZE_QUEUE_LIMIT", "not-a-number") // default
+      vi.stubEnv("WORKER_STABILIZE_INTERVAL_MS", "") // default
+      vi.resetModules()
+      try {
+        const env = await import("./environment")
+        expect(env.WORKER_FINALIZE_CONCURRENCY).toBe(1)
+        expect(env.WORKER_FINALIZE_QUEUE_LIMIT).toBe(16)
+        expect(env.WORKER_STABILIZE_INTERVAL_MS).toBe(250)
+        expect(env.WORKER_POST_LOAD_DELAY_MS).toBe(250)
+      } finally {
+        vi.unstubAllEnvs()
+        vi.resetModules()
+      }
     })
   })
 })

@@ -4,7 +4,6 @@ import { promises as fsPromises } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { Readable } from "node:stream"
-import pLimit from "p-limit"
 import {
   TestResult,
   ScreenshotTest,
@@ -32,6 +31,8 @@ import {
   WORKER_CHROME_EXTRA_ARGS,
   WORKER_ENABLE_WEBGL,
   WORKER_FATAL_FAILSAFE_TIMEOUT_MS,
+  WORKER_FINALIZE_CONCURRENCY,
+  WORKER_FINALIZE_QUEUE_LIMIT,
   WORKER_PER_STORY_BUDGET_MS,
   WORKER_PROGRESS_TIMEOUT_MS,
   WORKER_SESSION_MAX_INFRA_FAILURES,
@@ -43,6 +44,7 @@ import { updateGitHubCheckRun, type GitHubCheckData } from "./github"
 import { getGitLabHostConfig, updateGitLabCommitStatus, type GitLabCheckData } from "./gitlab"
 import { WORKER_ID } from "./identity"
 import { log } from "./log"
+import { runStoryPipeline, settlePrewarmedPool } from "./pipeline"
 import { beginBuildProgress, endBuildProgress } from "./progress"
 import { buildImageUrlResolver } from "./s3"
 import {
@@ -51,10 +53,16 @@ import {
   installNetworkEgressBlock,
 } from "./safeguards"
 import { startStaticServer } from "./server"
-import { getStorybookStories, navigateToStorybook, processStoryWithRetry } from "./stories"
+import {
+  captureStoryWithRetry,
+  finalizeStoryWithRecording,
+  getStorybookStories,
+  navigateToStorybook,
+} from "./stories"
 import { installStoryRenderStateHook } from "./storyReady"
 import { NonRetryableTaskError, isPermanentS3FetchError } from "./tasks"
 import { withTimeout } from "./timeout"
+import type { Story } from "./types"
 import { postBuildFailedStatus, type BuildCheckData } from "./vcsStatus"
 import { nodeCompatTransformRequest } from "./wdio"
 
@@ -287,43 +295,6 @@ export async function ingestStorybook(
   await screenshotTestRepo.save(screenshotTest)
 
   try {
-    // Initialize the tarball download from S3
-    const tarballPath = path.join(tmpDir, "storybook.tar.gz")
-    log.info(`Downloading storybook build from S3 ${key} -> ${tarballPath}`)
-    const getObjectCommand = new GetObjectCommand({ Bucket: bucket, Key: key })
-    let response
-    try {
-      response = await s3Client.send(getObjectCommand)
-    } catch (error) {
-      // If the upload tarball is permanently gone (e.g. NoSuchKey) there is no
-      // point retrying. Surface it as a non-retryable error so the worker deletes
-      // the task from the queue instead of releasing the lock for backoff retries.
-      // The outer catch below marks the ScreenshotTest as failed before this
-      // propagates.
-      if (isPermanentS3FetchError(error)) {
-        const name = (error as { name?: string }).name ?? "unknown"
-        throw new NonRetryableTaskError(
-          `Storybook upload tarball is unavailable (${name}) at s3://${bucket}/${key}; not retrying`,
-          error,
-        )
-      }
-      throw error
-    }
-    if (!response.Body) {
-      throw new Error("Empty response body from S3")
-    }
-    if (!(response.Body instanceof Readable)) {
-      throw new Error(`Unexpected response.Body type ${typeof response.Body}`)
-    }
-    // Download the tarball to a temporary file
-    await downloadWithTimeout(response.Body, tarballPath, 30 * 1000)
-    log.debug(`Successfully downloaded storybook build from S3`)
-
-    // Extract the tarball
-    log.info(`Extracting storybook build to: ${tmpDir}`)
-    await safeExtract(tarballPath, tmpDir)
-    log.debug(`Successfully extracted storybook build`)
-
     // Initialize WebdriverIO
     log.debug("Initializing WebdriverIO in headless Chrome mode")
     const config: Capabilities.WebdriverIOConfig = {
@@ -365,7 +336,12 @@ export async function ingestStorybook(
     // Sessions are recycled after WORKER_SESSION_RECYCLE_STORIES stories (bounding Chrome's
     // cumulative memory growth, issue #453) and replaced after WORKER_SESSION_MAX_INFRA_FAILURES
     // consecutive infra failures (dead-session recovery, issue #450).
-    const pool = await createBrowserPool(
+    //
+    // Prewarm (issue #456): pool creation is kicked off BEFORE the tarball download so all N
+    // Chrome sessions launch concurrently with the download + extraction instead of serially
+    // after them. settlePrewarmedPool joins the two: if the download/extract fails first, the
+    // pool is awaited and destroyed so an early failure never leaks Chrome processes.
+    const poolPromise = createBrowserPool(
       WORKER_STORY_CONCURRENCY,
       async () => {
         const session = await remote(config)
@@ -380,6 +356,47 @@ export async function ingestStorybook(
         maxConsecutiveInfraFailures: WORKER_SESSION_MAX_INFRA_FAILURES,
       },
     )
+
+    const downloadAndExtract = async (): Promise<void> => {
+      // Initialize the tarball download from S3
+      const tarballPath = path.join(tmpDir, "storybook.tar.gz")
+      log.info(`Downloading storybook build from S3 ${key} -> ${tarballPath}`)
+      const getObjectCommand = new GetObjectCommand({ Bucket: bucket, Key: key })
+      let response
+      try {
+        response = await s3Client.send(getObjectCommand)
+      } catch (error) {
+        // If the upload tarball is permanently gone (e.g. NoSuchKey) there is no
+        // point retrying. Surface it as a non-retryable error so the worker deletes
+        // the task from the queue instead of releasing the lock for backoff retries.
+        // The outer catch below marks the ScreenshotTest as failed before this
+        // propagates.
+        if (isPermanentS3FetchError(error)) {
+          const name = (error as { name?: string }).name ?? "unknown"
+          throw new NonRetryableTaskError(
+            `Storybook upload tarball is unavailable (${name}) at s3://${bucket}/${key}; not retrying`,
+            error,
+          )
+        }
+        throw error
+      }
+      if (!response.Body) {
+        throw new Error("Empty response body from S3")
+      }
+      if (!(response.Body instanceof Readable)) {
+        throw new Error(`Unexpected response.Body type ${typeof response.Body}`)
+      }
+      // Download the tarball to a temporary file
+      await downloadWithTimeout(response.Body, tarballPath, 30 * 1000)
+      log.debug(`Successfully downloaded storybook build from S3`)
+
+      // Extract the tarball
+      log.info(`Extracting storybook build to: ${tmpDir}`)
+      await safeExtract(tarballPath, tmpDir)
+      log.debug(`Successfully extracted storybook build`)
+    }
+
+    const { pool } = await settlePrewarmedPool(poolPromise, downloadAndExtract())
     const primarySession = pool.sessions[0]
     if (!primarySession) {
       throw new Error("Browser pool initialized with no sessions") // unreachable: size >= 1
@@ -472,44 +489,63 @@ export async function ingestStorybook(
               : ""),
         )
 
-        // Render stories concurrently across the session pool (issue #152, Phase 1b). The limit
-        // equals the pool size, so a slot rarely waits on acquire(). Session checkout, health
-        // probing, infra-error retry, and failure recording all live inside
-        // processStoryWithRetry (issues #450/#454): a single story's failure records a `failed`
-        // TestResult and resolves, so one bad story (or one dead session) cannot abort the build.
-        const limit = pLimit(pool.size)
-        log.info(`Rendering ${Object.keys(stories).length} stories across ${pool.size} session(s)`)
+        // Render stories concurrently across the session pool (issue #152, Phase 1b) through the
+        // two-lane capture/finalize pipeline (issue #456). Capture slots equal the pool size, so
+        // a slot rarely waits on acquire(); on capture success the session is released
+        // immediately and the story's S3 uploads + baseline diff + DB save run in a bounded
+        // background lane (WORKER_FINALIZE_CONCURRENCY), letting the session move straight to
+        // the next story. WORKER_FINALIZE_QUEUE_LIMIT caps captured-but-unfinalized stories
+        // (each buffers one PNG in memory). Session checkout, health probing, infra-error retry,
+        // and failure recording live inside captureStoryWithRetry/finalizeStoryWithRecording
+        // (issues #450/#454): a single story's failure records a `failed` TestResult and
+        // resolves, so one bad story (or one dead session) cannot abort the build.
+        log.info(
+          `Rendering ${Object.keys(stories).length} stories across ${pool.size} session(s) ` +
+            `(finalize concurrency ${WORKER_FINALIZE_CONCURRENCY}, ` +
+            `queue limit ${WORKER_FINALIZE_QUEUE_LIMIT})`,
+        )
 
         // Track render progress (issue #452): every settled story — success or recorded failure
         // — counts as forward progress. The in-process stall watchdog polls lastProgressAtMs,
         // and a throttled last_progress_at heartbeat lets the cross-worker stuck-build sweeper
-        // distinguish a large-but-healthy build from a wedged one.
+        // distinguish a large-but-healthy build from a wedged one. Stories count as complete
+        // when they FINALIZE; capture completions additionally touch() the watchdog (cheap) so
+        // a long finalize backlog is never mistaken for a stall.
         const progress = beginBuildProgress(screenshotTest.id, storyCount)
         let testResults: TestResult[]
         try {
-          const renderAllStories = Promise.all(
-            Object.values(stories).map((story) =>
-              limit(async () => {
-                try {
-                  return await processStoryWithRetry({
-                    story,
-                    screenshotTest,
-                    baseTestResult: baseTestResults.get(story.id),
-                    bucket,
-                    tmpDir,
-                    projectId,
-                    uploadId,
-                    port,
-                    s3Client,
-                    testResultTable,
-                    pool,
-                  })
-                } finally {
-                  progress.completeStory()
-                }
-              }),
-            ),
-          )
+          const storyInfoFor = (story: Story) => ({
+            story,
+            screenshotTest,
+            baseTestResult: baseTestResults.get(story.id),
+            bucket,
+            tmpDir,
+            projectId,
+            uploadId,
+            port,
+            s3Client,
+            testResultTable,
+          })
+          const renderAllStories = runStoryPipeline({
+            stories: Object.values(stories),
+            captureConcurrency: pool.size,
+            finalizeConcurrency: WORKER_FINALIZE_CONCURRENCY,
+            queueLimit: WORKER_FINALIZE_QUEUE_LIMIT,
+            capture: (story) => captureStoryWithRetry({ ...storyInfoFor(story), pool }),
+            finalize: (story, captured) =>
+              finalizeStoryWithRecording(storyInfoFor(story), captured),
+            hooks: {
+              onCaptureComplete: () => {
+                progress.touch()
+              },
+              onStoryComplete: () => {
+                progress.completeStory()
+              },
+              onCapturesDrained: () => {
+                logBuildMemoryUsage("capture-drain", screenshotTest.id)
+              },
+            },
+          })
 
           // Wrap the render fan-out in the build watchdog. Two triggers share one abort path
           // (issue #452): the progress watchdog fires when no story has completed for
