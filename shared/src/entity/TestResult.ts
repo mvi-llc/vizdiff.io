@@ -10,7 +10,7 @@ import {
 } from "typeorm"
 
 import type { ScreenshotTest } from "./ScreenshotTest"
-import type { TestResultErrorKind, TestResultStatus } from "./types"
+import type { TestResultDiagnostics, TestResultErrorKind, TestResultStatus } from "./types"
 
 @Entity("test_results")
 @Index("IDX_test_results_screenshot_test_id", ["screenshotTest.id"])
@@ -65,6 +65,11 @@ export class TestResult {
   // Human-readable error detail accompanying errorKind. Only set when changeStatus is "failed"
   @Column({ type: "text", name: "error_message", nullable: true })
   errorMessage!: string | null
+
+  // Troubleshooting context captured at failure time (issue #475): console tail, in-flight
+  // requests, best-effort failure screenshot key. Only set when changeStatus is "failed"
+  @Column({ type: "jsonb", name: "diagnostics", nullable: true })
+  diagnostics!: TestResultDiagnostics | null
 
   @CreateDateColumn({ name: "created_at", type: "timestamptz", nullable: false })
   createdAt!: Date

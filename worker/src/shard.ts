@@ -52,6 +52,7 @@ import {
   installNetworkEgressBlock,
 } from "./safeguards"
 import { startStaticServer } from "./server"
+import { installSessionDiagnostics } from "./sessionDiagnostics"
 import {
   captureStoryWithRetry,
   finalizeStoryWithRecording,
@@ -575,6 +576,10 @@ export function createStoryBrowserPool(outputDir: string): Promise<BrowserPool> 
       // Record Storybook's story-render lifecycle in the page (issue #458) so capture waits for
       // render completion instead of screenshotting an async story's loading fallback.
       await installStoryRenderStateHook(session)
+      // Buffer console output and in-flight network requests per session (issue #475) so a
+      // failed story's TestResult carries actionable troubleshooting context. Runs in this
+      // factory so pool.replace()'s fresh browsers are covered too.
+      await installSessionDiagnostics(session)
       return session
     },
     {

@@ -1,14 +1,16 @@
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3"
 import type { WriteStream } from "node:fs"
 import { PNG } from "pngjs"
-import { TestResult, ScreenshotTest, screenshotKey } from "shared"
+import { TestResult, ScreenshotTest, failureScreenshotKey, screenshotKey } from "shared"
 import { Readable } from "stream"
 import type { Repository } from "typeorm"
 import { expect, describe, it, vi, beforeEach } from "vitest"
 import type { Browser } from "webdriverio"
 
 import type { BrowserPool, PooledSession } from "./browserPool"
+import { installSessionDiagnostics, type CollectedDiagnostics } from "./sessionDiagnostics"
 import {
+  buildTestResultDiagnostics,
   captureStory,
   finalizeStory,
   getSessionCaptureState,
@@ -1105,6 +1107,192 @@ describe("stories", () => {
       expect(session.consecutiveInfraFailures).toBe(0)
       expect(session.storiesRendered).toBe(1)
       expect(release).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  /**
+   * Failure diagnostics (issue #475): a failed capture persists the session's console tail,
+   * in-flight requests, and (when the session is answerable) a best-effort failure screenshot on
+   * the failed TestResult; a successful retry clears them via the upsert's explicit null.
+   *
+   * Each test uses a FRESH mock browser (not the shared module-level one): the diagnostics state
+   * and BiDi handlers are keyed on the Browser object, so a fresh mock isolates them exactly
+   * like BrowserPool.replace() does in production.
+   */
+  describe("failure diagnostics (#475)", () => {
+    /** Fresh mock browser with diagnostics installed + a single-session fake pool around it. */
+    async function diagnosticsSetup() {
+      const mock = createMockBrowser()
+      await installSessionDiagnostics(mock.browser)
+      const session: PooledSession = {
+        id: 0,
+        browser: mock.browser,
+        storiesRendered: 0,
+        consecutiveInfraFailures: 0,
+      }
+      const pool = {
+        size: 1,
+        sessions: [session],
+        acquire: vi.fn(async () => session),
+        release: vi.fn(async () => undefined),
+        replace: vi.fn(async () => undefined),
+        setSessionInit: vi.fn(),
+        destroyAll: vi.fn(async () => undefined),
+      } as unknown as BrowserPool
+      const saved: TestResult[] = []
+      const info = {
+        story: mockStory,
+        screenshotTest: mockScreenshotTest,
+        bucket: "test-bucket",
+        tmpDir: "/tmp/test",
+        projectId: "test-project",
+        uploadId: "123",
+        port: 9009,
+        s3Client: new S3Client({}),
+        testResultTable: {
+          upsert: mockTestResultSave.mockImplementation(async (data: TestResult) => {
+            saved.push(data)
+            return upsertResult(data)
+          }),
+        } as unknown as Repository<TestResult>,
+        pool,
+      }
+      return { mock, saved, info }
+    }
+
+    /** Emits an untagged console entry stamped inside any capture attempt that starts later. */
+    function emitConsoleForUpcomingCapture(
+      mock: Awaited<ReturnType<typeof diagnosticsSetup>>["mock"],
+      text: string,
+    ): void {
+      mock.emitBidi("log.entryAdded", {
+        level: "error",
+        text,
+        timestamp: Date.now() + 60_000,
+      })
+    }
+
+    it("persists console tail, pending requests, and screenshot key on a story-class failure", async () => {
+      const { mock, saved, info } = await diagnosticsSetup()
+      // The page logged the actual exception, and a fetch never completed.
+      emitConsoleForUpcomingCapture(mock, "TypeError: cannot read worker")
+      mock.emitBidi("network.beforeRequestSent", {
+        request: { request: "req-1", url: "http://localhost:9009/worker.js" },
+      })
+      // Storybook reports the story threw: a story-class failure, recorded immediately.
+      mock.state.events = [{ type: "storyThrewException", message: "component blew up" }]
+
+      const testResult = await processStoryWithRetry(info)
+
+      expect(testResult.changeStatus).toBe("failed")
+      expect(saved).toHaveLength(1)
+      const diagnostics = saved[0]?.diagnostics
+      expect(diagnostics).toBeTruthy()
+      expect(diagnostics?.consoleTail.map((entry) => entry.text)).toContain(
+        "TypeError: cannot read worker",
+      )
+      // Persisted entries are {level, text, stampMs} — no per-session storyId tag.
+      expect(diagnostics?.consoleTail[0]).not.toHaveProperty("storyId")
+      expect(diagnostics?.pendingRequests).toEqual([
+        expect.objectContaining({ url: "http://localhost:9009/worker.js" }),
+      ])
+      // The failure-time screenshot was captured and uploaded to its canonical key.
+      const expectedKey = failureScreenshotKey("test-project", "123", mockStory.id)
+      expect(diagnostics?.failureScreenshotKey).toBe(expectedKey)
+      expect(mock.fns.takeScreenshot).toHaveBeenCalledTimes(1)
+      expect(mockSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({
+            Bucket: "test-bucket",
+            Key: expectedKey,
+            ContentType: "image/png",
+          }) as object,
+        }),
+      )
+    })
+
+    it("skips the screenshot for a browser-gone failure but still persists diagnostics", async () => {
+      const { mock, saved, info } = await diagnosticsSetup()
+      emitConsoleForUpcomingCapture(mock, "console context before the session died")
+      // Every attempt hits a dead session (infra-class; WORKER_STORY_MAX_ATTEMPTS defaults to 2),
+      // so the budget-exhausted path records the last infra failure.
+      mock.fns.url
+        .mockRejectedValueOnce(new Error("invalid session id"))
+        .mockRejectedValueOnce(new Error("invalid session id"))
+
+      const testResult = await processStoryWithRetry(info)
+
+      expect(testResult.changeStatus).toBe("failed")
+      expect(testResult.errorKind).toBe("browser-gone")
+      expect(saved).toHaveLength(1)
+      const diagnostics = saved[0]?.diagnostics
+      expect(diagnostics?.consoleTail.map((entry) => entry.text)).toContain(
+        "console context before the session died",
+      )
+      // A gone session cannot answer a screenshot command: not attempted, key omitted.
+      expect(mock.fns.takeScreenshot).not.toHaveBeenCalled()
+      expect(diagnostics?.failureScreenshotKey).toBeUndefined()
+    })
+
+    it("records the failed row with the key omitted when the screenshot upload fails", async () => {
+      const { mock, saved, info } = await diagnosticsSetup()
+      mock.state.events = [{ type: "storyThrewException", message: "component blew up" }]
+      // Only the failure-screenshot PUT fails; the record itself must still be persisted.
+      mockSend.mockImplementation(async (command) => {
+        if (command instanceof PutObjectCommand && command.input.Key.endsWith("-failure.png")) {
+          throw new Error("S3 is down")
+        }
+        return {}
+      })
+
+      const testResult = await processStoryWithRetry(info)
+
+      expect(mock.fns.takeScreenshot).toHaveBeenCalledTimes(1)
+      expect(testResult.changeStatus).toBe("failed")
+      expect(saved).toHaveLength(1)
+      const diagnostics = saved[0]?.diagnostics
+      expect(diagnostics).toBeTruthy()
+      expect(diagnostics?.failureScreenshotKey).toBeUndefined()
+      expect(diagnostics?.consoleTail).toBeDefined()
+    })
+
+    it("clears diagnostics on a successful capture (upsert writes an explicit null)", async () => {
+      const { saved, info } = await diagnosticsSetup()
+
+      const testResult = await processStoryWithRetry(info)
+
+      // The success-path upsert must include diagnostics: null (not undefined) so a previous
+      // failed attempt's diagnostics are cleared by the idempotent upsert.
+      expect(testResult.changeStatus).toBe("new")
+      expect(saved).toHaveLength(1)
+      expect(saved[0]?.diagnostics).toBeNull()
+    })
+
+    it("enforces the 64 KB serialized cap by dropping oldest console entries", () => {
+      // Each entry's 500-char text serializes to ~1000 bytes (every char needs a JSON escape),
+      // so 50 entries + 20 fat pending URLs comfortably exceed the 64 KB budget.
+      const collected: CollectedDiagnostics = {
+        consoleTail: Array.from({ length: 50 }, (_, i) => ({
+          level: "error",
+          text: `${i + 1}:${'"'.repeat(498)}`,
+          stampMs: i,
+        })),
+        pendingRequests: Array.from({ length: 20 }, (_, i) => ({
+          url: '"'.repeat(500),
+          pendingMs: i,
+        })),
+      }
+
+      const diagnostics = buildTestResultDiagnostics(collected, "some/failure-key.png")
+
+      expect(Buffer.byteLength(JSON.stringify(diagnostics), "utf8")).toBeLessThanOrEqual(64 * 1024)
+      expect(diagnostics.consoleTail.length).toBeGreaterThan(0)
+      expect(diagnostics.consoleTail.length).toBeLessThan(50)
+      // Oldest entries were dropped; the newest survives.
+      expect(diagnostics.consoleTail[0]?.text.startsWith("1:")).toBe(false)
+      expect(diagnostics.consoleTail.at(-1)?.text.startsWith("50:")).toBe(true)
+      expect(diagnostics.pendingRequests).toHaveLength(20)
+      expect(diagnostics.failureScreenshotKey).toBe("some/failure-key.png")
     })
   })
 

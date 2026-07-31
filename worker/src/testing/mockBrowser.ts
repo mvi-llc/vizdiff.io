@@ -65,7 +65,15 @@ export interface MockBrowserResult {
     pause: ReturnType<typeof vi.fn>
     waitUntil: ReturnType<typeof vi.fn>
     addInitScript: ReturnType<typeof vi.fn>
+    on: ReturnType<typeof vi.fn>
+    sessionSubscribe: ReturnType<typeof vi.fn>
+    takeScreenshot: ReturnType<typeof vi.fn>
   }
+  /**
+   * Delivers a fake BiDi event payload to every handler registered via `browser.on(event, ...)`,
+   * letting tests drive log/network subscriptions (issue #475 session diagnostics).
+   */
+  emitBidi: (event: string, payload: unknown) => void
 }
 
 /**
@@ -88,6 +96,26 @@ export function createMockBrowser(initial: Partial<MockPageState> = {}): MockBro
     }
     return await runInFakePage(script as (...a: unknown[]) => unknown, args, state)
   })
+
+  // BiDi event plumbing (issue #475): `on` records handlers per event name; `emitBidi` (on the
+  // returned result) synchronously delivers a payload to them.
+  const bidiHandlers = new Map<string, Array<(payload: unknown) => void>>()
+  const on = vi.fn((event: string, handler: (payload: unknown) => void) => {
+    const handlers = bidiHandlers.get(event) ?? []
+    handlers.push(handler)
+    bidiHandlers.set(event, handlers)
+    return browser
+  })
+  const sessionSubscribe = vi.fn().mockResolvedValue(undefined)
+  // Real takeScreenshot resolves a base64-encoded PNG string.
+  const takeScreenshot = vi.fn(async () =>
+    Buffer.from("mock failure screenshot data").toString("base64"),
+  )
+  const emitBidi = (event: string, payload: unknown): void => {
+    for (const handler of bidiHandlers.get(event) ?? []) {
+      handler(payload)
+    }
+  }
 
   const waitUntil = vi.fn(
     async (
@@ -119,6 +147,9 @@ export function createMockBrowser(initial: Partial<MockPageState> = {}): MockBro
     pause,
     waitUntil,
     addInitScript,
+    on,
+    sessionSubscribe,
+    takeScreenshot,
     isMultiremote: false,
     capabilities: {},
     sessionId: "mock-session",
@@ -128,7 +159,19 @@ export function createMockBrowser(initial: Partial<MockPageState> = {}): MockBro
   return {
     browser,
     state,
-    fns: { url, execute, saveScreenshot, setViewport, pause, waitUntil, addInitScript },
+    fns: {
+      url,
+      execute,
+      saveScreenshot,
+      setViewport,
+      pause,
+      waitUntil,
+      addInitScript,
+      on,
+      sessionSubscribe,
+      takeScreenshot,
+    },
+    emitBidi,
   }
 }
 

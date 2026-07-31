@@ -64,3 +64,16 @@ export function diffImageKey(
 ): string {
   return `${screenshotsKeyPrefix(projectId, uploadId)}${storyId}-diff.png`
 }
+
+/**
+ * Key of the best-effort failure-time screenshot captured when a story fails (issue #475).
+ * Failure context, not a baseline candidate. Lives under {@link screenshotsKeyPrefix}, so
+ * upload/project/account retention and delete-by-prefix cover it with no extra bookkeeping.
+ */
+export function failureScreenshotKey(
+  projectId: number | string,
+  uploadId: string,
+  storyId: string,
+): string {
+  return `${screenshotsKeyPrefix(projectId, uploadId)}${storyId}-failure.png`
+}

@@ -48,6 +48,24 @@ export function isInfraErrorKind(kind: string | null | undefined): boolean {
 }
 
 /**
+ * Per-story troubleshooting context captured by the worker when a test result fails
+ * (issue #475), stored in the `test_results.diagnostics` jsonb column. Only set when
+ * `changeStatus` is "failed"; NULL otherwise (and for rows written before the feature).
+ *
+ * All fields are hard-capped by the worker at write time (console tail length/entry size,
+ * pending-request count/URL length, and an overall serialized size budget), so readers can
+ * treat the payload as small.
+ */
+export interface TestResultDiagnostics {
+  /** Tail of the browser console (including page JS exceptions) leading up to the failure. */
+  consoleTail: { level: string; text: string; stampMs: number }[]
+  /** Network requests still in flight when the story failed, longest-pending first. */
+  pendingRequests: { url: string; pendingMs: number }[]
+  /** S3 object key of the best-effort failure-time screenshot, when one was captured. */
+  failureScreenshotKey?: string
+}
+
+/**
  * Status values for screenshot tests (builds)
  */
 export type ScreenshotTestStatus =
