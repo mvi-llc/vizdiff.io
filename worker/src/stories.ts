@@ -33,6 +33,91 @@ import type { SetViewportOptions, Story, StorybookWindow } from "./types"
 const SCREENSHOTS_UNCHANGED_TIMEOUT_MS = 10 * 1000
 const IMAGE_UNCHANGED_THRESHOLD = 0.001
 
+/**
+ * Per-session capture state (issue #474), keyed on the Browser object itself: BrowserPool's
+ * `replace()` swaps a brand-new Browser instance into the session, so state cached against the
+ * old instance is invalidated automatically (and garbage-collected via the WeakMap). The field
+ * set is intentionally minimal for now; a later PR adds navigation state for in-place story
+ * switching.
+ */
+export interface SessionCaptureState {
+  /** The viewport last applied via {@link setViewportCached}, for skipping redundant BiDi calls. */
+  lastViewport?: SetViewportOptions
+}
+
+const sessionCaptureState = new WeakMap<Browser, SessionCaptureState>()
+
+/** Returns the capture state for a browser session, creating it on first use. */
+export function getSessionCaptureState(browser: Browser): SessionCaptureState {
+  let state = sessionCaptureState.get(browser)
+  if (!state) {
+    state = {}
+    sessionCaptureState.set(browser, state)
+  }
+  return state
+}
+
+/**
+ * Viewport skip cache (issue #474): `browser.setViewport` is a BiDi round-trip even when the
+ * viewport is unchanged from the previous story — which is the common case, since most stories
+ * share the default viewport. Skips the call when the cached last-applied viewport matches, and
+ * updates the cache only after a successful call so a failed attempt is retried next time.
+ * Discovery-time setViewport calls (ingest/shard) deliberately do not go through this cache.
+ */
+async function setViewportCached(browser: Browser, viewport: SetViewportOptions): Promise<void> {
+  const state = getSessionCaptureState(browser)
+  const last = state.lastViewport
+  if (
+    last?.width === viewport.width &&
+    last.height === viewport.height &&
+    last.devicePixelRatio === viewport.devicePixelRatio
+  ) {
+    log.debug(
+      `Viewport unchanged (${viewport.width}x${viewport.height}@${viewport.devicePixelRatio}); skipping setViewport`,
+    )
+    return
+  }
+  await browser.setViewport(viewport)
+  state.lastViewport = { ...viewport }
+}
+
+/**
+ * Adaptive stabilization cadence (issue #474): how long to sleep before stabilization check
+ * `attempt` (1-based). The first check is sleep-free — after semantic readiness (issue #458) most
+ * stories are already settled, so the confirmation screenshot is taken ~two animation frames
+ * after the first (see {@link waitForTwoAnimationFrames}) instead of after an unconditional
+ * 250 ms pause. Only when a diff comes back nonzero (an animation or late layout shift) does the
+ * loop fall back to paced sleeps, backing off min(interval, 100) → interval → 2×interval (capped
+ * at 500 ms), with SCREENSHOTS_UNCHANGED_TIMEOUT_MS bounding the overall budget.
+ */
+function stabilizePauseMs(attempt: number): number {
+  if (attempt <= 1) {
+    return 0
+  }
+  if (attempt === 2) {
+    return Math.min(WORKER_STABILIZE_INTERVAL_MS, 100)
+  }
+  if (attempt === 3) {
+    return WORKER_STABILIZE_INTERVAL_MS
+  }
+  return Math.min(WORKER_STABILIZE_INTERVAL_MS * 2, 500)
+}
+
+/**
+ * Waits for two animation frames in the page — i.e. until the browser has had a chance to
+ * present a new frame — without any wall-clock sleep. WebdriverIO's BiDi `execute` awaits a
+ * returned promise, so this costs one round-trip (~a frame or two) instead of a fixed pause.
+ */
+async function waitForTwoAnimationFrames(browser: Browser): Promise<void> {
+  await browser.execute(async () => {
+    // @ts-expect-error: window is not defined
+    const w = window as { requestAnimationFrame: (cb: () => void) => void }
+    await new Promise<void>((resolve) => {
+      w.requestAnimationFrame(() => w.requestAnimationFrame(() => resolve()))
+    })
+  })
+}
+
 export type StoryInfo = {
   story: Story
   screenshotTest: ScreenshotTest
@@ -210,9 +295,9 @@ export async function captureStableScreenshot(
   let currentScreenshotPath = tempPath2
   let finalScreenshotBuffer: Buffer | undefined
 
-  // Set the initial viewport
+  // Set the initial viewport (skipped when unchanged from the previous story, issue #474)
   log.debug(`Setting initial viewport for ${storyId}: ${viewport.width}x${viewport.height}`)
-  await browser.setViewport(viewport)
+  await setViewportCached(browser, viewport)
 
   // Navigate to the story
   const storyUrl = `http://localhost:${port}/iframe.html?id=${storyId}` // Ensure port is used
@@ -222,7 +307,7 @@ export async function captureStableScreenshot(
   // Wait for the story's render lifecycle to complete (issue #458). Visual quiescence alone is
   // not enough: async/Suspense stories paint a loading fallback that reads as "stable".
   log.debug(`Waiting for story ${storyId} to render...`)
-  await waitForStoryReady(browser, story)
+  const readyResult = await waitForStoryReady(browser, story)
 
   // Inject CSS to remove Storybook's body padding
   log.debug(`Injecting CSS to remove body padding for story ${storyId}`)
@@ -244,10 +329,11 @@ export async function captureStableScreenshot(
 
   // Adjust the viewport for the story. This is a best-effort first pass; the layout may not be
   // settled yet, so the post-stabilization adjustment below is authoritative for tall content.
-  // The initial measurement is tracked so the post-stabilization re-measure can be skipped when
+  // The initial measurement rides the readiness snapshot (issue #474) instead of a separate
+  // execute round-trip, and is tracked so the post-stabilization re-measure can be skipped when
   // nothing suggested the layout was still moving (issue #456).
   log.debug(`Adjusting viewport for story ${storyId}`)
-  const initialContentHeight = await measureContentHeight(browser)
+  const initialContentHeight = readyResult.contentHeight
   let currentViewport: SetViewportOptions = {
     ...viewport,
     height: await adjustViewportForStory(browser, storyId, viewport, initialContentHeight),
@@ -260,12 +346,23 @@ export async function captureStableScreenshot(
 
   const startTime = Date.now()
   let stabilized = false
-  const MAX_ATTEMPTS = Math.ceil(SCREENSHOTS_UNCHANGED_TIMEOUT_MS / WORKER_STABILIZE_INTERVAL_MS)
+  // Attempts cap derived from the overall budget and the steady-state (post-backoff) pacing, as
+  // a backstop for the wall-clock check below (issue #474; the first attempt is sleep-free).
+  const MAX_ATTEMPTS =
+    1 + Math.ceil(SCREENSHOTS_UNCHANGED_TIMEOUT_MS / Math.max(stabilizePauseMs(4), 1))
   let attempts = 0
 
   while (attempts < MAX_ATTEMPTS && Date.now() - startTime < SCREENSHOTS_UNCHANGED_TIMEOUT_MS) {
     attempts++
-    await browser.pause(WORKER_STABILIZE_INTERVAL_MS)
+    const pauseMs = stabilizePauseMs(attempts)
+    if (pauseMs > 0) {
+      await browser.pause(pauseMs)
+    } else {
+      // Adaptive cadence (issue #474): the first confirmation is rAF-spaced and sleep-free — a
+      // settled story stabilizes on this attempt with zero pauses. Backoff sleeps only kick in
+      // when this first comparison reports the page still changing.
+      await waitForTwoAnimationFrames(browser)
+    }
     log.debug(`Taking stabilization screenshot attempt ${attempts}/${MAX_ATTEMPTS}...`)
 
     let currentScreenshotBuffer: Buffer<ArrayBuffer>
@@ -331,7 +428,7 @@ export async function captureStableScreenshot(
 
     // Not stable yet, check if we're approaching the timeout
     const timeRemaining = SCREENSHOTS_UNCHANGED_TIMEOUT_MS - (Date.now() - startTime)
-    if (timeRemaining < WORKER_STABILIZE_INTERVAL_MS) {
+    if (timeRemaining < stabilizePauseMs(attempts + 1)) {
       log.warn(`Approaching timeout for story ${storyId} stabilization, using last screenshot`)
       break
     }
@@ -381,7 +478,7 @@ export async function captureStableScreenshot(
             `${currentViewport.height} to ${fittedHeight} (content: ${settledContentHeight})`,
         )
         currentViewport = { ...currentViewport, height: fittedHeight }
-        await browser.setViewport(currentViewport)
+        await setViewportCached(browser, currentViewport)
         // Let the relayout settle, then capture the full-height screenshot.
         await browser.pause(WORKER_POST_LOAD_DELAY_MS)
         try {
@@ -1042,8 +1139,9 @@ async function adjustViewportForStory(
     log.error(
       `Failed to get content height for story ${storyId}. Using original height: ${originalHeight}`,
     )
-    // If measurement failed, ensure the viewport is at its original dimensions.
-    await browser.setViewport(viewport)
+    // If measurement failed, ensure the viewport is at its original dimensions (a no-op BiDi
+    // call when the cached viewport already matches, issue #474).
+    await setViewportCached(browser, viewport)
     return originalHeight
   }
   log.debug(`Content height for story ${storyId}: ${contentHeight}`)
@@ -1055,7 +1153,7 @@ async function adjustViewportForStory(
       `Adjusting viewport height for story ${storyId} from ${originalHeight} to ${finalHeight} ` +
         `(content: ${contentHeight})`,
     )
-    await browser.setViewport({
+    await setViewportCached(browser, {
       width: viewport.width,
       height: finalHeight,
       devicePixelRatio: viewport.devicePixelRatio,
