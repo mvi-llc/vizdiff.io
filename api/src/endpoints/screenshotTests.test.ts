@@ -108,7 +108,9 @@ describe("screenshot test endpoints", () => {
       // In-flight build with partial results: 3 distinct stories, "a" retried (upserted in place).
       countedBuildId = await createBuild(3, "running", 6, ["a", "a", "b", "c"])
       // In-flight build with a worker identity and a ~5s-old progress heartbeat (issue #477).
-      heartbeatBuildId = await createBuild(4, "running", 6, ["a"], {
+      // No test results: the get endpoint presigns image URLs for every result, and the test
+      // environment has no S3 region configured ("Region is missing" in CI).
+      heartbeatBuildId = await createBuild(4, "running", 6, [], {
         workerId: "worker-1",
         lastProgressAt: new Date(Date.now() - HEARTBEAT_AGE_MS),
       })
