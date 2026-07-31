@@ -27,6 +27,7 @@ import {
   S3_BUCKET_NAME,
   S3_CLIENT_CONFIG,
   WORKER_CHROME_EXTRA_ARGS,
+  WORKER_EGRESS_BLOCK_MODE,
   WORKER_ENABLE_WEBGL,
   WORKER_FATAL_FAILSAFE_TIMEOUT_MS,
   WORKER_FINALIZE_CONCURRENCY,
@@ -536,7 +537,14 @@ function buildWdioConfig(outputDir: string): Capabilities.WebdriverIOConfig {
         // (issue #447). See `safeguards.ts`.
         args: hardenedChromeArgs(
           ["--headless", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-          { enableWebgl: WORKER_ENABLE_WEBGL, extraArgs: WORKER_CHROME_EXTRA_ARGS },
+          {
+            enableWebgl: WORKER_ENABLE_WEBGL,
+            // "resolver" (the default) blocks off-origin egress at the DNS layer for every
+            // context — the fix for the #473 interception wedge. chromedriver launches a
+            // fresh Chrome per session from these args, so the rules apply per session.
+            egressBlockMode: WORKER_EGRESS_BLOCK_MODE,
+            extraArgs: WORKER_CHROME_EXTRA_ARGS,
+          },
         ),
       },
     },
@@ -1095,13 +1103,18 @@ export async function runRenderChunk(
     // Start a local server to serve the (cached) Storybook files
     const { server, port } = await startStaticServer(storybookDir)
     try {
-      // Install the hard network egress boundary on EVERY pooled session (see ingest.ts):
-      // must run before navigating to any untrusted story; replacement sessions get the same
-      // boundary via the pool's session-init callback.
+      // Install the network egress boundary on EVERY pooled session (see ingest.ts): must run
+      // before navigating to any untrusted story; replacement sessions get the same boundary
+      // via the pool's session-init callback. In the default "resolver" mode this is a no-op
+      // (enforcement lives in the Chrome launch args); interception modes install per session.
       const origin = `http://localhost:${port}`
-      pool.setSessionInit((browser) => installNetworkEgressBlock(browser, origin))
+      pool.setSessionInit((browser) =>
+        installNetworkEgressBlock(browser, origin, WORKER_EGRESS_BLOCK_MODE),
+      )
       await Promise.all(
-        pool.sessions.map((session) => installNetworkEgressBlock(session.browser, origin)),
+        pool.sessions.map((session) =>
+          installNetworkEgressBlock(session.browser, origin, WORKER_EGRESS_BLOCK_MODE),
+        ),
       )
 
       const primarySession = pool.sessions[0]

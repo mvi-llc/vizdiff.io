@@ -48,6 +48,22 @@ Options:
                         a dedicated Worker that fetches a same-origin binary and only signals
                         readiness (parameters.useReadySignal) from the worker's onmessage —
                         exercising worker-owned network requests end to end (issue #473)
+  --font-stories N      Number of additional font-loading story PAIRS (default: 2; each pair is
+                        a light+dark story id, so N pairs add 2N stories). Even pairs load a real
+                        same-origin woff2 via page-scope FontFace/document.fonts; odd pairs load
+                        it from a dedicated worker's scope (self.fonts + OffscreenCanvas text
+                        draw). Readiness is only signaled once the font load SETTLES — the #473
+                        production wedge was same-origin font fetches paused forever by the
+                        egress interceptor, so these stories fail ready-signal-timeout when that
+                        regresses. Every story id busts the font cache with its own ?copy= query
+                        param, mirroring production's concurrent dual-render font requests
+  --canary-stories N    Number of egress-canary stories (default: 1). Each spawns a dedicated
+                        worker that fetches http://example.com/ (a hostname, from worker scope —
+                        outside the page init-script guard, so only the network-layer egress
+                        control can block it) and only signals readiness if that fetch is
+                        BLOCKED (fails fast). It also probes an IP-literal URL and logs the
+                        outcome to the console for empirical documentation. If off-origin egress
+                        is open (or the block wedges the request), the story fails
   --budget-seconds S    Fail if the build is not terminal within S seconds (default: 300;
                         use >= 1800 with --kill-worker so the recovery path has time to act)
   --api-url URL         Base URL of the vizdiff api (default: http://localhost:3001)
@@ -91,6 +107,8 @@ function parseArgs(argv) {
   const opts = {
     stories: 743,
     workerStories: 1,
+    fontStories: 2,
+    canaryStories: 1,
     budgetSeconds: 300,
     apiUrl: "http://localhost:3001",
     token: undefined,
@@ -116,6 +134,12 @@ function parseArgs(argv) {
         break
       case "--worker-stories":
         opts.workerStories = parseInt(next(), 10)
+        break
+      case "--font-stories":
+        opts.fontStories = parseInt(next(), 10)
+        break
+      case "--canary-stories":
+        opts.canaryStories = parseInt(next(), 10)
         break
       case "--budget-seconds":
         opts.budgetSeconds = parseInt(next(), 10)
@@ -167,6 +191,12 @@ function parseArgs(argv) {
   }
   if (!Number.isInteger(opts.workerStories) || opts.workerStories < 0) {
     fail("--worker-stories must be a non-negative integer", 2)
+  }
+  if (!Number.isInteger(opts.fontStories) || opts.fontStories < 0) {
+    fail("--font-stories must be a non-negative integer", 2)
+  }
+  if (!Number.isInteger(opts.canaryStories) || opts.canaryStories < 0) {
+    fail("--canary-stories must be a non-negative integer", 2)
   }
   if (!Number.isInteger(opts.budgetSeconds) || opts.budgetSeconds < 1) {
     fail("--budget-seconds must be a positive integer", 2)
@@ -307,6 +337,27 @@ function psql(opts, sql) {
  * interception cannot settle — the regression class where worker-backed stories died at the
  * ready-signal timeout.
  *
+ * It also includes `fontStoryPairs` font-loading story PAIRS (issue #473, the production wedge):
+ * production diagnostics showed the egress interceptor pausing SAME-ORIGIN woff2 fetches issued
+ * through Chromium's font resource path (`FontFace`/`document.fonts`, page and worker scope)
+ * forever — `network.continueRequest` fails with "'Fetch.continueRequest' wasn't found" — while
+ * plain `fetch()` from the same contexts continued fine. Each pair is a light+dark story id
+ * (mirroring production's dual-render churn: 2-4 concurrent requests for the same font file);
+ * even pairs load `assets/test-font.woff2` via page-scope `FontFace` + `document.fonts`, odd
+ * pairs load it inside a dedicated worker (`self.fonts` + OffscreenCanvas text draw, falling
+ * back to a worker-scope fetch when FontFace is unavailable in worker scope). Every story id
+ * appends its own `?copy=` query param so each copy issues a real network request instead of
+ * hitting the memory cache. Readiness is only signaled once the font load SETTLES (resolve or
+ * reject — the #473 failure mode is "never settles", so a wedged font fails the story at the
+ * ready-signal timeout while a font that merely fails to parse does not).
+ *
+ * Finally, `canaryStoryCount` egress-canary stories verify the egress control still BLOCKS
+ * off-origin traffic: a dedicated worker (worker scope is outside the page init-script guard,
+ * so only the network-layer control applies) fetches `http://example.com/` and the story only
+ * signals ready when that fetch fails fast. It also probes an IP-literal URL and logs the
+ * outcome (blocked/allowed/timeout) to the console for empirical documentation of resolver-mode
+ * coverage. An open egress path — or a block that wedges instead of failing — fails the story.
+ *
  * By default the fixture also exposes a minimal `window.__STORYBOOK_ADDONS_CHANNEL__` whose
  * `emit("setCurrentStory", ...)` re-renders the requested story in place and channel-emits
  * `storyRendered` — exercising the worker's in-place story switching (issue #474 Phase B). The
@@ -316,21 +367,47 @@ function psql(opts, sql) {
  * generated instead: only the synchronous `?id=` render exists, so the worker's soft-switch
  * probe finds no channel and hard-navigates every story (the fallback-ladder path).
  */
-function fixtureIframeHtml(storyCount, workerStoryCount, { legacy = false } = {}) {
+function fixtureIframeHtml(
+  storyCount,
+  workerStoryCount,
+  fontStoryPairs,
+  canaryStoryCount,
+  { legacy = false } = {},
+) {
   return `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <title>vizdiff e2e scale fixture${legacy ? " (legacy)" : ""}</title>
-<style>html, body { margin: 0; padding: 0; background: #ffffff; }</style>
+${
+    fontStoryPairs > 0
+      ? `<!-- Boot-time font load (issue #473): production storybooks request their app font via
+     CSS @font-face + preload DURING document navigation/parse — the earliest interception
+     window, where the egress interceptor wedged same-origin font fetches. Font stories below
+     also gate on this "VizdiffBoot" family, so a wedged boot request fails them. -->
+<link rel="preload" href="assets/test-font.woff2?boot" as="font" type="font/woff2" crossorigin>
+<style>
+@font-face { font-family: "VizdiffBoot"; src: url("assets/test-font.woff2?boot") format("woff2"); }
+.vizdiff-boot-font { font-family: "VizdiffBoot", monospace; }
+</style>
+`
+      : ""
+  }<style>html, body { margin: 0; padding: 0; background: #ffffff; }</style>
 </head>
 <body>
-<div id="storybook-root"></div>
+${
+    fontStoryPairs > 0
+      ? `<span class="vizdiff-boot-font" style="position:absolute;left:-9999px;top:0">boot</span>
+`
+      : ""
+  }<div id="storybook-root"></div>
 <script>
 (function () {
   "use strict";
   var STORY_COUNT = ${storyCount};
   var WORKER_STORY_COUNT = ${workerStoryCount};
+  var FONT_STORY_PAIRS = ${fontStoryPairs};
+  var CANARY_STORY_COUNT = ${canaryStoryCount};
 
   var stories = {};
   for (var i = 0; i < STORY_COUNT; i++) {
@@ -359,7 +436,53 @@ function fixtureIframeHtml(storyCount, workerStoryCount, { legacy = false } = {}
       importPath: "./stories/e2e-scale-worker.stories.js",
       componentPath: "",
       tags: ["story"],
-      parameters: { useReadySignal: true }
+      parameters: { useReadySignal: true, fixture: { type: "worker-fetch" } }
+    };
+  }
+  // Font-loading stories (issue #473, the production wedge): each pair is a light+dark story id;
+  // even pairs load the woff2 page-scope (FontFace + document.fonts), odd pairs load it from a
+  // dedicated worker's scope. Every id busts the font cache with its own ?copy= param so each
+  // copy issues a real request (production showed 2-4 concurrent copies of one font wedging).
+  for (var fi = 0; fi < FONT_STORY_PAIRS; fi++) {
+    var fontScope = fi % 2 === 0 ? "page" : "worker";
+    var variants = ["light", "dark"];
+    for (var vi = 0; vi < variants.length; vi++) {
+      var variant = variants[vi];
+      var fid = "e2e-scale-font--" + fontScope + "-" + fi + "-" + variant;
+      stories[fid] = {
+        id: fid,
+        kind: "E2E/Scale/Font",
+        title: "E2E/Scale/Font",
+        name: "Font" + fontScope.charAt(0).toUpperCase() + fontScope.slice(1) + fi +
+          variant.charAt(0).toUpperCase() + variant.slice(1),
+        importPath: "./stories/e2e-scale-font.stories.js",
+        componentPath: "",
+        tags: ["story"],
+        parameters: {
+          useReadySignal: true,
+          fixture: {
+            type: "font-" + fontScope,
+            theme: variant,
+            fontUrl: "assets/test-font.woff2?copy=" + fontScope + "-" + fi + "-" + variant
+          }
+        }
+      };
+    }
+  }
+  // Egress-canary stories (issue #473): a dedicated worker fetches an off-origin hostname; the
+  // story only becomes ready if that fetch is blocked (fails fast). Worker scope deliberately —
+  // the page init-script guard does not run in workers, so this exercises the network layer.
+  for (var ci = 0; ci < CANARY_STORY_COUNT; ci++) {
+    var cid = "e2e-scale-canary--egress-canary-" + ci;
+    stories[cid] = {
+      id: cid,
+      kind: "E2E/Scale/Canary",
+      title: "E2E/Scale/Canary",
+      name: "EgressCanary" + ci,
+      importPath: "./stories/e2e-scale-canary.stories.js",
+      componentPath: "",
+      tags: ["story"],
+      parameters: { useReadySignal: true, fixture: { type: "canary" } }
     };
   }
 
@@ -370,6 +493,120 @@ function fixtureIframeHtml(storyCount, workerStoryCount, { legacy = false } = {}
       h = ((h ^ id.charCodeAt(i)) * 16777619) >>> 0;
     }
     return "rgb(" + (h & 255) + "," + ((h >> 8) & 255) + "," + ((h >> 16) & 255) + ")";
+  }
+
+  // Story-type-specific async behavior, shared by both fixture variants (legacy hard-nav and
+  // channel). All of these gate the explicit ready signal (parameters.useReadySignal) on async
+  // work settling, so a wedged network request fails the story at the ready-signal timeout.
+  function renderStoryExtras(story, div) {
+    // Ambient font load (issue #473): when the fixture carries font stories, EVERY story kicks
+    // off a non-blocking FontFace load it never awaits — mirroring production storybooks where
+    // most stories reference the app font via CSS without gating readiness on it, so font
+    // requests are routinely still in flight when the harness switches/navigates to the next
+    // story. That in-flight-at-teardown overlap is the load pattern under which the egress
+    // interceptor wedged font fetches in production. Per-story ?ambient= busting guarantees a
+    // real request per story rather than a memory-cache hit.
+    if (FONT_STORY_PAIRS > 0) {
+      try {
+        var ambient = new FontFace(
+          "VizdiffAmbient-" + story.id,
+          "url(assets/test-font.woff2?ambient=" + encodeURIComponent(story.id) + ")"
+        );
+        document.fonts.add(ambient);
+        ambient.load().catch(function () { /* non-gating by design */ });
+      } catch (ambientErr) { /* non-gating by design */ }
+    }
+
+    var fixture = story.parameters && story.parameters.fixture;
+    if (!fixture) { return; }
+
+    if (fixture.type === "worker-fetch") {
+      // Dedicated Worker fetches a same-origin binary and postMessages back (issue #473).
+      var worker = new Worker("worker-fixture.js");
+      worker.onmessage = function (event) {
+        if (event.data && event.data.ok) {
+          div.textContent = story.title + " / " + story.name +
+            " (worker ok, " + event.data.bytes + " bytes)";
+          window.__VIZDIFF_STORY_READY__ = true;
+        } else {
+          div.textContent = story.title + " / " + story.name +
+            " (worker error: " + (event.data && event.data.error) + ")";
+          // Ready signal deliberately NOT set: a failed worker fetch must fail the story.
+        }
+      };
+    } else if (fixture.type === "font-page") {
+      // Page-scope FontFace load through Chromium's font resource path — the request class the
+      // production egress interceptor wedged (#473). Ready on SETTLE (then/catch): the failure
+      // mode is "never settles", not "rejects".
+      if (fixture.theme === "dark") {
+        div.style.background = "#1a1a2a";
+      }
+      var famName = "VizdiffTest-" + story.name;
+      var startedMs = Date.now();
+      var face = new FontFace(famName, "url(" + fixture.fontUrl + ")");
+      document.fonts.add(face);
+      // Two gates, both required to SETTLE before ready (a settled-but-rejected load is visible
+      // in the console and the rendered text; only a wedged, never-settling load should time the
+      // story out): the story's own cache-busted FontFace load, and the document's boot-time
+      // "VizdiffBoot" family — production font-gated stories wait on the app font requested at
+      // document boot, so a wedged boot request must fail these stories too.
+      var uniqueSettled = face.load().then(
+        function () { return "unique:loaded"; },
+        function (err) {
+          console.error("vizdiff fixture: page-scope font load FAILED for " + story.id + ": " + err);
+          return "unique:FAILED(" + err + ")";
+        }
+      );
+      var bootSettled = document.fonts.load('16px "VizdiffBoot"').then(
+        function (faces) { return faces.length > 0 ? "boot:loaded" : "boot:empty"; },
+        function (err) {
+          console.error("vizdiff fixture: boot font load FAILED for " + story.id + ": " + err);
+          return "boot:FAILED(" + err + ")";
+        }
+      );
+      Promise.all([uniqueSettled, bootSettled]).then(function (results) {
+        div.style.fontFamily = '"' + famName + '", monospace';
+        div.textContent = story.title + " / " + story.name +
+          " (" + results.join(", ") + " in " + (Date.now() - startedMs) + "ms)";
+        window.__VIZDIFF_STORY_READY__ = true;
+      });
+    } else if (fixture.type === "font-worker") {
+      // Same font, loaded from a DEDICATED WORKER's scope (self.fonts + OffscreenCanvas text
+      // draw, or a worker-scope fetch fallback). Ready on settle, reported via postMessage.
+      if (fixture.theme === "dark") {
+        div.style.background = "#1a1a2a";
+      }
+      var fontWorker = new Worker("font-worker.js");
+      fontWorker.onmessage = function (event) {
+        var data = event.data || {};
+        div.textContent = story.title + " / " + story.name +
+          " (worker font " + (data.ok ? "ok" : "FAILED") + ", mode=" + data.mode +
+          (data.error ? ", error=" + data.error : "") + ")";
+        if (!data.ok) {
+          console.error("vizdiff fixture: worker-scope font load FAILED for " + story.id +
+            ": mode=" + data.mode + " error=" + data.error);
+        }
+        // Ready on settle (the message IS the settle); see font-page above.
+        window.__VIZDIFF_STORY_READY__ = true;
+      };
+      fontWorker.postMessage({ fontUrl: fixture.fontUrl });
+    } else if (fixture.type === "canary") {
+      // Off-origin egress canary from worker scope (outside the page init-script guard). Ready
+      // ONLY when the off-origin hostname fetch was blocked (failed fast); an open egress path
+      // or a wedged block fails the story at the ready-signal timeout.
+      var canaryWorker = new Worker("canary-worker.js");
+      canaryWorker.onmessage = function (event) {
+        var probes = event.data || {};
+        var host = probes.hostProbe || {};
+        var ip = probes.ipProbe || {};
+        console.log("vizdiff fixture: egress canary result " + JSON.stringify(probes));
+        div.textContent = story.title + " / " + story.name +
+          " (host probe: " + host.outcome + ", ip probe: " + ip.outcome + ")";
+        if (host.outcome === "blocked") {
+          window.__VIZDIFF_STORY_READY__ = true;
+        }
+      };
+    }
   }
 
   var preview = {
@@ -406,24 +643,11 @@ ${
     // Semantic render-completion signal (worker/src/storyReady.ts polls currentRender.phase).
     preview.currentRender = { id: storyId, phase: "completed" };
 
-    // Worker-backed story (issue #473): render completes immediately (above), but the explicit
-    // ready signal (parameters.useReadySignal) is only set once a dedicated Worker has fetched
-    // worker-data.bin and posted back — mirroring chart.js-in-OffscreenCanvas storybooks whose
-    // readiness depends on worker-owned network requests.
-    if (story.parameters && story.parameters.useReadySignal) {
-      var worker = new Worker("worker-fixture.js");
-      worker.onmessage = function (event) {
-        if (event.data && event.data.ok) {
-          div.textContent = story.title + " / " + story.name +
-            " (worker ok, " + event.data.bytes + " bytes)";
-          window.__VIZDIFF_STORY_READY__ = true;
-        } else {
-          div.textContent = story.title + " / " + story.name +
-            " (worker error: " + (event.data && event.data.error) + ")";
-          // Ready signal deliberately NOT set: a failed worker fetch must fail the story.
-        }
-      };
-    }
+    // Async story types (worker-fetch/font/canary, issue #473): render completes immediately
+    // (above), but the explicit ready signal (parameters.useReadySignal) is only set once the
+    // story's async work settles — mirroring storybooks whose readiness depends on worker-owned
+    // or font-resource network requests.
+    renderStoryExtras(story, div);
   }`
       : `  // Renders a story into the root, updates currentRender, and channel-emits storyRendered —
   // shared by the initial ?id= hard-navigation load and in-place setCurrentStory switches
@@ -453,26 +677,11 @@ ${
     preview.currentRender = { id: storyId, phase: "completed" };
     window.__STORYBOOK_ADDONS_CHANNEL__.emit("storyRendered", storyId);
 
-    // Worker-backed story (issue #473): render completes immediately (above), but the explicit
-    // ready signal (parameters.useReadySignal) is only set once a dedicated Worker has fetched
-    // worker-data.bin and posted back — mirroring chart.js-in-OffscreenCanvas storybooks whose
-    // readiness depends on worker-owned network requests. Works in both navigation modes: a
-    // soft switch re-arms __VIZDIFF_STORY_READY__ via the init script's reset() before the
-    // switch is emitted.
-    if (story.parameters && story.parameters.useReadySignal) {
-      var worker = new Worker("worker-fixture.js");
-      worker.onmessage = function (event) {
-        if (event.data && event.data.ok) {
-          div.textContent = story.title + " / " + story.name +
-            " (worker ok, " + event.data.bytes + " bytes)";
-          window.__VIZDIFF_STORY_READY__ = true;
-        } else {
-          div.textContent = story.title + " / " + story.name +
-            " (worker error: " + (event.data && event.data.error) + ")";
-          // Ready signal deliberately NOT set: a failed worker fetch must fail the story.
-        }
-      };
-    }
+    // Async story types (worker-fetch/font/canary, issue #473): render completes immediately
+    // (above), but the explicit ready signal (parameters.useReadySignal) is only set once the
+    // story's async work settles. Works in both navigation modes: a soft switch re-arms
+    // __VIZDIFF_STORY_READY__ via the init script's reset() before the switch is emitted.
+    renderStoryExtras(story, div);
   }
 
   // Minimal Storybook preview channel (issue #474): assigned AFTER the worker's init script has
@@ -519,20 +728,156 @@ fetch("worker-data.bin")
 `
 }
 
-function buildFixtureTarball(storyCount, workerStoryCount, { legacy = false } = {}) {
+/**
+ * Dedicated-worker script for the font-loading stories (issue #473): load the same-origin woff2
+ * IN WORKER SCOPE via `self.fonts` + FontFace (Chromium supports FontFace in workers for
+ * OffscreenCanvas text), draw text to an OffscreenCanvas so the font is actually used, and post
+ * the settle result. Falls back to a plain worker-scope `fetch` of the woff2 when FontFace is
+ * unavailable in worker scope.
+ */
+function fixtureFontWorkerJs() {
+  return `"use strict";
+self.onmessage = function (event) {
+  var fontUrl = event.data && event.data.fontUrl;
+  var report = function (msg) { self.postMessage(msg); };
+  try {
+    if (typeof FontFace === "function" && self.fonts && typeof self.fonts.add === "function") {
+      var face = new FontFace("VizdiffTestWorker", "url(" + fontUrl + ")");
+      self.fonts.add(face);
+      face.load().then(function () {
+        try {
+          var canvas = new OffscreenCanvas(240, 60);
+          var ctx = canvas.getContext("2d");
+          ctx.font = "24px VizdiffTestWorker";
+          ctx.fillText("VizdiffTest", 8, 36);
+        } catch (drawErr) {
+          // Text draw is best-effort; the load itself is what #473 exercises.
+        }
+        report({ ok: true, mode: "worker-fontface" });
+      }).catch(function (err) {
+        // Settled (rejected): NOT the #473 wedge, but still a failed load — report it.
+        report({ ok: false, mode: "worker-fontface", error: String(err) });
+      });
+    } else {
+      fetch(fontUrl)
+        .then(function (res) {
+          if (!res.ok) { throw new Error("HTTP " + res.status); }
+          return res.arrayBuffer();
+        })
+        .then(function (buf) { report({ ok: true, mode: "worker-fetch", bytes: buf.byteLength }); })
+        .catch(function (err) { report({ ok: false, mode: "worker-fetch", error: String(err) }); });
+    }
+  } catch (err) {
+    report({ ok: false, mode: "worker-error", error: String(err) });
+  }
+};
+`
+}
+
+/**
+ * Dedicated-worker script for the egress-canary stories (issue #473): probe an off-origin
+ * HOSTNAME (http://example.com/ — resolver-level egress blocking works by hostname, so this is
+ * the URL class it must block) and an off-origin IP LITERAL (documentation-range TEST-NET-3,
+ * which DNS-level blocking cannot see; the outcome is logged for empirical documentation).
+ * Worker scope deliberately: the page init-script guard does not run in dedicated workers, so
+ * only the network-layer egress control stands between this fetch and the wire.
+ */
+function fixtureCanaryWorkerJs() {
+  return `"use strict";
+function probe(url, timeoutMs) {
+  return new Promise(function (resolve) {
+    var controller = new AbortController();
+    var startedMs = Date.now();
+    var timer = setTimeout(function () { controller.abort(); }, timeoutMs);
+    // no-cors so a reachable cross-origin host reads as "allowed" (opaque response) instead of
+    // being masked by a CORS read failure.
+    fetch(url, { signal: controller.signal, mode: "no-cors", cache: "no-store" })
+      .then(function (res) {
+        clearTimeout(timer);
+        resolve({ outcome: "allowed", status: res.status, ms: Date.now() - startedMs });
+      })
+      .catch(function (err) {
+        clearTimeout(timer);
+        resolve({
+          outcome: controller.signal.aborted ? "timeout" : "blocked",
+          error: String(err),
+          ms: Date.now() - startedMs
+        });
+      });
+  });
+}
+Promise.all([
+  probe("http://example.com/vizdiff-egress-canary", 8000),
+  probe("http://203.0.113.7/vizdiff-egress-canary", 4000)
+]).then(function (results) {
+  self.postMessage({ hostProbe: results[0], ipProbe: results[1] });
+});
+`
+}
+
+/**
+ * A real, valid 512-byte woff2 ("VizdiffTest" family: box glyphs for a handful of ASCII letters,
+ * built with fontTools) used as the last-resort font payload when no woff2 is found in
+ * node_modules. Chromium's OTS sanitizer accepts it, so FontFace.load() resolves.
+ */
+const EMBEDDED_TEST_FONT_WOFF2_BASE64 =
+  "d09GMgABAAAAAAIAAAoAAAAABvwAAAG1AAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAABmAAgRAKhiCDZAE2AiQDMgsuAAQgB" +
+  "YIOB04b2wQAPgxvjNCOJTIED4YQMqLwynn9fUPoqLjp0o3igX6s9b6sakY9QVKfTtISGBIpXakXaZR2otMt7tW29pghU0" +
+  "VDoZoltU9iXhIxPJHsbjXGnMKMXzVe8oJC5mjqanN84VrrJ96z91V4HP9TN7UJEvifB1gUhdamQPNAomgs3KRrgOULNOD" +
+  "IEl5iGpSeXRoLyeXpmxjFGaX1HHoFGZgBvN0KjHne4qiMHO9wlDEQkdCXBPRlL8BQW1I05khjYGVr7+zhNxizq9FZ1IiT" +
+  "241g9OXtI4yeYJQAaOuCrj4oG6hpquvq6GlpgyFYwhw+AO+ADCCShc4FaoVGvmvgdU1tfdL7A7SRP2jYhpdDZmW4SS0nW" +
+  "RL6WfNJTybT9ebG3uxaDBAQ+L9cwvxllH7Dz/d6Xp944h9JBIHbrMbrgI5yIJBTVaslfW0FpwOGyiJ0KnLZEwRoDaZHJb" +
+  "U5yHq6cHF6WhK6IhjaDBA1XYFsxi1cNLx2299iu1o9g+Q+JzOv+oiJS1cIOls/C1srK42lu4fK0drTwZQvvNjopAgYKMM" +
+  "z22vKtBmz5szbcmHIF1Kc6AxUSq2MDgA="
+
+/**
+ * Resolves the woff2 payload shipped as `assets/test-font.woff2`: prefer a REAL font from the
+ * repo's node_modules (the `storybook` package ships Nunito Sans), falling back to the embedded
+ * minimal-but-valid woff2 above so the fixture works on a checkout without node_modules.
+ */
+function resolveTestFontBytes() {
+  const candidates = [
+    path.join(REPO_ROOT, "node_modules", "storybook", "assets", "browser", "nunito-sans-regular.woff2"),
+  ]
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return { bytes: fs.readFileSync(candidate), source: candidate }
+    }
+  }
+  return {
+    bytes: Buffer.from(EMBEDDED_TEST_FONT_WOFF2_BASE64, "base64"),
+    source: "embedded VizdiffTest woff2",
+  }
+}
+
+function buildFixtureTarball(
+  storyCount,
+  workerStoryCount,
+  fontStoryPairs,
+  canaryStoryCount,
+  { legacy = false } = {},
+) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vizdiff-e2e-scale-"))
   fs.writeFileSync(
     path.join(dir, "iframe.html"),
-    fixtureIframeHtml(storyCount, workerStoryCount, { legacy }),
+    fixtureIframeHtml(storyCount, workerStoryCount, fontStoryPairs, canaryStoryCount, { legacy }),
   )
   fs.writeFileSync(
     path.join(dir, "index.html"),
     "<!doctype html><title>vizdiff e2e scale fixture</title>\n",
   )
-  // Always shipped, even with --worker-stories 0, so the fixture layout is stable.
+  // Always shipped, even when the corresponding story count is 0, so the fixture layout is
+  // stable.
   fs.writeFileSync(path.join(dir, "worker-fixture.js"), fixtureWorkerJs())
+  fs.writeFileSync(path.join(dir, "font-worker.js"), fixtureFontWorkerJs())
+  fs.writeFileSync(path.join(dir, "canary-worker.js"), fixtureCanaryWorkerJs())
   // Deterministic 64-byte binary payload for the worker's fetch.
   fs.writeFileSync(path.join(dir, "worker-data.bin"), Buffer.alloc(64, 0x56)) // "V"
+  // Real woff2 payload for the font-loading stories (issue #473).
+  fs.mkdirSync(path.join(dir, "assets"), { recursive: true })
+  const font = resolveTestFontBytes()
+  fs.writeFileSync(path.join(dir, "assets", "test-font.woff2"), font.bytes)
+  log(`Fixture font: ${font.source} (${font.bytes.length} bytes)`)
   const tarballPath = path.join(dir, "storybook.tar.gz")
   // Root layout: the worker extracts to the static-server root and loads /iframe.html, so
   // iframe.html must sit at the top of the archive (no wrapping directory).
@@ -544,7 +889,10 @@ function buildFixtureTarball(storyCount, workerStoryCount, { legacy = false } = 
     "iframe.html",
     "index.html",
     "worker-fixture.js",
+    "font-worker.js",
+    "canary-worker.js",
     "worker-data.bin",
+    "assets/test-font.woff2",
   ])
   return { dir, tarballPath }
 }
@@ -632,11 +980,13 @@ async function main() {
     )
   }
 
-  // Worker-backed stories are additional to --stories; every count assertion below uses the total.
-  const totalStories = opts.stories + opts.workerStories
+  // Worker/font/canary stories are additional to --stories; every count assertion below uses the
+  // total (each font "story" is a light+dark PAIR of story ids).
+  const totalStories =
+    opts.stories + opts.workerStories + 2 * opts.fontStories + opts.canaryStories
 
   console.log(`vizdiff e2e scale harness (issue #456)
-  stories:        ${opts.stories} plain + ${opts.workerStories} worker-backed = ${totalStories}
+  stories:        ${opts.stories} plain + ${opts.workerStories} worker-backed + ${2 * opts.fontStories} font (${opts.fontStories} pairs) + ${opts.canaryStories} canary = ${totalStories}
   budget:         ${opts.budgetSeconds}s
   api:            ${opts.apiUrl}
   kill-worker:    ${opts.killWorker ? "yes" : "no"}
@@ -665,11 +1015,15 @@ async function main() {
   // 2. Fixture.
   log(
     `Generating static storybook fixture (${opts.stories} plain + ${opts.workerStories} ` +
-      `worker-backed stories)...`,
+      `worker-backed + ${2 * opts.fontStories} font + ${opts.canaryStories} canary stories)...`,
   )
-  const { dir, tarballPath } = buildFixtureTarball(opts.stories, opts.workerStories, {
-    legacy: opts.legacyFixture,
-  })
+  const { dir, tarballPath } = buildFixtureTarball(
+    opts.stories,
+    opts.workerStories,
+    opts.fontStories,
+    opts.canaryStories,
+    { legacy: opts.legacyFixture },
+  )
   const tarball = fs.readFileSync(tarballPath)
   log(`Fixture tarball: ${tarballPath} (${(tarball.length / 1024).toFixed(1)} KiB)`)
 

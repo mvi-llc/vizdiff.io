@@ -126,6 +126,44 @@ export const WORKER_CHANGED_THRESHOLD =
 // regression well.
 export const WORKER_ENABLE_WEBGL = process.env.WORKER_ENABLE_WEBGL === "true"
 
+// --- Network egress blocking mode (issue #473) --------------------------------------------------
+// How the worker prevents untrusted story bundles from exfiltrating data over the network:
+//
+//   "resolver"  (default) Block off-origin traffic at the DNS layer: screenshot sessions launch
+//               Chrome with `--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost`, so every
+//               non-localhost hostname fails to resolve in every context (pages, dedicated/shared/
+//               service workers, fonts, CSS/img subresources) and nothing is ever intercepted or
+//               paused. This fixed #473: the BiDi request interceptor wedged requests owned by
+//               dedicated-worker targets ("'Fetch.continueRequest' wasn't found"), leaving
+//               same-origin font/worker fetches paused forever and failing the story at the
+//               ready-signal timeout. Empirically (Chromium 150) the rules also apply to
+//               IP-LITERAL URLs (ERR_NAME_NOT_RESOLVED); the remaining gap is the "localhost"
+//               hostname itself, any port (see safeguards.ts).
+//   "intercept" The pre-#473 behavior: a BiDi network intercept pauses EVERY request and fails
+//               off-origin ones. Kept as an escape hatch; known to wedge worker-owned requests
+//               under load (issue #473). (A top-level-context-scoped variant was measured and
+//               wedges identically — worker-owned requests are attributed to their owning
+//               frame's context — so it is not offered.)
+//   "off"       No network-layer egress control at all (page init-script guard and Chrome
+//               hardening flags remain). A documented last-resort workaround.
+//
+// Invalid values fall back to the default; the worker logs a startup warning (see worker.ts).
+const EGRESS_BLOCK_MODES = ["resolver", "intercept", "off"] as const
+export type WorkerEgressBlockMode = (typeof EGRESS_BLOCK_MODES)[number]
+const rawEgressBlockMode = (process.env.WORKER_EGRESS_BLOCK_MODE ?? "").trim().toLowerCase()
+export const WORKER_EGRESS_BLOCK_MODE: WorkerEgressBlockMode = (
+  EGRESS_BLOCK_MODES as readonly string[]
+).includes(rawEgressBlockMode)
+  ? (rawEgressBlockMode as WorkerEgressBlockMode)
+  : "resolver"
+// Set when WORKER_EGRESS_BLOCK_MODE held an unrecognized value (environment.ts cannot import the
+// logger — log.ts imports environment.ts — so worker startup surfaces the warning).
+export const WORKER_EGRESS_BLOCK_MODE_INVALID: string | undefined =
+  rawEgressBlockMode !== "" &&
+  !(EGRESS_BLOCK_MODES as readonly string[]).includes(rawEgressBlockMode)
+    ? rawEgressBlockMode
+    : undefined
+
 // Whitespace-separated extra Chrome flags appended to the screenshot session launch args, after
 // the hardening and WebGL flags (issue #447). An operator escape hatch for browser tuning without
 // an image rebuild. Appending can only add flags, not remove the hardening set; use

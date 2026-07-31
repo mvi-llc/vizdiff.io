@@ -1,10 +1,12 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { Browser } from "webdriverio"
 
+import { log } from "./log"
 import {
   DISABLE_WEBGL_CHROME_ARGS,
   ENABLE_WEBGL_CHROME_ARGS,
   HARDENING_CHROME_ARGS,
+  RESOLVER_EGRESS_CHROME_ARGS,
   hardenedChromeArgs,
   installBrowserSafeguards,
   installNetworkEgressBlock,
@@ -52,6 +54,25 @@ describe("hardenedChromeArgs", () => {
     }
     for (const flag of DISABLE_WEBGL_CHROME_ARGS) {
       expect(result).not.toContain(flag)
+    }
+  })
+
+  it("appends the resolver egress rules when egressBlockMode is resolver", () => {
+    const result = hardenedChromeArgs([], { egressBlockMode: "resolver" })
+    for (const flag of RESOLVER_EGRESS_CHROME_ARGS) {
+      expect(result).toContain(flag)
+    }
+  })
+
+  it("omits the resolver egress rules for the other egress modes and by default", () => {
+    for (const args of [
+      hardenedChromeArgs([]),
+      hardenedChromeArgs([], { egressBlockMode: "intercept" }),
+      hardenedChromeArgs([], { egressBlockMode: "off" }),
+    ]) {
+      for (const flag of RESOLVER_EGRESS_CHROME_ARGS) {
+        expect(args).not.toContain(flag)
+      }
     }
   })
 
@@ -242,6 +263,10 @@ describe("safeguardInitScript (page behavior)", () => {
 describe("installNetworkEgressBlock", () => {
   const ALLOWED = "http://localhost:6230"
 
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
   type Handler = (event: unknown) => void
 
   function makeBrowser() {
@@ -270,9 +295,34 @@ describe("installNetworkEgressBlock", () => {
     return { browser, continued, failed, emit }
   }
 
-  it("subscribes to beforeRequestSent and adds an intercept", async () => {
+  /** Waits out the handler's fire-and-forget settle chain (incl. the 100 ms release retry). */
+  const flushSettle = () => new Promise((resolve) => setTimeout(resolve, 200))
+
+  it("installs nothing in resolver mode (enforcement lives in the Chrome launch args)", async () => {
+    const { browser } = makeBrowser()
+    await installNetworkEgressBlock(browser as unknown as Browser, ALLOWED, "resolver")
+    expect(browser.networkAddIntercept).not.toHaveBeenCalled()
+    expect(browser.sessionSubscribe).not.toHaveBeenCalled()
+    expect(browser.on).not.toHaveBeenCalled()
+  })
+
+  it("defaults to resolver mode when no mode is given", async () => {
     const { browser } = makeBrowser()
     await installNetworkEgressBlock(browser as unknown as Browser, ALLOWED)
+    expect(browser.networkAddIntercept).not.toHaveBeenCalled()
+  })
+
+  it("installs nothing in off mode and warns about the disabled safeguard", async () => {
+    const { browser } = makeBrowser()
+    await installNetworkEgressBlock(browser as unknown as Browser, ALLOWED, "off")
+    expect(browser.networkAddIntercept).not.toHaveBeenCalled()
+    expect(browser.sessionSubscribe).not.toHaveBeenCalled()
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("DISABLED"))
+  })
+
+  it("subscribes to beforeRequestSent and adds an intercept in intercept mode", async () => {
+    const { browser } = makeBrowser()
+    await installNetworkEgressBlock(browser as unknown as Browser, ALLOWED, "intercept")
     expect(browser.networkAddIntercept).toHaveBeenCalledWith({ phases: ["beforeRequestSent"] })
     expect(browser.sessionSubscribe).toHaveBeenCalledWith({
       events: ["network.beforeRequestSent"],
@@ -282,7 +332,7 @@ describe("installNetworkEgressBlock", () => {
 
   it("continues same-origin requests and fails off-origin ones", async () => {
     const { browser, continued, failed, emit } = makeBrowser()
-    await installNetworkEgressBlock(browser as unknown as Browser, ALLOWED)
+    await installNetworkEgressBlock(browser as unknown as Browser, ALLOWED, "intercept")
 
     emit("r1", `${ALLOWED}/iframe.html`) // same-origin -> allow
     emit("r2", `${ALLOWED}/static/main.js`) // same-origin -> allow
@@ -297,7 +347,7 @@ describe("installNetworkEgressBlock", () => {
 
   it("ignores events without a request id", async () => {
     const { browser, continued, failed, emit } = makeBrowser()
-    await installNetworkEgressBlock(browser as unknown as Browser, ALLOWED)
+    await installNetworkEgressBlock(browser as unknown as Browser, ALLOWED, "intercept")
     // @ts-expect-error intentionally malformed event
     emit(undefined, "https://evil.example.com")
     expect(continued).toEqual([])
@@ -311,7 +361,64 @@ describe("installNetworkEgressBlock", () => {
       on: vi.fn(),
     }
     await expect(
-      installNetworkEgressBlock(browser as unknown as Browser, ALLOWED),
+      installNetworkEgressBlock(browser as unknown as Browser, ALLOWED, "intercept"),
     ).resolves.toBeUndefined()
+  })
+
+  it("warns once per URL key when an allowed request cannot be settled (issue #473)", async () => {
+    const { browser, emit } = makeBrowser()
+    const wedged = new Error("'Fetch.continueRequest' wasn't found")
+    browser.networkContinueRequest.mockRejectedValue(wedged)
+    browser.networkFailRequest.mockRejectedValue(wedged)
+    await installNetworkEgressBlock(browser as unknown as Browser, ALLOWED, "intercept")
+
+    // Two copies of the same asset (different cache-busting query) plus one distinct asset.
+    emit("r1", `${ALLOWED}/assets/font.woff2?copy=1`)
+    emit("r2", `${ALLOWED}/assets/font.woff2?copy=2`)
+    emit("r3", `${ALLOWED}/assets/other.js`)
+    await flushSettle()
+
+    const warns = vi
+      .mocked(log.warn)
+      .mock.calls.filter(([, msg]) => typeof msg === "string" && msg.includes("could not settle"))
+    expect(warns).toHaveLength(2) // one per URL-sans-query, not one per request
+    // The message must be actionable: point the operator at resolver mode.
+    expect(warns[0]?.[1]).toContain("WORKER_EGRESS_BLOCK_MODE=resolver")
+  })
+
+  it("attempts a best-effort release before warning and reports success", async () => {
+    const { browser, emit } = makeBrowser()
+    browser.networkContinueRequest.mockRejectedValue(new Error("transient"))
+    // networkFailRequest succeeds -> the paused request is at least released (as failed).
+    await installNetworkEgressBlock(browser as unknown as Browser, ALLOWED, "intercept")
+
+    emit("r1", `${ALLOWED}/assets/font.woff2`)
+    await flushSettle()
+
+    expect(browser.networkFailRequest).toHaveBeenCalledWith({ request: "r1" })
+    const warns = vi
+      .mocked(log.warn)
+      .mock.calls.filter(([, msg]) => typeof msg === "string" && msg.includes("could not settle"))
+    expect(warns).toHaveLength(1)
+    expect(warns[0]?.[1]).toContain("released on retry")
+  })
+
+  it("errors when a BLOCK could not be enforced", async () => {
+    const { browser, emit } = makeBrowser()
+    const wedged = new Error("'Fetch.failRequest' wasn't found")
+    browser.networkFailRequest.mockRejectedValue(wedged)
+    await installNetworkEgressBlock(browser as unknown as Browser, ALLOWED, "intercept")
+
+    emit("r1", "https://evil.example.com/steal")
+    emit("r2", "https://evil.example.com/steal")
+    await flushSettle()
+
+    const errors = vi
+      .mocked(log.error)
+      .mock.calls.filter(
+        ([, msg]) => typeof msg === "string" && msg.includes("could NOT enforce the block"),
+      )
+    // Security-relevant: every unenforced block is error-level, no dedupe.
+    expect(errors).toHaveLength(2)
   })
 })

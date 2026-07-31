@@ -84,6 +84,7 @@ Single-host fallback: when `GITLAB_HOSTS` is unset, a single host is derived fro
 | `WORKER_CHANGED_THRESHOLD` | worker | no | `0` | Minimum fraction of differing pixels (0–1) for a story to be marked **changed**, applied together with `WORKER_CHANGED_MIN_PIXELS` (both floors must be met). Defaults to `0` (no ratio floor); raise it as an escape hatch for deployments with nondeterministic stories where a fixed pixel count flags too often on large screenshots. Neither setting affects the capture-stabilization loop. Invalid or out-of-range values fall back to the default. |
 | `WORKER_ENABLE_WEBGL` | worker | no | `false` | Opt-in software (SwiftShader) WebGL for story rendering (issue #447). Off by default because SwiftShader is in-process software rasterization driven by untrusted story content — a larger attack surface than no GL at all. Disabled → screenshot sessions launch with `--disable-webgl` and WebGL-dependent stories (maplibre-gl, deck.gl, three.js, …) fall into their error boundaries; enabled → sessions launch with `--enable-unsafe-swiftshader` and render WebGL deterministically on the CPU (same SwiftShader version → same pixels). |
 | `WORKER_CHROME_EXTRA_ARGS` | worker | no | — | Whitespace-separated extra Chrome flags appended to the screenshot session launch args, after the hardening and WebGL flags (e.g. `--force-color-profile=srgb --lang=de`). Appending can only add flags, not remove the hardening set; use `WORKER_ENABLE_WEBGL` (not this) to control WebGL. |
+| `WORKER_EGRESS_BLOCK_MODE` | worker | no | `resolver` | How the worker blocks off-origin network egress from untrusted story bundles (issue #473). `resolver` (default): Chrome launches with host-resolver rules that fail DNS for every hostname except `localhost`, blocking egress in **every** context (pages, dedicated workers, fonts, subresources) with nothing intercepted or paused; empirically this also blocks IP-literal URLs (`ERR_NAME_NOT_RESOLVED`). `intercept`: the pre-2.7 BiDi request-interception behavior, kept as an escape hatch — known to wedge worker-owned requests (fonts, worker fetches) under load, hanging those stories to their ready-signal timeout. `off`: no network-layer egress control (page-level JS guard and Chrome hardening flags remain) — last resort only. See "Network egress blocking" below. |
 | `WORKER_FATAL_FAILSAFE_TIMEOUT_MS` | worker | no | `5000` | Upper bound (ms) on the best-effort "mark the build failed + post the failed VCS status" work that runs just before the worker's fatal `process.exit` on a wedged render (issue #451). The exit is never delayed past this. |
 | `WORKER_MAX_TASK_ATTEMPTS` | worker | no | `3` | Maximum number of times a task may be claimed before the startup orphan reclaim fails the build outright instead of requeueing it (issue #451). Bounds the crash loop where a build reliably wedges the worker. |
 | `WORKER_TASK_LOCK_TIMEOUT_MINUTES` | worker | no | `10` | How long a claimed task's queue lock is honored before other workers treat the task as abandoned and reclaim it. While a task is being processed its owner refreshes the lock every minute (the task-lock heartbeat), so expiry only ever fires for a worker that died without releasing (SIGKILL/OOM) — a legitimately long build is never stolen mid-run. **Ordering constraint:** keep this below the effective stuck-running threshold (`max(WORKER_STUCK_RUNNING_MINUTES, 3 × WORKER_PROGRESS_TIMEOUT_MS)`) so an orphaned `render_story_chunk` task is reclaimed by a surviving worker — resuming build progress — before the stuck-build sweeper fails the whole build for lack of progress. Values < 1 are clamped to 1. |
@@ -157,6 +158,38 @@ Single-host fallback: when `GITLAB_HOSTS` is unset, a single host is derived fro
 
 \* Credentials may be supplied via IRSA, instance profiles, or the standard AWS credential chain
 instead of static keys.
+
+### Network egress blocking
+
+Uploaded storybooks are untrusted code, so the worker prevents story bundles from exfiltrating
+data over the network. Enforcement is layered: hardened Chrome launch flags (WebRTC and
+background networking off), a page-level init script that blocks off-origin
+`fetch`/XHR/`sendBeacon`/`window.open` and disables real-time transports (pages only — dedicated
+workers never run it), and the authoritative network-layer control selected by
+`WORKER_EGRESS_BLOCK_MODE`.
+
+The default `resolver` mode blocks by **hostname at the DNS layer**: screenshot sessions launch
+Chrome with `--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost`, so every non-localhost
+hostname fails to resolve before any connection is attempted, in every context — pages,
+dedicated/shared/service workers, font fetches, CSS/img subresources, navigations, and WebSocket
+handshakes alike. This is **stronger for worker contexts** than the previous request-interception
+approach and cannot wedge a request, because nothing is ever intercepted or paused. Measured on
+the shipped Chromium: IP-literal URLs (e.g. `http://203.0.113.7/`) are also blocked with
+`ERR_NAME_NOT_RESOLVED` — Chromium applies the mapping before its IP-literal short-circuit — and
+that includes `127.0.0.1`/`::1`. The remaining caveat is the literal hostname `localhost` itself:
+DNS rules cannot see ports, so any port on `localhost` resolves. Page contexts are still blocked
+from other localhost ports by the init script (different origin); dedicated workers are not
+(they always sat outside the page-level guard), and the worker container runs no other localhost
+listeners beyond chromedriver and the health endpoint.
+
+The `intercept` mode is the pre-2.7 implementation: a WebDriver BiDi network intercept pauses
+every request and fails off-origin ones. It is kept only as an escape hatch — Chromium implements
+BiDi interception on CDP Fetch, and requests owned by dedicated-worker targets (including
+Chromium's font resource loads) intermittently cannot be settled: the continue/fail command fails
+with `'Fetch.continueRequest' wasn't found` and the request stays paused forever, hanging
+font-gated and worker-backed stories to their ready-signal timeout (issue #473). There is no
+recovery once a request is wedged (release retries keep failing), so do not run `intercept` in
+production unless you are diagnosing the interception path itself.
 
 ### Worker memory sizing
 
