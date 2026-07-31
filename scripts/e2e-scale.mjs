@@ -43,7 +43,11 @@ Uploads a synthetic N-story static storybook to a running vizdiff stack and veri
 completes with N results within a time budget. See docs/SCALE-TESTING.md.
 
 Options:
-  --stories N           Number of synthetic stories to generate (default: 743)
+  --stories N           Number of plain synthetic stories to generate (default: 743)
+  --worker-stories N    Number of additional web-worker-backed stories (default: 1). Each spawns
+                        a dedicated Worker that fetches a same-origin binary and only signals
+                        readiness (parameters.useReadySignal) from the worker's onmessage —
+                        exercising worker-owned network requests end to end (issue #473)
   --budget-seconds S    Fail if the build is not terminal within S seconds (default: 300;
                         use >= 1800 with --kill-worker so the recovery path has time to act)
   --api-url URL         Base URL of the vizdiff api (default: http://localhost:3001)
@@ -83,6 +87,7 @@ function sleep(ms) {
 function parseArgs(argv) {
   const opts = {
     stories: 743,
+    workerStories: 1,
     budgetSeconds: 300,
     apiUrl: "http://localhost:3001",
     token: undefined,
@@ -104,6 +109,9 @@ function parseArgs(argv) {
     switch (arg) {
       case "--stories":
         opts.stories = parseInt(next(), 10)
+        break
+      case "--worker-stories":
+        opts.workerStories = parseInt(next(), 10)
         break
       case "--budget-seconds":
         opts.budgetSeconds = parseInt(next(), 10)
@@ -149,6 +157,9 @@ function parseArgs(argv) {
   }
   if (!Number.isInteger(opts.stories) || opts.stories < 1) {
     fail("--stories must be a positive integer", 2)
+  }
+  if (!Number.isInteger(opts.workerStories) || opts.workerStories < 0) {
+    fail("--worker-stories must be a non-negative integer", 2)
   }
   if (!Number.isInteger(opts.budgetSeconds) || opts.budgetSeconds < 1) {
     fail("--budget-seconds must be a positive integer", 2)
@@ -279,8 +290,17 @@ function psql(opts, sql) {
  * deterministic colored div for that story plus `currentRender.phase = "completed"` as the
  * render-readiness signal. No React, no bundler: readiness is instant, so the harness measures
  * pipeline overhead rather than app render time.
+ *
+ * In addition to `storyCount` plain stories the fixture always includes `workerStoryCount`
+ * web-worker-backed stories (issue #473): each spawns a dedicated `Worker("worker-fixture.js")`
+ * whose script `fetch()`es the same-origin `worker-data.bin` and postMessages the result; the
+ * page only sets `window.__VIZDIFF_STORY_READY__ = true` in `onmessage`, and the story declares
+ * `parameters: { useReadySignal: true }`. Readiness therefore depends on requests OWNED BY A
+ * DEDICATED WORKER (the worker script load + the worker's fetch), which frame-scoped CDP Fetch
+ * interception cannot settle — the regression class where worker-backed stories died at the
+ * ready-signal timeout.
  */
-function fixtureIframeHtml(storyCount) {
+function fixtureIframeHtml(storyCount, workerStoryCount) {
   return `<!doctype html>
 <html>
 <head>
@@ -294,6 +314,7 @@ function fixtureIframeHtml(storyCount) {
 (function () {
   "use strict";
   var STORY_COUNT = ${storyCount};
+  var WORKER_STORY_COUNT = ${workerStoryCount};
 
   var stories = {};
   for (var i = 0; i < STORY_COUNT; i++) {
@@ -308,6 +329,21 @@ function fixtureIframeHtml(storyCount) {
       componentPath: "",
       tags: ["story"],
       parameters: {}
+    };
+  }
+  // Worker-backed stories (issue #473): readiness is only signaled from a dedicated Worker's
+  // onmessage, after the worker itself fetches a same-origin binary.
+  for (var wi = 0; wi < WORKER_STORY_COUNT; wi++) {
+    var wid = "e2e-scale-worker--worker-story-" + wi;
+    stories[wid] = {
+      id: wid,
+      kind: "E2E/Scale/Worker",
+      title: "E2E/Scale/Worker",
+      name: "WorkerStory" + wi,
+      importPath: "./stories/e2e-scale-worker.stories.js",
+      componentPath: "",
+      tags: ["story"],
+      parameters: { useReadySignal: true }
     };
   }
 
@@ -349,6 +385,25 @@ function fixtureIframeHtml(storyCount) {
     document.getElementById("storybook-root").appendChild(div);
     // Semantic render-completion signal (worker/src/storyReady.ts polls currentRender.phase).
     preview.currentRender = { id: storyId, phase: "completed" };
+
+    // Worker-backed story (issue #473): render completes immediately (above), but the explicit
+    // ready signal (parameters.useReadySignal) is only set once a dedicated Worker has fetched
+    // worker-data.bin and posted back — mirroring chart.js-in-OffscreenCanvas storybooks whose
+    // readiness depends on worker-owned network requests.
+    if (story.parameters && story.parameters.useReadySignal) {
+      var worker = new Worker("worker-fixture.js");
+      worker.onmessage = function (event) {
+        if (event.data && event.data.ok) {
+          div.textContent = story.title + " / " + story.name +
+            " (worker ok, " + event.data.bytes + " bytes)";
+          window.__VIZDIFF_STORY_READY__ = true;
+        } else {
+          div.textContent = story.title + " / " + story.name +
+            " (worker error: " + (event.data && event.data.error) + ")";
+          // Ready signal deliberately NOT set: a failed worker fetch must fail the story.
+        }
+      };
+    }
   }
 })();
 </script>
@@ -357,17 +412,47 @@ function fixtureIframeHtml(storyCount) {
 `
 }
 
-function buildFixtureTarball(storyCount) {
+/**
+ * Dedicated-worker script for the worker-backed stories: fetch a same-origin binary FROM THE
+ * WORKER REALM (the request is owned by the worker target, not the frame), then post the result.
+ */
+function fixtureWorkerJs() {
+  return `"use strict";
+// Fetched from the dedicated worker, so the request is owned by the worker target (issue #473).
+fetch("worker-data.bin")
+  .then(function (res) {
+    if (!res.ok) { throw new Error("HTTP " + res.status); }
+    return res.arrayBuffer();
+  })
+  .then(function (buf) { self.postMessage({ ok: true, bytes: buf.byteLength }); })
+  .catch(function (err) { self.postMessage({ ok: false, error: String(err) }); });
+`
+}
+
+function buildFixtureTarball(storyCount, workerStoryCount) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vizdiff-e2e-scale-"))
-  fs.writeFileSync(path.join(dir, "iframe.html"), fixtureIframeHtml(storyCount))
+  fs.writeFileSync(path.join(dir, "iframe.html"), fixtureIframeHtml(storyCount, workerStoryCount))
   fs.writeFileSync(
     path.join(dir, "index.html"),
     "<!doctype html><title>vizdiff e2e scale fixture</title>\n",
   )
+  // Always shipped, even with --worker-stories 0, so the fixture layout is stable.
+  fs.writeFileSync(path.join(dir, "worker-fixture.js"), fixtureWorkerJs())
+  // Deterministic 64-byte binary payload for the worker's fetch.
+  fs.writeFileSync(path.join(dir, "worker-data.bin"), Buffer.alloc(64, 0x56)) // "V"
   const tarballPath = path.join(dir, "storybook.tar.gz")
   // Root layout: the worker extracts to the static-server root and loads /iframe.html, so
   // iframe.html must sit at the top of the archive (no wrapping directory).
-  execFileSync("tar", ["-czf", tarballPath, "-C", dir, "iframe.html", "index.html"])
+  execFileSync("tar", [
+    "-czf",
+    tarballPath,
+    "-C",
+    dir,
+    "iframe.html",
+    "index.html",
+    "worker-fixture.js",
+    "worker-data.bin",
+  ])
   return { dir, tarballPath }
 }
 
@@ -454,8 +539,11 @@ async function main() {
     )
   }
 
+  // Worker-backed stories are additional to --stories; every count assertion below uses the total.
+  const totalStories = opts.stories + opts.workerStories
+
   console.log(`vizdiff e2e scale harness (issue #456)
-  stories:        ${opts.stories}
+  stories:        ${opts.stories} plain + ${opts.workerStories} worker-backed = ${totalStories}
   budget:         ${opts.budgetSeconds}s
   api:            ${opts.apiUrl}
   kill-worker:    ${opts.killWorker ? "yes" : "no"}
@@ -481,8 +569,11 @@ async function main() {
   }
 
   // 2. Fixture.
-  log(`Generating ${opts.stories}-story static storybook fixture...`)
-  const { dir, tarballPath } = buildFixtureTarball(opts.stories)
+  log(
+    `Generating static storybook fixture (${opts.stories} plain + ${opts.workerStories} ` +
+      `worker-backed stories)...`,
+  )
+  const { dir, tarballPath } = buildFixtureTarball(opts.stories, opts.workerStories)
   const tarball = fs.readFileSync(tarballPath)
   log(`Fixture tarball: ${tarballPath} (${(tarball.length / 1024).toFixed(1)} KiB)`)
 
@@ -527,7 +618,7 @@ async function main() {
       build = page.builds.find((b) => b.id === testId)
       if (!build) fail(`Build ${testId} not found in GET /api/projects/${projectId}/builds`)
       log(
-        `build ${testId}: status=${build.status} results=${build.stories}/${opts.stories} ` +
+        `build ${testId}: status=${build.status} results=${build.stories}/${totalStories} ` +
           `changes=${build.changes} elapsed=${elapsedSec.toFixed(0)}s`,
       )
       if (TERMINAL_STATUSES.has(build.status)) break
@@ -560,11 +651,19 @@ async function main() {
     for (const result of test.testResults) {
       byStatus[result.changeStatus] = (byStatus[result.changeStatus] ?? 0) + 1
     }
+    for (const result of test.testResults) {
+      if (result.changeStatus === "failed") {
+        console.error(
+          `  failed story: ${result.storyId} kind=${result.errorKind ?? "?"} ` +
+            `message=${JSON.stringify(result.errorMessage ?? "")}`,
+        )
+      }
+    }
 
     console.log(
       `\n=== Result ===============================================
   terminal status:   ${build.status}
-  test results:      ${test.testResults.length} / ${opts.stories} expected
+  test results:      ${test.testResults.length} / ${totalStories} expected
   by change status:  ${JSON.stringify(byStatus)}
   wall clock:        ${wallClockSec.toFixed(1)}s (budget ${opts.budgetSeconds}s)` +
         (killedContainer ? `\n  killed worker:     ${killedContainer}` : "") +
@@ -582,8 +681,8 @@ async function main() {
             : ""),
       )
     }
-    if (test.testResults.length !== opts.stories) {
-      failures.push(`expected ${opts.stories} test results, got ${test.testResults.length}`)
+    if (test.testResults.length !== totalStories) {
+      failures.push(`expected ${totalStories} test results, got ${test.testResults.length}`)
     }
     if (wallClockSec >= opts.budgetSeconds) {
       failures.push(`wall clock ${wallClockSec.toFixed(1)}s exceeded budget ${opts.budgetSeconds}s`)
