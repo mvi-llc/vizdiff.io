@@ -260,6 +260,7 @@ export const get: RequestHandler = async (req, res) => {
     tag: screenshotTest.tag ?? undefined,
     initiatedStampSec: toSeconds(screenshotTest.createdAt),
     buildDurationSec: screenshotTest.buildDurationSec ?? undefined,
+    expectedStoryCount: screenshotTest.expectedStoryCount ?? undefined,
     testResults: testResultResponses,
   }
 
@@ -358,7 +359,7 @@ export const listActivity: RequestHandler = async (_req, res) => {
     .limit(10)
     .execute()) as ActivityQueryResult[]
 
-  const responses: ScreenshotTestResponse[] = screenshotTests.map((test) => ({
+  const responses: ScreenshotTestSummaryResponse[] = screenshotTests.map((test) => ({
     id: test.screenshot_test_id,
     projectId: test.project_id,
     projectName: test.project_name,
@@ -375,6 +376,9 @@ export const listActivity: RequestHandler = async (_req, res) => {
     status: test.screenshot_test_status as ScreenshotTestResponse["status"],
     tag: test.screenshot_test_tag ?? undefined,
     initiatedStampSec: toSeconds(test.screenshot_test_created_at),
+    // The SQL already computes the deduped per-story test count; surface it so the activity
+    // list can show live counts for running builds (issue #476).
+    stories: parseInt(test.testcount) || 0,
   }))
 
   res.json(responses)
