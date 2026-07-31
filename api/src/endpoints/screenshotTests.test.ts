@@ -15,6 +15,21 @@ vi.mock("../projectAccess", async (importOriginal) => {
   return { ...actual, getAccessibleProjectIds: vi.fn(actual.getAccessibleProjectIds) }
 })
 
+// The test environment has no S3 region configured (mirroring CI, where the real presigner throws
+// "Region is missing"), so replace the presign helpers with deterministic stand-ins. This lets the
+// diagnostics tests below exercise builds that DO have test results (every result's image URLs are
+// presigned by `get`) without touching AWS.
+vi.mock("../s3", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../s3")>()
+  return {
+    ...actual,
+    presignImageUrl: vi.fn((stored: string) => Promise.resolve(`https://presigned.test/${stored}`)),
+    presignImageUrlOrNull: vi.fn((stored: string | null) =>
+      Promise.resolve(stored ? `https://presigned.test/${stored}` : null),
+    ),
+  }
+})
+
 /**
  * Integration test for GET /api/tests/:id and GET /api/activity (issues #476/#477). Running
  * builds upsert one TestResult row per story as chunks finalize, so the frontend derives live
@@ -23,6 +38,8 @@ vi.mock("../projectAccess", async (importOriginal) => {
  *   the JSON payload entirely when the column is NULL (pre-enumeration or legacy builds).
  * - `get` surfaces the server-computed `lastProgressAgeMs` (falling back to updated_at when no
  *   heartbeat exists) and `workerId` while the build is in flight, and omits both once terminal.
+ * - `get` surfaces per-result failure `diagnostics` (issue #475) — console tail, pending requests,
+ *   presigned failure screenshot — and omits the field entirely when the column is NULL.
  * - `get` 404s when the build's project is not in the caller's accessible set.
  * - `listActivity` returns the deduplicated per-story test count (`stories`) that its SQL already
  *   computes, including 0 for builds with no results yet.
@@ -33,6 +50,7 @@ describe("screenshot test endpoints", () => {
   let legacyBuildId = 0
   let countedBuildId = 0
   let heartbeatBuildId = 0
+  let diagnosticsBuildId = 0
 
   /** last_progress_at written for the heartbeat build, relative to the seeding time. */
   const HEARTBEAT_AGE_MS = 5000
@@ -108,12 +126,58 @@ describe("screenshot test endpoints", () => {
       // In-flight build with partial results: 3 distinct stories, "a" retried (upserted in place).
       countedBuildId = await createBuild(3, "running", 6, ["a", "a", "b", "c"])
       // In-flight build with a worker identity and a ~5s-old progress heartbeat (issue #477).
-      // No test results: the get endpoint presigns image URLs for every result, and the test
-      // environment has no S3 region configured ("Region is missing" in CI).
       heartbeatBuildId = await createBuild(4, "running", 6, [], {
         workerId: "worker-1",
         lastProgressAt: new Date(Date.now() - HEARTBEAT_AGE_MS),
       })
+      // Finished build with two failed results (issue #475): one carrying the worker-captured
+      // diagnostics payload, one with the column NULL (pre-#475 rows / cleared on retry).
+      const diagnosticsBuild = manager.create(ScreenshotTest, {
+        project,
+        buildNumber: 5,
+        commitSha: "sha-5",
+        branch: "main",
+        uploadId: `upload-5-${Date.now()}-${Math.random()}`,
+        status: "failed",
+        expectedStoryCount: 2,
+      })
+      await manager.save(diagnosticsBuild)
+      diagnosticsBuildId = diagnosticsBuild.id
+      await manager.upsert(
+        TestResult,
+        {
+          name: "with-diagnostics",
+          screenshotTest: diagnosticsBuild,
+          storyId: "with-diagnostics",
+          newImageUrl: "screenshots/with-diagnostics.png",
+          changeStatus: "failed",
+          errorKind: "render-timeout",
+          errorMessage: "Timed out waiting for the story to render",
+          diagnostics: {
+            consoleTail: [
+              { level: "log", text: "loading data", stampMs: 1000 },
+              { level: "error", text: "Uncaught TypeError: boom", stampMs: 2500 },
+            ],
+            pendingRequests: [{ url: "https://api.example.com/slow", pendingMs: 29750 }],
+            failureScreenshotKey: "screenshots/with-diagnostics-failure.png",
+          },
+        },
+        { conflictPaths: ["screenshotTest", "storyId"] },
+      )
+      await manager.upsert(
+        TestResult,
+        {
+          name: "without-diagnostics",
+          screenshotTest: diagnosticsBuild,
+          storyId: "without-diagnostics",
+          newImageUrl: "screenshots/without-diagnostics.png",
+          changeStatus: "failed",
+          errorKind: "story-error",
+          errorMessage: "story threw during render",
+          diagnostics: null,
+        },
+        { conflictPaths: ["screenshotTest", "storyId"] },
+      )
     })
   })
 
@@ -198,6 +262,38 @@ describe("screenshot test endpoints", () => {
     const serialized = JSON.parse(JSON.stringify(res.body)) as Record<string, unknown>
     expect(serialized).not.toHaveProperty("lastProgressAgeMs")
     expect(serialized).not.toHaveProperty("workerId")
+  })
+
+  it("GET /api/tests/:id surfaces diagnostics for failed results and presigns the failure screenshot", async () => {
+    const res = createMockRes()
+    await getTest({ params: { id: String(diagnosticsBuildId) } } as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    const response = res.body as TestResponse
+    const withDiagnostics = response.testResults.find((r) => r.name === "with-diagnostics")
+    expect(withDiagnostics).toBeDefined()
+    expect(withDiagnostics!.diagnostics).toEqual({
+      console: [
+        { level: "log", text: "loading data", stampMs: 1000 },
+        { level: "error", text: "Uncaught TypeError: boom", stampMs: 2500 },
+      ],
+      pendingRequests: [{ url: "https://api.example.com/slow", pendingMs: 29750 }],
+      failureScreenshotUrl: "https://presigned.test/screenshots/with-diagnostics-failure.png",
+    })
+  })
+
+  it("GET /api/tests/:id omits diagnostics when the column is NULL", async () => {
+    const res = createMockRes()
+    await getTest({ params: { id: String(diagnosticsBuildId) } } as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    const response = res.body as TestResponse
+    const withoutDiagnostics = response.testResults.find((r) => r.name === "without-diagnostics")
+    expect(withoutDiagnostics).toBeDefined()
+    // Round-trip through JSON to assert the field is omitted from the payload, not just undefined.
+    const serialized = JSON.parse(JSON.stringify(withoutDiagnostics)) as Record<string, unknown>
+    expect(serialized).not.toHaveProperty("diagnostics")
+    expect(serialized["errorMessage"]).toBe("story threw during render")
   })
 
   it("GET /api/tests/:id returns 404 when the project is not accessible", async () => {

@@ -23,6 +23,24 @@ import { changeStatusColor, changeStatusMessage } from "@/lib/changeStatus"
 
 type ViewMode = "new" | "old" | "diff" | "split"
 
+/** Format an epoch-milliseconds console timestamp as HH:MM:SS.mmm (local time). */
+function formatConsoleStamp(stampMs: number): string {
+  const date = new Date(stampMs)
+  const pad = (value: number, width: number) => String(value).padStart(width, "0")
+  return `${pad(date.getHours(), 2)}:${pad(date.getMinutes(), 2)}:${pad(date.getSeconds(), 2)}.${pad(date.getMilliseconds(), 3)}`
+}
+
+/** Theme color for a console entry so errors/warnings stand out in the diagnostics tail. */
+function consoleLevelColor(level: string): string | undefined {
+  if (level === "error") {
+    return "error.main"
+  }
+  if (level === "warn" || level === "warning") {
+    return "warning.main"
+  }
+  return undefined
+}
+
 interface TestResultDialogProps {
   result: TestResultResponse | null
   allResults: TestResultResponse[]
@@ -148,6 +166,16 @@ export default function TestResultDialog({
   if (!result) {
     return null
   }
+
+  // Failure troubleshooting context (issue #475): only present for failed results. When the
+  // worker captured a failure-time screenshot, show it in the "new" image slot (the regular new
+  // screenshot is empty for failed results) labeled as such.
+  const diagnostics = result.changeStatus === "failed" ? result.diagnostics : undefined
+  const failureScreenshotUrl = diagnostics?.failureScreenshotUrl
+  const newScreenshotUrl = failureScreenshotUrl ?? result.screenshotUrl
+  const newScreenshotAlt = failureScreenshotUrl
+    ? `Failure screenshot for ${result.name}`
+    : undefined
 
   // 6. JSX
   return (
@@ -299,6 +327,64 @@ export default function TestResultDialog({
             {result.errorMessage}
           </Box>
         )}
+        {diagnostics && diagnostics.console.length > 0 && (
+          <Box sx={{ flex: "0 0 auto" }}>
+            <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
+              Console output
+            </Typography>
+            <Box
+              component="pre"
+              sx={{
+                m: 0,
+                p: 1.5,
+                maxHeight: "30vh",
+                overflow: "auto",
+                fontFamily: "monospace",
+                fontSize: "0.8125rem",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+                bgcolor: "var(--five-percent-opacity)",
+              }}
+            >
+              {diagnostics.console.map((entry, index) => (
+                <Box
+                  key={index}
+                  component="span"
+                  sx={{ display: "block", color: consoleLevelColor(entry.level) }}
+                >
+                  {`${formatConsoleStamp(entry.stampMs)} [${entry.level}] ${entry.text}`}
+                </Box>
+              ))}
+            </Box>
+          </Box>
+        )}
+        {diagnostics && diagnostics.pendingRequests.length > 0 && (
+          <Box sx={{ flex: "0 0 auto" }}>
+            <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
+              Pending requests at failure
+            </Typography>
+            <Box
+              component="pre"
+              sx={{
+                m: 0,
+                p: 1.5,
+                maxHeight: "20vh",
+                overflow: "auto",
+                fontFamily: "monospace",
+                fontSize: "0.8125rem",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+                bgcolor: "var(--five-percent-opacity)",
+              }}
+            >
+              {diagnostics.pendingRequests.map((request, index) => (
+                <Box key={index} component="span" sx={{ display: "block" }}>
+                  {`${request.url} — pending ${(request.pendingMs / 1000).toFixed(1)}s`}
+                </Box>
+              ))}
+            </Box>
+          </Box>
+        )}
         <Box sx={{ flex: 1, minHeight: 0, display: "flex" }}>
           {viewMode === "split" ? (
             <Box sx={{ display: "flex", width: "100%", gap: 2, overflow: "hidden" }}>
@@ -352,16 +438,32 @@ export default function TestResultDialog({
                     color="error"
                     sx={{ fontSize: 40, color: "var(--text-secondary)" }}
                   />
-                ) : result.screenshotUrl ? (
-                  <Image
-                    src={result.screenshotUrl}
-                    alt={`New version of ${result.name}`}
-                    fill
-                    sizes="50vw"
-                    style={{ objectFit: "contain" }}
-                    priority
-                    onError={() => setScreenshotError(true)}
-                  />
+                ) : newScreenshotUrl ? (
+                  <>
+                    <Image
+                      src={newScreenshotUrl}
+                      alt={newScreenshotAlt ?? `New version of ${result.name}`}
+                      fill
+                      sizes="50vw"
+                      style={{ objectFit: "contain" }}
+                      priority
+                      onError={() => setScreenshotError(true)}
+                    />
+                    {failureScreenshotUrl && (
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          position: "absolute",
+                          bottom: 8,
+                          bgcolor: "var(--five-percent-opacity)",
+                          px: 1,
+                          color: "var(--text-secondary)",
+                        }}
+                      >
+                        Failure screenshot
+                      </Typography>
+                    )}
+                  </>
                 ) : (
                   <Typography variant="caption" sx={{ color: "var(--text-secondary)" }}>
                     No New Screenshot
@@ -408,16 +510,32 @@ export default function TestResultDialog({
                   color="error"
                   sx={{ fontSize: 40, color: "var(--text-secondary)" }}
                 />
-              ) : result.screenshotUrl ? (
-                <Image
-                  src={result.screenshotUrl}
-                  alt={`Screenshot for ${result.name}`}
-                  fill
-                  sizes="100vw"
-                  style={{ objectFit: "contain" }}
-                  priority
-                  onError={() => setScreenshotError(true)}
-                />
+              ) : newScreenshotUrl ? (
+                <>
+                  <Image
+                    src={newScreenshotUrl}
+                    alt={newScreenshotAlt ?? `Screenshot for ${result.name}`}
+                    fill
+                    sizes="100vw"
+                    style={{ objectFit: "contain" }}
+                    priority
+                    onError={() => setScreenshotError(true)}
+                  />
+                  {failureScreenshotUrl && (
+                    <Typography
+                      variant="caption"
+                      sx={{
+                        position: "absolute",
+                        bottom: 8,
+                        bgcolor: "var(--five-percent-opacity)",
+                        px: 1,
+                        color: "var(--text-secondary)",
+                      }}
+                    >
+                      Failure screenshot
+                    </Typography>
+                  )}
+                </>
               ) : (
                 <Typography variant="caption" sx={{ color: "var(--text-secondary)" }}>
                   No Screenshot

@@ -251,6 +251,17 @@ export const get: RequestHandler = async (req, res) => {
       diffRatio: result.diffRatio ?? undefined,
       errorKind: result.errorKind ?? undefined,
       errorMessage: result.errorMessage ?? undefined,
+      // Failure troubleshooting context (issue #475): pass the worker-captured console tail and
+      // pending requests through verbatim, and presign the failure screenshot like the images above.
+      diagnostics: result.diagnostics
+        ? {
+            console: result.diagnostics.consoleTail,
+            pendingRequests: result.diagnostics.pendingRequests,
+            failureScreenshotUrl:
+              (await presignImageUrlOrNull(result.diagnostics.failureScreenshotKey ?? null)) ??
+              undefined,
+          }
+        : undefined,
       createdStampSec: toSeconds(result.createdAt),
     })),
   )

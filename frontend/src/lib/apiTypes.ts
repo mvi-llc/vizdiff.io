@@ -96,6 +96,12 @@ export type TestResultResponse = {
   errorKind?: string
   /** Human-readable error detail accompanying errorKind. Only set for failed results. */
   errorMessage?: string
+  /** Failure troubleshooting context (issue #475). Only set for failed results. */
+  diagnostics?: {
+    console: { level: string; text: string; stampMs: number }[]
+    pendingRequests: { url: string; pendingMs: number }[]
+    failureScreenshotUrl?: string
+  }
   createdStampSec: number
 }
 
