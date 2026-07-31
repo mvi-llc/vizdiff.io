@@ -104,7 +104,7 @@ Single-host fallback: when `GITLAB_HOSTS` is unset, a single host is derived fro
 | `BUILD_TIMEOUT_FLOOR_MS` | worker | no | `900000` (15 min) | Lower bound on the derived whole-build ceiling, so small storybooks keep the previous 15-minute allowance rather than getting a tiny ceiling. Ignored when `BUILD_TIMEOUT_MS` is set explicitly. |
 | `BUILD_ABORT_GRACE_MS` | worker | no | `10000` | After the build watchdog (progress stall or ceiling) aborts the browser sessions, how long to wait for the in-flight render to actually unwind (running its `finally` blocks, returning sessions to the pool) before declaring it unrecoverable and exiting the worker so the orchestrator restarts a clean process. |
 | `BUILD_MEMORY_WARN_BYTES` | worker | no | `2147483648` (2 GiB) | Resident set size past which a build logs a memory-pressure warning. Purely observational; it does not abort the build. |
-| `WORKER_SHARDING_ENABLED` | worker | no | `false` | Cross-worker build sharding (issue #456, Phase B): split a large build into `render_story_chunk` tasks that any worker replica can claim, instead of rendering everything inside the discovery task. See "Cross-worker sharding" below — including the rolling-deploy caveat: enable only after **every** worker replica runs a version that understands the new task type. |
+| `WORKER_SHARDING_ENABLED` | worker | no | `true` | Cross-worker build sharding (issue #456, Phase B): split a large build into `render_story_chunk` tasks that any worker replica can claim, instead of rendering everything inside the discovery task. Enabled by default; set `false` to disable. See "Cross-worker sharding" below — including the rolling-deploy caveat: set `false` while a mixed-version rollout is in flight, because workers older than this feature fail `render_story_chunk` tasks with "Unknown task type". |
 | `WORKER_SHARD_CHUNK_SIZE` | worker | no | `50` | Stories per `render_story_chunk` task when sharding is enabled. Smaller chunks spread better across replicas and shrink a browser crash's blast radius to fewer stories, at more per-chunk overhead (browser-pool spin-up, story discovery; the extracted tarball is cached per upload). Values < 1 are clamped to 1. |
 | `WORKER_SHARD_MIN_STORIES` | worker | no | `100` | Minimum discovered story count before a build is sharded; smaller builds render inline in the discovery task, where per-chunk overhead would outweigh the parallelism. Values < 1 are clamped to 1. |
 | `POSTGRES_HOST` | api, worker | no | `localhost` | Postgres host. |
@@ -168,9 +168,9 @@ detected by the health probe and replaced, with affected stories retried (issues
 
 ### Cross-worker sharding
 
-With `WORKER_SHARDING_ENABLED=true`, a build whose storybook contains at least
-`WORKER_SHARD_MIN_STORIES` stories is divided across all worker replicas instead of rendering
-inside a single worker (issue #456, Phase B):
+Cross-worker sharding is **enabled by default** (`WORKER_SHARDING_ENABLED=true`; set `false` to
+disable). A build whose storybook contains at least `WORKER_SHARD_MIN_STORIES` stories is divided
+across all worker replicas instead of rendering inside a single worker (issue #456, Phase B):
 
 1. The discovery (`ingest_storybook`) task downloads the upload, enumerates its stories, records
    `expected_story_count` on the build, and enqueues one `render_story_chunk` task per
@@ -190,8 +190,13 @@ render timeouts derive from the chunk's story count (`WORKER_PER_STORY_BUDGET_MS
 stuck-build sweeper watches.
 
 **Rolling-deploy caveat:** workers older than this feature fail `render_story_chunk` tasks with
-"Unknown task type". Leave `WORKER_SHARDING_ENABLED` off (the default) until **every** worker
-replica has been upgraded, then flip it on.
+"Unknown task type". Because sharding is now on by default, set `WORKER_SHARDING_ENABLED=false`
+**before** starting a rolling deploy that leaves old and new worker versions running side by side,
+and remove the override (or set it back to `true`) once **every** worker replica has been
+upgraded.
+
+See `docs/SCALE-TESTING.md` for an end-to-end multi-worker scale verification harness
+(`scripts/e2e-scale.mjs` + `docker-compose.scale.yml`).
 
 ## Worker metrics
 

@@ -246,10 +246,11 @@ worker:
   # default (10000).
   buildAbortGraceMs: ""
   # -- Cross-worker build sharding (issue #456, WORKER_SHARDING_ENABLED): split large builds
-  # into render_story_chunk tasks that any worker replica can claim. Off by default. Rolling-
-  # deploy caveat: enable only after EVERY worker replica runs a version that understands the
-  # new task type — older workers error on it.
-  shardingEnabled: false
+  # into render_story_chunk tasks that any worker replica can claim. Enabled by default; set
+  # false to disable. Rolling-deploy caveat: set false BEFORE a mixed-version rollout (old and
+  # new workers running side by side) — workers older than this feature fail the
+  # render_story_chunk task type — and re-enable once every replica is upgraded.
+  shardingEnabled: true
   # -- Stories per render chunk task when sharding is enabled (issue #456,
   # WORKER_SHARD_CHUNK_SIZE). Empty uses the built-in default (50).
   shardChunkSize: ""
