@@ -96,5 +96,11 @@ export type TestResultResponse = {
 
 export type TestResponse = ScreenshotTestResponse & {
   parent?: ScreenshotTestResponse
+  /**
+   * Total number of stories this build is expected to produce results for (issue #476). Written
+   * by the worker once the storybook's stories are enumerated; absent for builds that predate it
+   * or have not reached enumeration yet.
+   */
+  expectedStoryCount?: number
   testResults: TestResultResponse[]
 }

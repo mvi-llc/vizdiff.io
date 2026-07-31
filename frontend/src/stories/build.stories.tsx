@@ -240,6 +240,9 @@ export const Running: Story = {
           HttpResponse.json({
             ...mockBuildData,
             status: "running",
+            // Partial results stream in while the build runs; the page shows the one finished
+            // card and "1 / 6" style live counts (issue #476).
+            expectedStoryCount: 6,
             testResults: mockBuildData.testResults.slice(0, 1),
           }),
         ),

@@ -89,14 +89,12 @@ export default function Build(): JSX.Element {
   const status = data?.status
   const isPending = status === "pending" || status === "running"
   const testResults = data?.testResults
-  const sortedTestResults = useMemo(
-    () => (isPending ? [] : getSortedTestResults(testResults ?? [])),
-    [isPending, testResults],
-  )
-  const tests = isPending ? undefined : sortedTestResults.length
-  const changes = isPending
-    ? undefined
-    : sortedTestResults.filter((result) => result.changeStatus !== "unchanged").length
+  // Results are upserted per story while the build runs (since 2.5), so counts derived from the
+  // partial result set are exact for the stories rendered so far (issue #476).
+  const sortedTestResults = useMemo(() => getSortedTestResults(testResults ?? []), [testResults])
+  const tests = sortedTestResults.length
+  const changes = sortedTestResults.filter((result) => result.changeStatus !== "unchanged").length
+  const expectedStoryCount = data?.expectedStoryCount
   const approveEnabled = status === "unapproved" || status === "denied"
   const denyEnabled = status === "unapproved" || status === "approved"
 
@@ -210,15 +208,17 @@ export default function Build(): JSX.Element {
             <Box sx={{ display: "flex", gap: 3 }}>
               <Box>
                 <Typography variant="h6" sx={{ fontWeight: 500 }}>
-                  {tests ?? "…"}
+                  {isPending && expectedStoryCount != undefined
+                    ? `${tests} / ${expectedStoryCount}`
+                    : tests}
                 </Typography>
-                <Typography variant="body2">Tests</Typography>
+                <Typography variant="body2">{isPending ? "Tests so far" : "Tests"}</Typography>
               </Box>
               <Box>
                 <Typography variant="h6" sx={{ fontWeight: 500 }}>
-                  {changes ?? "…"}
+                  {changes}
                 </Typography>
-                <Typography variant="body2">Changes</Typography>
+                <Typography variant="body2">{isPending ? "Changes so far" : "Changes"}</Typography>
               </Box>
               <Box>
                 <Typography
@@ -256,14 +256,13 @@ export default function Build(): JSX.Element {
           </Box>
         </Box>
 
-        {/* Test Results */}
-        {isPending ? (
+        {/* Test Results: partial results stream in while the build runs, so render the grid
+            whenever any results exist (issue #476). */}
+        {sortedTestResults.length === 0 ? (
           <Typography variant="body1" sx={{ textAlign: "center", py: 4 }}>
-            Tests are currently being rendered.
-          </Typography>
-        ) : sortedTestResults.length === 0 ? (
-          <Typography variant="body1" sx={{ textAlign: "center", py: 4 }}>
-            This build does not contain any tests.
+            {isPending
+              ? "Waiting for the first results…"
+              : "This build does not contain any tests."}
           </Typography>
         ) : (
           <Box
