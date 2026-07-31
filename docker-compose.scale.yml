@@ -1,0 +1,99 @@
+# Scale-testing override for docker-compose.images.yml (issue #456: cross-worker sharding).
+#
+# This is a TEST RIG, not production configuration. Layered on top of the images compose file it:
+#
+#   - runs TWO worker replicas (`worker` + `worker2`, explicit services rather than
+#     `deploy.replicas` so each container has a predictable name for the kill-worker drill in
+#     scripts/e2e-scale.mjs) with WORKER_STORY_CONCURRENCY=4 each, and
+#   - bundles a throwaway MinIO (with a one-shot bucket-creation job) and points the api and
+#     workers at it, so the harness needs no external S3. The MinIO override REPLACES whatever
+#     S3_* settings your .env has for the duration of the scale test.
+#
+# Usage (see docs/SCALE-TESTING.md for the full walkthrough):
+#
+#   docker compose -f docker-compose.images.yml -f docker-compose.scale.yml up -d \
+#     postgres minio minio-init api worker worker2
+#
+# The frontend is not needed by the harness; add it to the service list (or omit the list) if you
+# want the UI as well.
+services:
+  minio:
+    image: quay.io/minio/minio:latest
+    restart: unless-stopped
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    # Optional debug port, bound to loopback only (S3 API). Services reach MinIO over the compose
+    # network.
+    ports:
+      - "127.0.0.1:9000:9000"
+
+  # One-shot job: wait for MinIO, then create the harness bucket. `mc mb --ignore-existing` makes
+  # re-runs idempotent.
+  minio-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        until mc alias set local http://minio:9000 minioadmin minioadmin; do
+          echo "waiting for minio..."; sleep 1
+        done
+        mc mb --ignore-existing local/vizdiff-e2e-scale
+    restart: "no"
+
+  api:
+    environment: &scale-s3-env
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET_NAME: vizdiff-e2e-scale
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+
+  worker:
+    environment:
+      <<: *scale-s3-env
+      WORKER_STORY_CONCURRENCY: "4"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+
+  # Second worker replica. Mirrors the base `worker` service from docker-compose.images.yml
+  # (image, env_file, healthcheck) because compose overrides can only extend existing services,
+  # not multiply them; keep this in sync with the base file if that service changes.
+  worker2:
+    image: ghcr.io/vizdiff-io/vizdiff-worker:${VIZDIFF_VERSION:-latest}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      <<: *scale-s3-env
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      WORKER_HEALTH_PORT: 3003
+      WORKER_STORY_CONCURRENCY: "4"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'node -e "fetch(''http://localhost:3003/health'').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  minio_data:

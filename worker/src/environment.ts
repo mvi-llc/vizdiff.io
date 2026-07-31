@@ -326,10 +326,15 @@ export const WORKER_STUCK_PENDING_MINUTES = intEnv("WORKER_STUCK_PENDING_MINUTES
 
 // Split large builds across worker replicas: the discovery (ingest) task enumerates stories and
 // enqueues one `render_story_chunk` task per chunk, any worker claims chunks, and the
-// last-finishing chunk completes the build. Off by default; enable only once EVERY worker
-// replica runs a version that understands the `render_story_chunk` task type (older workers
-// error on it). See docs/CONFIGURATION.md "Cross-worker sharding".
-export const WORKER_SHARDING_ENABLED = process.env.WORKER_SHARDING_ENABLED === "true"
+// last-finishing chunk completes the build. ON by default; set WORKER_SHARDING_ENABLED=false to
+// disable — in particular during a rolling deploy from a version that predates the
+// `render_story_chunk` task type, since older workers fail that task with "Unknown task type".
+// See docs/CONFIGURATION.md "Cross-worker sharding". Tri-state like ENABLE_VCS_STATUS: an
+// explicit "true"/"false" wins; unset means enabled.
+export const WORKER_SHARDING_ENABLED =
+  process.env.WORKER_SHARDING_ENABLED != undefined
+    ? process.env.WORKER_SHARDING_ENABLED === "true"
+    : true
 
 // Number of stories per render_story_chunk task. Smaller chunks spread better across replicas
 // and shrink the blast radius of a browser crash to fewer stories, at the cost of more

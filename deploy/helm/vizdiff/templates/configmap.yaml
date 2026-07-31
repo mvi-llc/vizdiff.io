@@ -110,9 +110,9 @@ data:
   {{- with .Values.worker.buildAbortGraceMs }}
   BUILD_ABORT_GRACE_MS: {{ . | quote }}
   {{- end }}
-  {{- if .Values.worker.shardingEnabled }}
-  WORKER_SHARDING_ENABLED: "true"
-  {{- end }}
+  {{- /* Always rendered explicitly: the worker's built-in default is now "true", so
+  shardingEnabled: false must emit WORKER_SHARDING_ENABLED: "false" to actually disable it. */}}
+  WORKER_SHARDING_ENABLED: {{ .Values.worker.shardingEnabled | quote }}
   {{- with .Values.worker.shardChunkSize }}
   WORKER_SHARD_CHUNK_SIZE: {{ . | quote }}
   {{- end }}

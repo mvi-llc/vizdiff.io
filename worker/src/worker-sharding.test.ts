@@ -3,8 +3,9 @@
  * or above WORKER_SHARD_MIN_STORIES, the discovery (ingest) task must enqueue
  * render_story_chunk tasks and return with the build left "running" — no inline rendering, no
  * completion aggregation, browser pool torn down. Below the threshold the inline path runs
- * unchanged. This lives in its own file because the environment mock (flag ON) is per module
- * graph; worker.test.ts keeps the flag at its real default (off).
+ * unchanged. This lives in its own file because the environment mock (low threshold/chunk size)
+ * is per module graph; worker.test.ts keeps the real environment, where its story counts stay
+ * below WORKER_SHARD_MIN_STORIES so the inline path runs even with the flag's default now ON.
  */
 
 import "reflect-metadata"
