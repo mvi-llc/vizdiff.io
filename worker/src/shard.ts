@@ -59,7 +59,7 @@ import {
   navigateToStorybook,
 } from "./stories"
 import { installStoryRenderStateHook } from "./storyReady"
-import { NonRetryableTaskError, isPermanentS3FetchError } from "./tasks"
+import { NonRetryableTaskError, isPermanentS3FetchError, normalizeTaskDataId } from "./tasks"
 import { BuildTimeoutError, withTimeout } from "./timeout"
 import type { Story } from "./types"
 import { parseBuildCheckData, type BuildCheckData } from "./vcsStatus"
@@ -154,17 +154,24 @@ export interface RenderChunkPayload {
   gitlabCheckData?: GitLabCheckData
 }
 
-/** Narrow an unknown task `data` jsonb to a {@link RenderChunkPayload}, or undefined. */
+/**
+ * Narrow an unknown task `data` jsonb to a {@link RenderChunkPayload}, or undefined.
+ *
+ * `projectId`/`uploadId` accept numbers as well as strings (normalized via normalizeTaskDataId):
+ * the api's `Project.id` is a NUMBER (`@PrimaryGeneratedColumn`) stored unquoted in jsonb, and a
+ * payload that copied it verbatim must parse — rejecting it would (and, pre-fix, did) delete
+ * every chunk task as non-retryable and strand the build in "running" until the sweeper failed
+ * it. Only null/undefined/empty ids are rejected.
+ */
 export function parseRenderChunkPayload(data: unknown): RenderChunkPayload | undefined {
   if (typeof data !== "object" || data == null) {
     return undefined
   }
   const obj = data as Record<string, unknown>
-  const { projectId, uploadId, chunkIndex, chunkCount, storyIds } = obj
-  if (typeof projectId !== "string" || projectId === "") {
-    return undefined
-  }
-  if (typeof uploadId !== "string" || uploadId === "") {
+  const { chunkIndex, chunkCount, storyIds } = obj
+  const projectId = normalizeTaskDataId(obj.projectId)
+  const uploadId = normalizeTaskDataId(obj.uploadId)
+  if (projectId == undefined || uploadId == undefined) {
     return undefined
   }
   if (
@@ -201,7 +208,10 @@ export function parseRenderChunkPayload(data: unknown): RenderChunkPayload | und
  */
 export async function enqueueRenderChunks(
   screenshotTest: ScreenshotTest,
-  projectId: string,
+  // string | number so a caller holding the api's numeric Project.id cannot enqueue a numeric
+  // id: the chunk jsonb must always carry string ids (parseRenderChunkPayload tolerates numbers
+  // for rows enqueued pre-fix, but new rows are normalized at the source).
+  projectId: string | number,
   uploadId: string,
   chunks: readonly (readonly string[])[],
   checkData?: BuildCheckData,
@@ -213,7 +223,7 @@ export async function enqueueRenderChunks(
   const params: unknown[] = []
   chunks.forEach((storyIds, chunkIndex) => {
     const data: RenderChunkPayload = {
-      projectId,
+      projectId: String(projectId),
       uploadId,
       storyIds: [...storyIds],
       chunkIndex,

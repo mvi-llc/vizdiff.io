@@ -2,6 +2,7 @@ import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom
 import { isInfraErrorKind } from "shared"
 
 import { DatabasePool } from "./database"
+import { WORKER_TASK_LOCK_TIMEOUT_MINUTES } from "./environment"
 import { log } from "./log"
 import { getCurrentBuildProgress } from "./progress"
 
@@ -107,9 +108,6 @@ export function recordBrowserRelaunch(): void {
 /** How long a scrape will wait on the queue-depth query before serving the last-known value. */
 const QUEUE_DEPTH_QUERY_TIMEOUT_MS = 2000
 
-/** Mirrors the availability window used by the task scheduler (tasks.ts LOCK_TIMEOUT_MINUTES). */
-const QUEUE_LOCK_TIMEOUT_MINUTES = 60
-
 let lastKnownQueueDepth: number | undefined
 
 /**
@@ -126,10 +124,12 @@ async function queryQueueDepth(): Promise<number | undefined> {
   const query = (async () => {
     const client = await DatabasePool()
     try {
+      // Mirrors the availability window used by the task scheduler (tasks.ts claimNextTask):
+      // a task whose lock outlived WORKER_TASK_LOCK_TIMEOUT_MINUTES is claimable again.
       const res = await client.query(
         `SELECT count(*)::int AS depth FROM task_queue
          WHERE locked_at IS NULL
-            OR locked_at < NOW() - INTERVAL '${QUEUE_LOCK_TIMEOUT_MINUTES} minutes'`,
+            OR locked_at < NOW() - INTERVAL '${WORKER_TASK_LOCK_TIMEOUT_MINUTES} minutes'`,
       )
       return (res.rows[0] as { depth: number } | undefined)?.depth
     } finally {

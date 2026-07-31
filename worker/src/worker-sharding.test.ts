@@ -303,6 +303,25 @@ describe("sharded ingest handoff (#456 Phase B)", () => {
     }
   })
 
+  // Regression (#456 follow-up): the api's ingest payload carries the NUMERIC Project.id. Even
+  // if a numeric projectId slips through to the handoff, the enqueued chunk jsonb must carry
+  // STRING ids — pre-fix the number was copied verbatim and parseRenderChunkPayload rejected
+  // every chunk as non-retryable.
+  it("enqueues chunk payloads with a string projectId even when fed the api's numeric id", async () => {
+    await ingestStorybook(42 as unknown as string, 123, "test-upload")
+
+    const insertCalls = mockPoolQuery.mock.calls.filter(([sql]) =>
+      (sql as string).includes("INSERT INTO task_queue"),
+    )
+    expect(insertCalls).toHaveLength(1)
+    const [, params] = insertCalls[0]! as [string, unknown[]]
+    const chunk0 = JSON.parse(params[1] as string) as Record<string, unknown>
+    const chunk1 = JSON.parse(params[3] as string) as Record<string, unknown>
+    expect(chunk0.projectId).toBe("42")
+    expect(chunk1.projectId).toBe("42")
+    expect(typeof chunk0.uploadId).toBe("string")
+  })
+
   it("renders inline (no chunk tasks) when the story count is below WORKER_SHARD_MIN_STORIES", async () => {
     // One story < WORKER_SHARD_MIN_STORIES (2): the flag is on but the build is too small.
     vi.mocked(getStorybookStories).mockResolvedValueOnce({

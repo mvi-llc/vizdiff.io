@@ -120,7 +120,8 @@ describe("worker metrics (#457)", () => {
       const [sql] = mockQuery.mock.calls[0] as [string]
       expect(sql).toContain("FROM task_queue")
       expect(sql).toMatch(/locked_at IS NULL/)
-      expect(sql).toMatch(/locked_at < NOW\(\) - INTERVAL '60 minutes'/)
+      // Mirrors the claim expiry window (WORKER_TASK_LOCK_TIMEOUT_MINUTES, default 10).
+      expect(sql).toMatch(/locked_at < NOW\(\) - INTERVAL '10 minutes'/)
       expect(mockRelease).toHaveBeenCalledTimes(1)
     })
 
