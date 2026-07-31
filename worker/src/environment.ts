@@ -294,6 +294,21 @@ export const WORKER_FATAL_FAILSAFE_TIMEOUT_MS = intEnv("WORKER_FATAL_FAILSAFE_TI
 // burned. Default: 3.
 export const WORKER_MAX_TASK_ATTEMPTS = intEnv("WORKER_MAX_TASK_ATTEMPTS", 3)
 
+// How long a task_queue claim lock is honored (minutes) before other workers treat the task as
+// abandoned and reclaim it (tasks.ts claimNextTask; mirrored by the queue-depth metric in
+// metrics.ts). While a claimed task is being processed the owning worker refreshes locked_at
+// every minute (the task-lock heartbeat, tasks.ts startTaskLockHeartbeat), so this expiry only
+// ever fires for owners that died without releasing the lock (SIGKILL/OOM) — a legitimately
+// long build keeps its lock fresh indefinitely. ORDERING CONSTRAINT: keep this below the
+// effective stuck-running threshold (max(WORKER_STUCK_RUNNING_MINUTES,
+// 3 x WORKER_PROGRESS_TIMEOUT_MS) — see worker.ts) so an orphaned render_story_chunk task is
+// reclaimed by a surviving worker — resuming build progress — before the stuck-build sweeper
+// fails the whole build for lack of progress. Values < 1 are clamped to 1. Default: 10 minutes.
+export const WORKER_TASK_LOCK_TIMEOUT_MINUTES = Math.max(
+  1,
+  intEnv("WORKER_TASK_LOCK_TIMEOUT_MINUTES", 10),
+)
+
 // Consider a "running" build stuck once its last activity (COALESCE(last_progress_at,
 // updated_at); last_progress_at is the render heartbeat written by progress.ts, issue #452) is
 // older than this many minutes. Minutes-scale: a healthy build heartbeats every few seconds and

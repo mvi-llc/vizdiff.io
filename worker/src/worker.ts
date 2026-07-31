@@ -28,14 +28,20 @@ import {
   claimNextTask,
   NonRetryableTaskError,
   DependencyNotReadyError,
+  normalizeTaskDataId,
+  startTaskLockHeartbeat,
   type ClaimedTask,
 } from "./tasks"
 import { BuildTimeoutError } from "./timeout"
 import { parseBuildCheckData, postBuildFailedStatus, type BuildCheckData } from "./vcsStatus"
 
+// The `data` jsonb the api stores on an `ingest_storybook` task. `projectId` is the api's
+// `Project.id` — a NUMBER (`@PrimaryGeneratedColumn`) that jsonb round-trips as a number —
+// while `uploadId` is a uuidv7 string; both are normalized to strings at the processTask
+// boundary so everything downstream (S3 keys, cache dirs, enqueued chunk payloads) sees strings.
 type IngestStorybookPayload = {
-  projectId: string
-  uploadId: string
+  projectId: string | number
+  uploadId: string | number
   githubCheckData?: GitHubCheckData
   gitlabCheckData?: GitLabCheckData
 }
@@ -96,7 +102,8 @@ let currentTaskId: number | undefined
 // Set while a claim round-trip is in flight (issue #456). The claim itself decides which task
 // is taken (oldest-first SKIP LOCKED — there is no per-id fetch anymore), so this synchronous
 // guard keeps the poll loop and the NOTIFY path from both claiming a row: a single-task worker
-// could only run one of them, and the loser's row would sit locked for LOCK_TIMEOUT_MINUTES.
+// could only run one of them, and the loser's row would sit locked for
+// WORKER_TASK_LOCK_TIMEOUT_MINUTES.
 let claimInFlight = false
 // Set once a shutdown signal (SIGTERM/SIGINT) has been received; stops the worker from
 // accepting any new tasks while the graceful shutdown runs.
@@ -255,7 +262,7 @@ async function main() {
   process.on("exit", shutdown)
   // Graceful shutdown on `docker stop` / Ctrl-C: stop accepting new tasks, release the
   // current task's lock so another worker can pick it up immediately (instead of waiting out
-  // LOCK_TIMEOUT_MINUTES), close the subscriber and pool, then exit.
+  // WORKER_TASK_LOCK_TIMEOUT_MINUTES), close the subscriber and pool, then exit.
   process.on("SIGTERM", handleShutdownSignal)
   process.on("SIGINT", handleShutdownSignal)
 
@@ -478,6 +485,11 @@ export async function startTask(task: ClaimedTask): Promise<void> {
   }
   currentTaskId = taskQueueId
   markTaskStarted(taskQueueId)
+  // Keep the claim lock fresh while the task runs: without the heartbeat a legitimately long
+  // task (e.g. a large inline build) would outlive WORKER_TASK_LOCK_TIMEOUT_MINUTES and be
+  // stolen mid-run by a sibling worker. With it, lock expiry only ever reclaims tasks whose
+  // owner died without releasing (SIGKILL/OOM).
+  const stopLockHeartbeat = startTaskLockHeartbeat(taskQueueId)
 
   try {
     log.debug(`Starting task ${taskQueueId} [${task.task_type}]`)
@@ -494,6 +506,7 @@ export async function startTask(task: ClaimedTask): Promise<void> {
     }
     throw error
   } finally {
+    stopLockHeartbeat()
     markTaskFinished()
     currentTaskId = undefined
   }
@@ -508,11 +521,20 @@ export async function processTask(
   try {
     switch (taskType) {
       case "ingest_storybook": {
-        const { projectId, uploadId, githubCheckData, gitlabCheckData } =
-          data as Partial<IngestStorybookPayload>
-        if (!projectId || !uploadId) {
+        const {
+          projectId: rawProjectId,
+          uploadId: rawUploadId,
+          githubCheckData,
+          gitlabCheckData,
+        } = data as Partial<IngestStorybookPayload>
+        // Normalize the api's numeric projectId (and, defensively, uploadId) to strings at this
+        // boundary, so the sharded handoff enqueues chunk payloads with string ids.
+        const projectId = normalizeTaskDataId(rawProjectId)
+        const uploadId = normalizeTaskDataId(rawUploadId)
+        if (projectId == undefined || uploadId == undefined) {
           throw new Error(
-            `Missing required ingest_storybook fields: projectId=${projectId}, uploadId=${uploadId}`,
+            `Missing required ingest_storybook fields: projectId=${String(rawProjectId)}, ` +
+              `uploadId=${String(rawUploadId)}`,
           )
         }
 
@@ -610,8 +632,8 @@ export function shutdown(): void {
 /**
  * Graceful shutdown on SIGTERM/SIGINT (e.g. `docker stop`): stop accepting new tasks, release
  * the current task's lock so another worker can pick it up immediately instead of waiting out
- * LOCK_TIMEOUT_MINUTES, close the notification subscriber and connection pool, then exit. A
- * second signal during shutdown exits immediately.
+ * WORKER_TASK_LOCK_TIMEOUT_MINUTES, close the notification subscriber and connection pool,
+ * then exit. A second signal during shutdown exits immediately.
  */
 export function handleShutdownSignal(signal: NodeJS.Signals): void {
   if (shuttingDown) {
