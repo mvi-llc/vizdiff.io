@@ -213,6 +213,26 @@ export async function installStoryRenderStateHook(browser: Browser): Promise<voi
   }
 }
 
+/**
+ * Result of {@link waitForStoryReady}. Besides the readiness outcome, the readiness poll's last
+ * snapshot carries the page's content height (issue #474): measuring it here rides an execute
+ * round-trip the worker already pays, so capture no longer needs a separate pre-stabilization
+ * measurement call per story.
+ */
+export interface StoryReadyResult {
+  /**
+   * "rendered" = the story's render lifecycle completed (semantic readiness); "degraded" = no
+   * render-state signals were available and the legacy fixed-delay fallback was used.
+   */
+  outcome: "rendered" | "degraded"
+  /**
+   * Content height (max of `document.body.scrollHeight` and
+   * `document.documentElement.scrollHeight`) from the last successful readiness snapshot.
+   * Undefined on the degraded path or when the measurement failed.
+   */
+  contentHeight?: number
+}
+
 /** Warn only once per process when readiness degrades to the legacy fixed-delay behavior. */
 let warnedDegradedReadiness = false
 
@@ -248,12 +268,13 @@ const LEGACY_SETTLE_DELAY_MS = 500
  * @param browser The WebDriverIO browser session, already navigated to the story URL
  * @param story The story being captured (id + parameters)
  * @param opts Timeout overrides, primarily for tests
+ * @returns The readiness outcome plus the content height batched into the readiness snapshot
  */
 export async function waitForStoryReady(
   browser: Browser,
   story: Story,
   opts: { timeoutMs?: number; delayCapMs?: number } = {},
-): Promise<void> {
+): Promise<StoryReadyResult> {
   const timeoutMs = opts.timeoutMs ?? WORKER_STORY_RENDER_TIMEOUT_MS
   const delayCapMs = opts.delayCapMs ?? WORKER_STORY_DELAY_MAX_MS
   const storyId = story.id
@@ -261,6 +282,7 @@ export async function waitForStoryReady(
 
   let outcome: "rendered" | "degraded" | undefined
   let failure: StoryRenderEvent | undefined
+  let lastContentHeight: number | undefined
 
   const timeoutMsg = `Story ${storyId} did not finish rendering within ${timeoutMs}ms`
   try {
@@ -274,14 +296,26 @@ export async function waitForStoryReady(
           const preview = w.__STORYBOOK_PREVIEW__
           // eslint-disable-next-line no-underscore-dangle
           const state = w.__VIZDIFF_RENDER_STATE__
+          // Batched content-height probe (issue #474): measuring here rides the readiness poll's
+          // existing round-trip instead of a separate per-story execute call.
+          // @ts-expect-error: document is not defined
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+          const b = document.body as { scrollHeight?: number } | undefined
+          // @ts-expect-error: document is not defined
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+          const h = document.documentElement as { scrollHeight?: number } | undefined
           return {
             previewExists: !!preview,
             phase: preview?.currentRender?.phase,
             currentStoryId: preview?.currentRender?.id,
             events: state?.events ?? [],
             channelHooked: state?.hooked ?? false,
+            contentHeight: Math.max(b?.scrollHeight ?? 0, h?.scrollHeight ?? 0),
           }
         })
+        if (typeof snapshot.contentHeight === "number") {
+          lastContentHeight = snapshot.contentHeight
+        }
 
         // A failure event or an errored render phase fails the story immediately (the loading
         // fallback must never be captured as the story's screenshot).
@@ -347,7 +381,9 @@ export async function waitForStoryReady(
       )
     }
     await browser.pause(LEGACY_SETTLE_DELAY_MS)
-    return
+    // No contentHeight on the degraded path: with no render-state signals there is no reason to
+    // trust the snapshot-time layout, so capture performs its own authoritative measurement.
+    return { outcome: "degraded" }
   }
 
   // Ready-signal convention (Chromatic-era `useReadySignal` storybooks): the story resolves an
@@ -395,6 +431,8 @@ export async function waitForStoryReady(
     log.debug(`Pausing ${delayMs}ms before capture for story ${storyId} (per-story delay)`)
     await browser.pause(delayMs)
   }
+
+  return { outcome: "rendered", contentHeight: lastContentHeight }
 }
 
 /** Clamps a story-supplied delay to [0, capMs]; non-finite values are treated as 0. */

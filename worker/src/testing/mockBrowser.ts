@@ -180,6 +180,13 @@ function buildFakeWindow(state: MockPageState): Record<string, unknown> {
     __STORYBOOK_PREVIEW__: preview,
     __VIZDIFF_RENDER_STATE__: { events: state.events, hooked: state.channelHooked },
     __VIZDIFF_STORY_READY__: state.storyReady,
+    // Immediate callback so the rAF-spaced stabilization tick (issue #474) — an execute whose
+    // page function awaits a requestAnimationFrame-chained promise — resolves without any timer
+    // advancement (fake-timer compatible: no setTimeout involved).
+    requestAnimationFrame: (callback: () => void): number => {
+      callback()
+      return 0
+    },
   }
 }
 

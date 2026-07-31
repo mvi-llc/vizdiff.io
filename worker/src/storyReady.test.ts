@@ -46,7 +46,7 @@ describe("waitForStoryReady", () => {
     setTimeout(() => (state.phase = "rendering"), 200)
     setTimeout(() => (state.phase = "completed"), 400)
     await vi.advanceTimersByTimeAsync(1000)
-    await expect(promise).resolves.toBeUndefined()
+    await expect(promise).resolves.toMatchObject({ outcome: "rendered" })
   })
 
   it("completes on a storyRendered event even with no currentRender phase", async () => {
@@ -54,7 +54,9 @@ describe("waitForStoryReady", () => {
       phase: undefined,
       events: [{ type: "storyRendered", storyId: STORY_ID }],
     })
-    await expect(waitForStoryReady(browser, makeStory())).resolves.toBeUndefined()
+    await expect(waitForStoryReady(browser, makeStory())).resolves.toMatchObject({
+      outcome: "rendered",
+    })
   })
 
   it("counts docsRendered as render completion", async () => {
@@ -62,7 +64,9 @@ describe("waitForStoryReady", () => {
       phase: undefined,
       events: [{ type: "docsRendered", storyId: STORY_ID }],
     })
-    await expect(waitForStoryReady(browser, makeStory())).resolves.toBeUndefined()
+    await expect(waitForStoryReady(browser, makeStory())).resolves.toMatchObject({
+      outcome: "rendered",
+    })
   })
 
   it("throws StoryRenderError on a storyErrored event, well before the timeout", async () => {
@@ -98,7 +102,7 @@ describe("waitForStoryReady", () => {
     const { browser, fns } = createMockBrowser()
     await expect(
       waitForStoryReady(browser, makeStory({ vizdiff: { delay: 2000 } })),
-    ).resolves.toBeUndefined()
+    ).resolves.toMatchObject({ outcome: "rendered" })
     expect(fns.pause).toHaveBeenCalledWith(2000)
   })
 
@@ -106,7 +110,7 @@ describe("waitForStoryReady", () => {
     const { browser, fns } = createMockBrowser()
     await expect(
       waitForStoryReady(browser, makeStory({ chromatic: { delay: 1500 } })),
-    ).resolves.toBeUndefined()
+    ).resolves.toMatchObject({ outcome: "rendered" })
     expect(fns.pause).toHaveBeenCalledWith(1500)
   })
 
@@ -114,7 +118,7 @@ describe("waitForStoryReady", () => {
     const { browser, fns } = createMockBrowser()
     await expect(
       waitForStoryReady(browser, makeStory({ vizdiff: { delay: 60_000 } }), { delayCapMs: 1000 }),
-    ).resolves.toBeUndefined()
+    ).resolves.toMatchObject({ outcome: "rendered" })
     expect(fns.pause).toHaveBeenCalledWith(1000)
     expect(fns.pause).not.toHaveBeenCalledWith(60_000)
   })
@@ -124,7 +128,7 @@ describe("waitForStoryReady", () => {
     const promise = waitForStoryReady(browser, makeStory({ useReadySignal: true }))
     setTimeout(() => (state.storyReady = true), 300)
     await vi.advanceTimersByTimeAsync(1000)
-    await expect(promise).resolves.toBeUndefined()
+    await expect(promise).resolves.toMatchObject({ outcome: "rendered" })
   })
 
   it('times out with reason "ready-signal" when the opted-in signal never resolves', async () => {
@@ -145,8 +149,20 @@ describe("waitForStoryReady", () => {
     state.events = []
     const promise = waitForStoryReady(browser, makeStory())
     await vi.advanceTimersByTimeAsync(6000)
-    await expect(promise).resolves.toBeUndefined()
+    const result = await promise
+    expect(result.outcome).toBe("degraded")
+    // No batched content height on the degraded path (issue #474): capture must fall back to its
+    // own authoritative measurement.
+    expect(result.contentHeight).toBeUndefined()
     expect(fns.pause).toHaveBeenCalledWith(500)
+  })
+
+  it("returns the content height measured on the readiness snapshot (#474)", async () => {
+    const { browser } = createMockBrowser({ contentHeight: 1234 })
+    await expect(waitForStoryReady(browser, makeStory())).resolves.toEqual({
+      outcome: "rendered",
+      contentHeight: 1234,
+    })
   })
 })
 

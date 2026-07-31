@@ -5,10 +5,18 @@ import { TestResult, ScreenshotTest, screenshotKey } from "shared"
 import { Readable } from "stream"
 import type { Repository } from "typeorm"
 import { expect, describe, it, vi, beforeEach } from "vitest"
+import type { Browser } from "webdriverio"
 
 import type { BrowserPool, PooledSession } from "./browserPool"
-import { captureStory, finalizeStory, processStoryWithRetry, renderStory } from "./stories"
+import {
+  captureStory,
+  finalizeStory,
+  getSessionCaptureState,
+  processStoryWithRetry,
+  renderStory,
+} from "./stories"
 import { createMockBrowser, defaultMockPageState } from "./testing/mockBrowser"
+import type { Story } from "./types"
 
 /**
  * Test suite for the screenshot comparison functionality.
@@ -297,6 +305,10 @@ describe("stories", () => {
     // Reset the scripted page state (individual tests mutate it)
     Object.assign(mockPageState, defaultMockPageState())
 
+    // Reset the per-session viewport skip cache (issue #474): the shared mockBrowser object
+    // persists across tests, so a cached viewport would otherwise leak between them.
+    delete getSessionCaptureState(mockBrowser).lastViewport
+
     // Reset PNG mock state
     ;(PNG as unknown as { setTestMode(mode: string): void }).setTestMode("")
 
@@ -521,9 +533,9 @@ describe("stories", () => {
     // 3. Stability check attempt (succeeds)
     expect(mockBrowserSaveScreenshot).toHaveBeenCalledTimes(3)
     expect(mockBrowserPause).toHaveBeenCalledWith(1000) // For retry delay
-    // Stability check interval: WORKER_STABILIZE_INTERVAL_MS (issue #456; default 250, was a
-    // hardcoded 500).
-    expect(mockBrowserPause).toHaveBeenCalledWith(250)
+    // Adaptive cadence (issue #474): the first stability check is rAF-spaced and sleep-free, so
+    // no WORKER_STABILIZE_INTERVAL_MS pause occurs for a story that settles immediately.
+    expect(mockBrowserPause).not.toHaveBeenCalledWith(250)
   })
 
   /**
@@ -708,6 +720,162 @@ describe("stories", () => {
       })
 
       expect(mockPixelmatch).toHaveBeenCalled()
+    })
+  })
+
+  /**
+   * Issue #474: adaptive stabilization cadence. The first stability check is rAF-spaced and
+   * sleep-free; only a nonzero first diff falls back to paced checks with backoff
+   * (min(interval, 100) -> interval -> 2x interval capped at 500 ms).
+   */
+  describe("adaptive stabilization cadence (#474)", () => {
+    function renderInfo() {
+      return {
+        story: mockStory,
+        screenshotTest: mockScreenshotTest,
+        bucket: "test-bucket",
+        tmpDir: "/tmp/test",
+        projectId: "test-project",
+        uploadId: "123",
+        port: 9009,
+        s3Client: new S3Client({}),
+        testResultTable: {
+          upsert: mockTestResultSave.mockImplementation(async (data: TestResult) =>
+            upsertResult(data),
+          ),
+        } as unknown as Repository<TestResult>,
+        browser: mockBrowser,
+      }
+    }
+
+    it("captures with zero pauses when the first two screenshots are identical", async () => {
+      // Default mock: screenshots are byte-identical and the content fits the viewport, so the
+      // story stabilizes on the rAF-spaced first attempt with no sleeps anywhere in capture.
+      await renderStory(renderInfo())
+
+      expect(mockBrowserPause).not.toHaveBeenCalled()
+    })
+
+    it("falls back to backoff-paced checks when the page keeps changing", async () => {
+      // Every capture returns distinct bytes and the first three comparisons report a fully
+      // changed page, so the loop must pace attempts 2-4 with the backoff sequence.
+      mockBrowserSaveScreenshot
+        .mockResolvedValueOnce(Buffer.from("frame 0")) // initial screenshot
+        .mockResolvedValueOnce(Buffer.from("frame 1")) // attempt 1 (rAF-spaced)
+        .mockResolvedValueOnce(Buffer.from("frame 2")) // attempt 2
+        .mockResolvedValueOnce(Buffer.from("frame 3")) // attempt 3
+        .mockResolvedValueOnce(Buffer.from("frame 4")) // attempt 4 (settles)
+      mockPixelmatch
+        .mockImplementationOnce(() => 10_000) // attempt 1: still changing
+        .mockImplementationOnce(() => 10_000) // attempt 2: still changing
+        .mockImplementationOnce(() => 10_000) // attempt 3: still changing
+
+      await renderStory(renderInfo())
+
+      // min(WORKER_STABILIZE_INTERVAL_MS, 100), WORKER_STABILIZE_INTERVAL_MS, 2x capped at 500.
+      expect(mockBrowserPause.mock.calls.map((call) => call[0] as number)).toEqual([100, 250, 500])
+    })
+  })
+
+  /**
+   * Issue #474: the initial content-height measurement rides the readiness snapshot instead of a
+   * separate execute round-trip, and setViewport is skipped when the viewport is unchanged from
+   * the session's previous story (invalidated automatically when the pool swaps in a new Browser
+   * object).
+   */
+  describe("round-trip batching and viewport skip cache (#474)", () => {
+    function infoWith(browser: Browser, story: Story = mockStory) {
+      return {
+        story,
+        screenshotTest: mockScreenshotTest,
+        bucket: "test-bucket",
+        tmpDir: "/tmp/test",
+        projectId: "test-project",
+        uploadId: "123",
+        port: 9009,
+        s3Client: new S3Client({}),
+        testResultTable: {
+          upsert: mockTestResultSave.mockImplementation(async (data: TestResult) =>
+            upsertResult(data),
+          ),
+        } as unknown as Repository<TestResult>,
+        browser,
+      }
+    }
+
+    it("batches the initial height probe into the readiness poll (no separate measure)", async () => {
+      // Default state: readiness succeeds on the first poll, the story stabilizes on attempt 1,
+      // and the settled re-measure is skipped. Capture therefore performs exactly three execute
+      // round-trips: readiness snapshot, CSS injection, and the rAF-spaced tick — with no
+      // standalone content-height measurement before stabilization.
+      await captureStory(infoWith(mockBrowser))
+
+      expect(mockBrowserFns.execute).toHaveBeenCalledTimes(3)
+    })
+
+    it("uses the readiness-snapshot height for the initial viewport fit", async () => {
+      // The first (readiness-snapshot) measurement reports tall content, so the initial viewport
+      // adjustment must grow the viewport before stabilization even begins.
+      mockPageState.contentHeight = [3000, 3000]
+
+      await captureStory(infoWith(mockBrowser))
+
+      expect(mockBrowserSetViewport).toHaveBeenCalledWith(
+        expect.objectContaining({ width: 1200, height: 3000 }),
+      )
+    })
+
+    it("skips setViewport when the viewport is unchanged on the same session", async () => {
+      const { browser, fns } = createMockBrowser()
+
+      await renderStory(infoWith(browser))
+      await renderStory(infoWith(browser))
+
+      // Two stories at the same default viewport: one BiDi setViewport call total.
+      expect(fns.setViewport).toHaveBeenCalledTimes(1)
+    })
+
+    it("re-applies setViewport when the story viewport differs", async () => {
+      const { browser, fns } = createMockBrowser()
+      const smallStory = {
+        ...mockStory,
+        id: "stories-components-teststory--small",
+        parameters: {
+          viewport: {
+            viewports: {
+              small: {
+                name: "small",
+                type: "mobile" as const,
+                styles: { width: "600px", height: "400px" },
+              },
+            },
+            defaultViewport: "small",
+          },
+        },
+      }
+
+      await renderStory(infoWith(browser))
+      await renderStory(infoWith(browser, smallStory))
+
+      expect(fns.setViewport).toHaveBeenCalledTimes(2)
+      expect(fns.setViewport).toHaveBeenLastCalledWith({
+        width: 600,
+        height: 400,
+        devicePixelRatio: 1,
+      })
+    })
+
+    it("re-applies setViewport on a fresh Browser object (pool replace)", async () => {
+      // BrowserPool.replace() swaps a brand-new Browser instance into the session; the WeakMap
+      // keying must invalidate the cache so the fresh browser gets its viewport set.
+      const first = createMockBrowser()
+      const second = createMockBrowser()
+
+      await renderStory(infoWith(first.browser))
+      await renderStory(infoWith(second.browser))
+
+      expect(first.fns.setViewport).toHaveBeenCalledTimes(1)
+      expect(second.fns.setViewport).toHaveBeenCalledTimes(1)
     })
   })
 
