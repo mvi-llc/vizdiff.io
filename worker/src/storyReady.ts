@@ -40,12 +40,31 @@ export interface StoryRenderEvent {
 export interface VizdiffRenderState {
   events: StoryRenderEvent[]
   hooked: boolean
+  /** Bumped by {@link reset} on every in-place story switch (issue #474); a debugging aid. */
+  generation: number
+  /** The story id the state was last {@link reset} for (issue #474). */
+  currentStoryId?: string
+  /** The hooked Storybook channel, captured on both attach paths (issue #474). */
+  channel?: unknown
+  /**
+   * Re-arms the render state for an in-place story switch (issue #474): clears recorded events,
+   * bumps `generation`, records the target story id, and resets `__VIZDIFF_STORY_READY__` —
+   * so stale signals from the previous story can never satisfy (or fail) the next story's
+   * readiness wait.
+   */
+  reset: (storyId: string) => void
 }
 
 /** The page globals the render-state init script installs. */
 export type RenderStateWindow = {
   __VIZDIFF_RENDER_STATE__?: VizdiffRenderState
   __VIZDIFF_STORY_READY__?: boolean
+  /**
+   * Emits an event on the hooked Storybook preview channel (issue #474 in-place switching).
+   * Returns false when no channel with an `emit` function has been captured yet, in which case
+   * the caller falls back to a hard navigation.
+   */
+  __VIZDIFF_EMIT__?: (type: string, payload?: unknown) => boolean
 }
 
 /** Channel events that mean the story (or docs page) finished rendering. */
@@ -93,8 +112,10 @@ export class StoryRenderTimeoutError extends Error {
  * be serialized via `addInitScript` (same idiom as `safeguardInitScript` in safeguards.ts).
  *
  * Behavior:
- *  - Installs `window.__VIZDIFF_RENDER_STATE__ = { events: [], hooked: false }` and
- *    `window.__VIZDIFF_STORY_READY__ = false`.
+ *  - Installs `window.__VIZDIFF_RENDER_STATE__` (events, hooked flag, generation counter, and a
+ *    `reset(storyId)` re-arm hook for in-place story switching, issue #474),
+ *    `window.__VIZDIFF_STORY_READY__ = false`, and `window.__VIZDIFF_EMIT__` (emits on the
+ *    captured channel, or returns false so the worker hard-navigates instead).
  *  - Intercepts Storybook's assignment of `window.__STORYBOOK_ADDONS_CHANNEL__` (via a
  *    configurable accessor) and attaches listeners for the story-render lifecycle events:
  *    `storyRendered`/`docsRendered` (success) and `storyErrored`/`storyThrewException`/
@@ -110,11 +131,37 @@ export function renderStateInitScript(): void {
   try {
     // @ts-ignore
     const w: any = window
-    const state = { events: [] as any[], hooked: false }
+    const state: any = {
+      events: [] as any[],
+      hooked: false,
+      generation: 0,
+      currentStoryId: undefined,
+      channel: undefined,
+    }
+    // Re-arms the render state for an in-place story switch (issue #474): the worker calls this
+    // page-side just before emitting `setCurrentStory`, so stale events (and a stale ready
+    // signal) from the previous story can never satisfy or fail the next story's readiness wait.
+    state.reset = (storyId: any): void => {
+      state.events = []
+      state.generation++
+      state.currentStoryId = storyId
+      w.__VIZDIFF_STORY_READY__ = false
+    }
     w.__VIZDIFF_RENDER_STATE__ = state
     // Reset per document: stories opting into the ready-signal convention set this to true once
     // their async scene is actually drawn (see docs/CONFIGURATION.md "Story readiness").
     w.__VIZDIFF_STORY_READY__ = false
+
+    // Emit helper for in-place story switching (issue #474): emits on the channel captured by
+    // attach() below, or returns false so the worker falls back to a hard navigation.
+    w.__VIZDIFF_EMIT__ = (type: any, payload: any): boolean => {
+      const channel = state.channel
+      if (!channel || typeof channel.emit !== "function") {
+        return false
+      }
+      channel.emit(type, payload)
+      return true
+    }
 
     const EVENT_TYPES = [
       // Success
@@ -131,6 +178,8 @@ export function renderStateInitScript(): void {
       if (state.hooked || !channel || typeof channel.on !== "function") {
         return
       }
+      // Capture the channel for __VIZDIFF_EMIT__ on BOTH attach paths (defineProperty and poll).
+      state.channel = channel
       for (const type of EVENT_TYPES) {
         channel.on(type, (arg: any) => {
           // Storybook emits either a story id string, an Error, or an object with
@@ -265,18 +314,30 @@ const LEGACY_SETTLE_DELAY_MS = 500
  * TASK: Use WebDriver BiDi to additionally wait for "network quiescence" (in-flight fonts/images/
  * fetches settling) after render completion, as Chromatic does.
  *
+ * Story-scoped readiness (issue #474, in-place switching): `opts.mode` selects how ambiguous
+ * signals are interpreted. After a SOFT switch the document is reused, so
+ * `preview.currentRender.phase` can still read `"completed"` (or `"errored"`) from the PREVIOUS
+ * story for a beat — soft mode therefore only accepts a completed phase once
+ * `currentRender.id === story.id`, and only fails on an errored phase attributable to this story.
+ * Hard mode (a fresh document) keeps the permissive semantics: a completed phase counts when
+ * `currentRender.id` is undefined (old Storybooks) or matches. Success events are story-scoped in
+ * both modes (a `storyRendered` for a different id is ignored; an id-less one is accepted), while
+ * ANY failure event fails the story — the event buffer was cleared by navigation or by the
+ * switch-time `reset`, so even id-less exceptions belong to this story.
+ *
  * @param browser The WebDriverIO browser session, already navigated to the story URL
  * @param story The story being captured (id + parameters)
- * @param opts Timeout overrides, primarily for tests
+ * @param opts Timeout overrides (primarily for tests) and the navigation mode (issue #474)
  * @returns The readiness outcome plus the content height batched into the readiness snapshot
  */
 export async function waitForStoryReady(
   browser: Browser,
   story: Story,
-  opts: { timeoutMs?: number; delayCapMs?: number } = {},
+  opts: { timeoutMs?: number; delayCapMs?: number; mode?: "soft" | "hard" } = {},
 ): Promise<StoryReadyResult> {
   const timeoutMs = opts.timeoutMs ?? WORKER_STORY_RENDER_TIMEOUT_MS
   const delayCapMs = opts.delayCapMs ?? WORKER_STORY_DELAY_MAX_MS
+  const mode = opts.mode ?? "hard"
   const storyId = story.id
   const startTime = Date.now()
 
@@ -317,30 +378,52 @@ export async function waitForStoryReady(
           lastContentHeight = snapshot.contentHeight
         }
 
-        // A failure event or an errored render phase fails the story immediately (the loading
-        // fallback must never be captured as the story's screenshot).
+        // A failure event fails the story immediately (the loading fallback must never be
+        // captured as the story's screenshot). Events are generation-scoped: cleared by the hard
+        // navigation (new document) or the switch-time reset (issue #474), so even a storyId-less
+        // exception event is attributable to this story.
         const failureEvent = snapshot.events.find((event) => FAILURE_EVENT_TYPES.has(event.type))
         if (failureEvent) {
           failure = failureEvent
           return true
         }
-        if (snapshot.phase === "errored") {
+        if (
+          snapshot.phase === "errored" &&
+          // Soft mode (issue #474): currentRender can still be the previous story's render for a
+          // beat after the switch, so only an errored phase attributable to THIS story fails it.
+          (mode === "hard" ||
+            snapshot.currentStoryId == undefined ||
+            snapshot.currentStoryId === storyId)
+        ) {
           failure = { type: "errored-phase" }
           return true
         }
 
-        const succeeded =
-          snapshot.events.some((event) => SUCCESS_EVENT_TYPES.has(event.type)) ||
-          snapshot.phase === "completed"
-        if (succeeded) {
+        const succeededByEvent = snapshot.events.some(
+          (event) =>
+            SUCCESS_EVENT_TYPES.has(event.type) &&
+            (event.storyId === storyId || event.storyId == undefined),
+        )
+        // Phase success is story-scoped in soft mode (a reused document's phase can be stale,
+        // issue #474); hard mode accepts an id-less currentRender for back-compat.
+        const succeededByPhase =
+          snapshot.phase === "completed" &&
+          (mode === "soft"
+            ? snapshot.currentStoryId === storyId
+            : snapshot.currentStoryId == undefined || snapshot.currentStoryId === storyId)
+        if (succeededByEvent || succeededByPhase) {
           outcome = "rendered"
           return true
         }
 
         // Graceful degradation: the preview booted but nothing is reporting render state (no
         // channel hook, no currentRender, no events). Proceed legacy-style rather than failing
-        // every story on Storybooks/drivers that predate these signals.
+        // every story on Storybooks/drivers that predate these signals. Hard-mode only: a soft
+        // switch is only attempted when the channel is hooked (switchToStory returned true), so
+        // a signal-less page cannot be the soft path — and degrading there would silently
+        // screenshot the previous story.
         if (
+          mode === "hard" &&
           snapshot.previewExists &&
           !snapshot.channelHooked &&
           snapshot.phase == undefined &&

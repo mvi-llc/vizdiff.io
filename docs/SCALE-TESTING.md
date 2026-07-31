@@ -19,6 +19,11 @@ worker-owned network requests — which frame-scoped request interception cannot
 covered end to end (issue #473). All assertions run against the total (`--stories` +
 `--worker-stories`).
 
+The fixture also exposes a minimal Storybook preview channel so the worker's in-place story
+switching (issue #474) is exercised by default; pass `--legacy-fixture` to generate the pre-#474
+channel-less HTML instead, which forces the worker down the hard-navigation fallback path on
+every story (useful for comparing the two navigation modes on the same stack).
+
 Requirements: Docker + the compose plugin, `tar`, Node >= 20. Everything below runs from the
 repo root.
 

@@ -37,6 +37,40 @@ export interface MockPageState {
    * which lets a test script "layout not settled yet, then tall" sequences.
    */
   contentHeight: number | number[] | undefined
+  /**
+   * Whether the fake page has a hooked preview channel: `window.__VIZDIFF_EMIT__` returns true
+   * (and records the emit) when set, false when not (issue #474 in-place switching).
+   */
+  channelPresent: boolean
+  /** Emits recorded by the fake `__VIZDIFF_EMIT__` (issue #474 in-place switching). */
+  emitted: Array<{ type: string; payload: unknown }>
+  /**
+   * Scripted channel behavior, called after each successful `__VIZDIFF_EMIT__`. The default
+   * ({@link respondToSetCurrentStory}) reacts to `setCurrentStory` like a healthy Storybook:
+   * records a `storyRendered` event and points phase/currentStoryId at the target story. Replace
+   * it to script sick channels (errors, silence), or set undefined for an unresponsive one.
+   */
+  onEmit?: (state: MockPageState, type: string, payload: unknown) => void
+  /** URLs passed to `history.replaceState` by page functions under test (issue #474). */
+  replaceStateCalls: string[]
+}
+
+/**
+ * Default `onEmit`: behaves like a healthy Storybook preview receiving `setCurrentStory` — the
+ * story renders instantly, emitting `storyRendered` and completing the render phase.
+ */
+export function respondToSetCurrentStory(
+  state: MockPageState,
+  type: string,
+  payload: unknown,
+): void {
+  if (type !== "setCurrentStory") {
+    return
+  }
+  const storyId = (payload as { storyId?: string }).storyId
+  state.events.push({ type: "storyRendered", storyId })
+  state.phase = "completed"
+  state.currentStoryId = storyId
 }
 
 /** Default state: the current story completed rendering immediately. */
@@ -49,6 +83,10 @@ export function defaultMockPageState(): MockPageState {
     channelHooked: true,
     storyReady: false,
     contentHeight: undefined,
+    channelPresent: true,
+    emitted: [],
+    onEmit: respondToSetCurrentStory,
+    replaceStateCalls: [],
   }
 }
 
@@ -221,7 +259,31 @@ function buildFakeWindow(state: MockPageState): Record<string, unknown> {
     : undefined
   return {
     __STORYBOOK_PREVIEW__: preview,
-    __VIZDIFF_RENDER_STATE__: { events: state.events, hooked: state.channelHooked },
+    __VIZDIFF_RENDER_STATE__: {
+      events: state.events,
+      hooked: state.channelHooked,
+      generation: 0,
+      currentStoryId: undefined,
+      // Fake of the init script's re-arm hook (issue #474): clears recorded events (in place, so
+      // the state.events identity survives) and the ready signal.
+      reset: (_storyId: string): void => {
+        state.events.length = 0
+        state.storyReady = false
+      },
+    },
+    __VIZDIFF_EMIT__: (type: string, payload: unknown): boolean => {
+      if (!state.channelPresent) {
+        return false
+      }
+      state.emitted.push({ type, payload })
+      state.onEmit?.(state, type, payload)
+      return true
+    },
+    history: {
+      replaceState: (_data: unknown, _unused: string, url: string): void => {
+        state.replaceStateCalls.push(url)
+      },
+    },
     __VIZDIFF_STORY_READY__: state.storyReady,
     // Immediate callback so the rAF-spaced stabilization tick (issue #474) — an execute whose
     // page function awaits a requestAnimationFrame-chained promise — resolves without any timer

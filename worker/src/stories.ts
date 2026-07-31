@@ -21,6 +21,8 @@ import {
   MAX_STORY_IDENTIFIER_LENGTH,
   WORKER_CHANGED_MIN_PIXELS,
   WORKER_CHANGED_THRESHOLD,
+  WORKER_INPLACE_STORY_SWITCHING,
+  WORKER_NAV_REFRESH_STORIES,
   WORKER_POST_LOAD_DELAY_MS,
   WORKER_STABILIZE_INTERVAL_MS,
   WORKER_STORY_MAX_ATTEMPTS,
@@ -35,7 +37,13 @@ import {
   type CollectedDiagnostics,
 } from "./sessionDiagnostics"
 import { probeSession } from "./sessionHealth"
-import { waitForStoryReady } from "./storyReady"
+import {
+  StoryRenderError,
+  StoryRenderTimeoutError,
+  waitForStoryReady,
+  type RenderStateWindow,
+  type StoryReadyResult,
+} from "./storyReady"
 import type { SetViewportOptions, Story, StorybookWindow } from "./types"
 
 const SCREENSHOTS_UNCHANGED_TIMEOUT_MS = 10 * 1000
@@ -44,13 +52,30 @@ const IMAGE_UNCHANGED_THRESHOLD = 0.001
 /**
  * Per-session capture state (issue #474), keyed on the Browser object itself: BrowserPool's
  * `replace()` swaps a brand-new Browser instance into the session, so state cached against the
- * old instance is invalidated automatically (and garbage-collected via the WeakMap). The field
- * set is intentionally minimal for now; a later PR adds navigation state for in-place story
- * switching.
+ * old instance is invalidated automatically (and garbage-collected via the WeakMap).
  */
 export interface SessionCaptureState {
   /** The viewport last applied via {@link setViewportCached}, for skipping redundant BiDi calls. */
   lastViewport?: SetViewportOptions
+  /**
+   * The story id the session's document was last navigated (or in-place switched) to (issue
+   * #474 Phase B). Undefined until the first hard navigation on this session — a soft switch is
+   * only attempted once a story document is already loaded.
+   */
+  navigatedStoryId?: string
+  /**
+   * Whether the worker's capture CSS has been injected into the CURRENT document. The injected
+   * style element persists in `document.head` across soft switches, so injection runs once per
+   * document; a hard navigation resets this.
+   */
+  cssInjected: boolean
+  /** Soft switches since the last hard navigation (the WORKER_NAV_REFRESH_STORIES cadence). */
+  softSwitchesSinceNav: number
+  /**
+   * Set when the previous story on this session failed (any error class): the failed story may
+   * have left the document in an arbitrary state, so the next story hard-navigates.
+   */
+  lastStoryFailed: boolean
 }
 
 const sessionCaptureState = new WeakMap<Browser, SessionCaptureState>()
@@ -59,7 +84,7 @@ const sessionCaptureState = new WeakMap<Browser, SessionCaptureState>()
 export function getSessionCaptureState(browser: Browser): SessionCaptureState {
   let state = sessionCaptureState.get(browser)
   if (!state) {
-    state = {}
+    state = { cssInjected: false, softSwitchesSinceNav: 0, lastStoryFailed: false }
     sessionCaptureState.set(browser, state)
   }
   return state
@@ -277,9 +302,62 @@ export function getStoryViewport(story: Story): SetViewportOptions {
 }
 
 /**
+ * Attempts an in-place story switch (issue #474 Phase B): instead of a full page navigation, the
+ * loaded preview document is re-targeted at the next story by emitting `setCurrentStory` on the
+ * Storybook preview channel — the same strategy as Storybook test-runner and Chromatic. A changed
+ * story id remounts the story with its initial args on every supported Storybook (6.4–9), so no
+ * `forceRemount` is emitted. In ONE execute round-trip, page-side:
+ *
+ *  1. `__VIZDIFF_RENDER_STATE__.reset(storyId)` re-arms the readiness state (clears recorded
+ *     events, bumps the generation, resets the ready signal) so nothing stale from the previous
+ *     story can satisfy or fail this story's readiness wait;
+ *  2. `history.replaceState` rewrites the address bar to the canonical
+ *     `/iframe.html?id=<storyId>&viewMode=<viewMode>` URL, keeping Storybook's own URL-derived
+ *     state (and any human debugging a session) consistent with the rendered story;
+ *  3. `__VIZDIFF_EMIT__("setCurrentStory", ...)` performs the switch.
+ *
+ * Returns true when the switch was emitted; false when the page has no hooked channel (or no
+ * init-script state), in which case the caller falls back to a hard navigation.
+ */
+export async function switchToStory(browser: Browser, story: Story): Promise<boolean> {
+  // Docs "stories" are tagged `docs` in the index; everything else renders in story view mode.
+  const viewMode = story.tags.includes("docs") ? "docs" : "story"
+  const canonicalUrl = `/iframe.html?id=${encodeURIComponent(story.id)}&viewMode=${viewMode}`
+  return await browser.execute(
+    (storyId: string, vm: string, url: string) => {
+      // @ts-expect-error: window is not defined
+      const w = window as RenderStateWindow & {
+        history: { replaceState: (data: unknown, unused: string, url: string) => void }
+      }
+      // eslint-disable-next-line no-underscore-dangle
+      const state = w.__VIZDIFF_RENDER_STATE__
+      // eslint-disable-next-line no-underscore-dangle
+      const emit = w.__VIZDIFF_EMIT__
+      if (!state || typeof state.reset !== "function" || typeof emit !== "function") {
+        return false
+      }
+      state.reset(storyId)
+      w.history.replaceState(null, "", url)
+      return emit("setCurrentStory", { storyId, viewMode: vm })
+    },
+    story.id,
+    viewMode,
+    canonicalUrl,
+  )
+}
+
+/**
  * Navigates to a story, waits for it to stabilize, and saves a screenshot.
  * Runs against a single browser-pool session, which the caller checks out for the full render of
  * one story, so no additional locking is needed.
+ *
+ * Navigation policy (issue #474 Phase B): the first story on a session hard-navigates; subsequent
+ * stories switch in-place via {@link switchToStory} when `WORKER_INPLACE_STORY_SWITCHING` is on,
+ * the previous story on the session succeeded, the story does not opt out via
+ * `parameters.vizdiff.forceNavigation`, and the `WORKER_NAV_REFRESH_STORIES` cadence has not been
+ * reached. A soft switch that fails readiness gets ONE internal hard-navigation retry before the
+ * error propagates (infra-class errors propagate untouched, so the internal retry never consumes
+ * the caller's WORKER_STORY_MAX_ATTEMPTS budget).
  * @param browser WebDriverIO browser instance
  * @param story The story to capture (id + parameters, used for readiness and delay opt-ins)
  * @param port The port where the Storybook is being served locally
@@ -307,33 +385,88 @@ export async function captureStableScreenshot(
   log.debug(`Setting initial viewport for ${storyId}: ${viewport.width}x${viewport.height}`)
   await setViewportCached(browser, viewport)
 
-  // Navigate to the story
+  const state = getSessionCaptureState(browser)
   const storyUrl = `http://localhost:${port}/iframe.html?id=${storyId}` // Ensure port is used
-  log.debug(`Navigating to story URL: ${storyUrl}`)
-  await browser.url(storyUrl)
+
+  // Hard navigation: load a fresh document. Resets everything that is per-document: the CSS
+  // injection marker, the soft-switch cadence counter, and the previous-story-failed taint.
+  const hardNavigate = async (): Promise<void> => {
+    log.debug(`Navigating to story URL: ${storyUrl}`)
+    await browser.url(storyUrl)
+    state.navigatedStoryId = storyId
+    state.softSwitchesSinceNav = 0
+    state.cssInjected = false
+    state.lastStoryFailed = false
+  }
+
+  // Navigation policy (issue #474 Phase B): switch in-place when possible, hard-navigate
+  // otherwise. See the function doc comment for the full fallback ladder.
+  let navMode: "soft" | "hard" = "hard"
+  const softEligible =
+    WORKER_INPLACE_STORY_SWITCHING &&
+    state.navigatedStoryId != undefined &&
+    !state.lastStoryFailed &&
+    story.parameters?.vizdiff?.forceNavigation !== true &&
+    (WORKER_NAV_REFRESH_STORIES === 0 || state.softSwitchesSinceNav < WORKER_NAV_REFRESH_STORIES)
+  if (softEligible && (await switchToStory(browser, story))) {
+    navMode = "soft"
+    state.navigatedStoryId = storyId
+    state.softSwitchesSinceNav++
+    log.debug(`Switched to story ${storyId} in-place via the preview channel`)
+  } else {
+    await hardNavigate()
+  }
 
   // Wait for the story's render lifecycle to complete (issue #458). Visual quiescence alone is
   // not enough: async/Suspense stories paint a loading fallback that reads as "stable".
-  log.debug(`Waiting for story ${storyId} to render...`)
-  const readyResult = await waitForStoryReady(browser, story)
+  log.debug(`Waiting for story ${storyId} to render (navMode=${navMode})...`)
+  let readyResult: StoryReadyResult
+  try {
+    readyResult = await waitForStoryReady(browser, story, { mode: navMode })
+  } catch (err) {
+    // Fallback ladder (issue #474): a soft switch whose readiness failed gets ONE internal
+    // hard-navigation retry of the same story — some stories only misbehave in a reused document
+    // (leaked globals, stale singletons), and a fresh document is the fix, not a re-attempt on
+    // the same page. Only render-readiness errors are intercepted; infra-class errors (dead
+    // session, command timeout) propagate untouched to captureStoryWithRetry's classifier so the
+    // internal retry never consumes WORKER_STORY_MAX_ATTEMPTS.
+    if (
+      navMode === "soft" &&
+      (err instanceof StoryRenderError || err instanceof StoryRenderTimeoutError)
+    ) {
+      log.warn(
+        err,
+        `Soft switch to story ${storyId} failed readiness; retrying once with a hard navigation`,
+      )
+      navMode = "hard"
+      await hardNavigate()
+      readyResult = await waitForStoryReady(browser, story, { mode: "hard" })
+    } else {
+      throw err
+    }
+  }
 
-  // Inject CSS to remove Storybook's body padding
-  log.debug(`Injecting CSS to remove body padding for story ${storyId}`)
-  await browser.execute(() => {
-    // @ts-expect-error: document is not defined
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
-    const style = document.createElement("style")
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-    style.textContent = `
+  // Inject CSS to remove Storybook's body padding. Once per DOCUMENT, not per story (issue
+  // #474): the injected style element persists in document.head across soft switches.
+  if (!state.cssInjected) {
+    log.debug(`Injecting CSS to remove body padding for story ${storyId}`)
+    await browser.execute(() => {
+      // @ts-expect-error: document is not defined
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+      const style = document.createElement("style")
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      style.textContent = `
       body.sb-main-padded.sb-show-main {
         padding: 0 !important;
         margin: 0 !important;
       }
     `
-    // @ts-expect-error: document is not defined
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
-    document.head.appendChild(style)
-  })
+      // @ts-expect-error: document is not defined
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+      document.head.appendChild(style)
+    })
+    state.cssInjected = true
+  }
 
   // Adjust the viewport for the story. This is a best-effort first pass; the layout may not be
   // settled yet, so the post-stabilization adjustment below is authoritative for tall content.
@@ -514,7 +647,7 @@ export async function captureStableScreenshot(
     log.warn(err, `Failed to delete unused temp screenshot ${currentScreenshotPath}`)
   })
   // --- End Screenshot Logic ---
-  log.info(`Stable screenshot saved to ${outputFilePath}`)
+  log.info(`Stable screenshot saved to ${outputFilePath} (navMode=${navMode})`)
   return outputFilePath
 }
 
@@ -596,6 +729,10 @@ export async function captureStoryWithRetry(
       session.storiesRendered++
       return { kind: "captured", captured }
     } catch (err) {
+      // Taint the session for in-place switching (issue #474): whatever the failure class, the
+      // failed story may have left the shared document in an arbitrary state, so the next story
+      // captured on this session hard-navigates to a fresh document.
+      getSessionCaptureState(session.browser).lastStoryFailed = true
       const classified = classifyStoryError(err)
       if (classified.errorClass === "story") {
         logChild.error(

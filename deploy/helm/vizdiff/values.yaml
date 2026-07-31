@@ -234,6 +234,18 @@ worker:
   # full-height screenshot (issue #456, WORKER_POST_LOAD_DELAY_MS). Empty uses the built-in
   # default (250).
   postLoadDelayMs: ""
+  # -- In-place story switching (issue #474, WORKER_INPLACE_STORY_SWITCHING): navigate each
+  # pooled browser session once, then switch stories via the Storybook preview channel instead of
+  # a full page navigation per story (bundle re-parse, provider boot, fonts, and CSS injection
+  # become once-per-document). Hard navigation remains the automatic fallback — no channel,
+  # previous story failed, refresh cadence, or a per-story parameters.vizdiff.forceNavigation
+  # opt-out (see docs/CONFIGURATION.md "In-place story switching"). Enabled by default; set
+  # false to hard-navigate every story.
+  inplaceStorySwitching: true
+  # -- Hard-navigate after this many consecutive in-place story switches on a session to bound
+  # leaked page state (issue #474, WORKER_NAV_REFRESH_STORIES). "0" disables the cadence. Empty
+  # uses the built-in default (50).
+  navRefreshStories: ""
   # -- Progress watchdog (issue #452, WORKER_PROGRESS_TIMEOUT_MS): abort a build once no story
   # has completed for this many ms. "0" disables the watchdog. Empty uses the built-in default
   # (300000, 5 minutes).
