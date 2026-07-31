@@ -307,9 +307,14 @@ describe("stories", () => {
     // Reset the scripted page state (individual tests mutate it)
     Object.assign(mockPageState, defaultMockPageState())
 
-    // Reset the per-session viewport skip cache (issue #474): the shared mockBrowser object
-    // persists across tests, so a cached viewport would otherwise leak between them.
-    delete getSessionCaptureState(mockBrowser).lastViewport
+    // Reset the per-session capture state (issue #474): the shared mockBrowser object persists
+    // across tests, so cached viewport and navigation state would otherwise leak between them.
+    const captureState = getSessionCaptureState(mockBrowser)
+    delete captureState.lastViewport
+    delete captureState.navigatedStoryId
+    captureState.cssInjected = false
+    captureState.softSwitchesSinceNav = 0
+    captureState.lastStoryFailed = false
 
     // Reset PNG mock state
     ;(PNG as unknown as { setTestMode(mode: string): void }).setTestMode("")
@@ -878,6 +883,268 @@ describe("stories", () => {
 
       expect(first.fns.setViewport).toHaveBeenCalledTimes(1)
       expect(second.fns.setViewport).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  /**
+   * In-place story switching (issue #474 Phase B): the first story on a session hard-navigates;
+   * subsequent stories switch in-place via the preview channel (`setCurrentStory`) with hard
+   * navigation as the fallback ladder — channel missing, previous story failed, per-story
+   * forceNavigation opt-out, WORKER_NAV_REFRESH_STORIES cadence, or the env kill switch — plus
+   * one internal hard-navigation retry when a SOFT switch fails readiness.
+   */
+  describe("in-place story switching (#474 Phase B)", () => {
+    const storyB: Story = {
+      ...mockStory,
+      id: "stories-components-teststory--second",
+      name: "Second",
+    }
+    const storyC: Story = {
+      ...mockStory,
+      id: "stories-components-teststory--third",
+      name: "Third",
+    }
+
+    function infoFor(browser: Browser, story: Story = mockStory) {
+      return {
+        story,
+        screenshotTest: mockScreenshotTest,
+        bucket: "test-bucket",
+        tmpDir: "/tmp/test",
+        projectId: "test-project",
+        uploadId: "123",
+        port: 9009,
+        s3Client: new S3Client({}),
+        testResultTable: {
+          upsert: mockTestResultSave.mockImplementation(async (data: TestResult) =>
+            upsertResult(data),
+          ),
+        } as unknown as Repository<TestResult>,
+        browser,
+      }
+    }
+
+    /** Single-session fake pool around a specific mock browser, for processStoryWithRetry. */
+    function makePool(browser: Browser) {
+      const session: PooledSession = {
+        id: 0,
+        browser,
+        storiesRendered: 0,
+        consecutiveInfraFailures: 0,
+      }
+      const acquire = vi.fn(async () => session)
+      const pool = {
+        size: 1,
+        sessions: [session],
+        acquire,
+        release: vi.fn(async () => undefined),
+        replace: vi.fn(async () => undefined),
+        setSessionInit: vi.fn(),
+        destroyAll: vi.fn(async () => undefined),
+      } as unknown as BrowserPool
+      return { pool, acquire }
+    }
+
+    function poolInfoFor(browser: Browser, pool: BrowserPool, story: Story) {
+      const { browser: _browser, ...rest } = infoFor(browser, story)
+      return { ...rest, pool }
+    }
+
+    /** Execute calls that injected the capture CSS (identified by the style rule in the source). */
+    function cssInjectCalls(fns: ReturnType<typeof createMockBrowser>["fns"]) {
+      return fns.execute.mock.calls.filter(
+        ([script]) => typeof script === "function" && String(script).includes("sb-main-padded"),
+      )
+    }
+
+    it("hard-navigates the first story on a session (no soft switch without a document)", async () => {
+      const { browser, state, fns } = createMockBrowser()
+
+      await renderStory(infoFor(browser))
+
+      expect(fns.url).toHaveBeenCalledTimes(1)
+      expect(fns.url).toHaveBeenCalledWith(
+        "http://localhost:9009/iframe.html?id=stories-components-teststory--mycomponent",
+      )
+      expect(state.emitted).toEqual([])
+    })
+
+    it("soft-switches the second story: no navigation, one setCurrentStory, canonical URL, CSS once", async () => {
+      const { browser, state, fns } = createMockBrowser()
+
+      await renderStory(infoFor(browser))
+      await renderStory(infoFor(browser, storyB))
+
+      // No second navigation: the story switched in-place via the preview channel.
+      expect(fns.url).toHaveBeenCalledTimes(1)
+      expect(state.emitted).toEqual([
+        { type: "setCurrentStory", payload: { storyId: storyB.id, viewMode: "story" } },
+      ])
+      // The iframe URL was rewritten to the canonical story URL for debuggability.
+      expect(state.replaceStateCalls).toEqual([`/iframe.html?id=${storyB.id}&viewMode=story`])
+      // The injected style element persists in document.head: one CSS inject per document.
+      expect(cssInjectCalls(fns)).toHaveLength(1)
+    })
+
+    it("hard-retries the same story once when a soft switch fails readiness, without extra attempts", async () => {
+      const { browser, state, fns } = createMockBrowser()
+      const { pool, acquire } = makePool(browser)
+      await processStoryWithRetry(poolInfoFor(browser, pool, mockStory))
+      acquire.mockClear()
+      fns.url.mockClear()
+
+      // The channel accepts the switch but the story errors in the reused document; the fresh
+      // document loaded by the internal hard-navigation retry renders it fine.
+      state.onEmit = (s, type) => {
+        if (type === "setCurrentStory") {
+          s.events.push({ type: "storyErrored", message: "leaked global broke the soft render" })
+        }
+      }
+      fns.url.mockImplementation(async () => {
+        state.events.length = 0
+        state.phase = "completed"
+        state.currentStoryId = undefined
+      })
+
+      const testResult = await processStoryWithRetry(poolInfoFor(browser, pool, storyB))
+
+      expect(testResult.changeStatus).toBe("new")
+      // Exactly one hard navigation (the internal retry) and NO extra pool acquire: the retry
+      // happens inside the capture attempt, not via WORKER_STORY_MAX_ATTEMPTS.
+      expect(fns.url).toHaveBeenCalledTimes(1)
+      expect(acquire).toHaveBeenCalledTimes(1)
+      expect(state.emitted).toEqual([
+        { type: "setCurrentStory", payload: { storyId: storyB.id, viewMode: "story" } },
+      ])
+    })
+
+    it("records the hard-retry failure when both the soft switch and the retry fail", async () => {
+      const { browser, state, fns } = createMockBrowser()
+      const { pool, acquire } = makePool(browser)
+      await processStoryWithRetry(poolInfoFor(browser, pool, mockStory))
+      acquire.mockClear()
+
+      state.onEmit = (s, type) => {
+        if (type === "setCurrentStory") {
+          s.events.push({ type: "storyErrored", message: "soft boom" })
+        }
+      }
+      fns.url.mockImplementation(async () => {
+        state.events.length = 0
+        state.events.push({ type: "storyThrewException", message: "hard boom" })
+      })
+
+      const testResult = await processStoryWithRetry(poolInfoFor(browser, pool, storyB))
+
+      // Recorded as failed with the SECOND (hard-navigation) error, not the soft-switch one.
+      expect(testResult.changeStatus).toBe("failed")
+      expect(testResult.errorKind).toBe("story-error")
+      expect(testResult.errorMessage).toContain("hard boom")
+      // Story-class failure: one attempt, no WORKER_STORY_MAX_ATTEMPTS consumption by the
+      // internal retry.
+      expect(acquire).toHaveBeenCalledTimes(1)
+    })
+
+    it("hard-navigates the story after a failure on the session (taint), then soft-switches again", async () => {
+      const { browser, state, fns } = createMockBrowser()
+      const { pool } = makePool(browser)
+      await processStoryWithRetry(poolInfoFor(browser, pool, mockStory)) // hard nav #1
+
+      // Story B fails on both the soft switch and the internal hard retry (hard nav #2).
+      state.onEmit = (s, type) => {
+        if (type === "setCurrentStory") {
+          s.events.push({ type: "storyErrored", message: "soft boom" })
+        }
+      }
+      fns.url.mockImplementation(async () => {
+        state.events.length = 0
+        state.events.push({ type: "storyThrewException", message: "hard boom" })
+      })
+      const failed = await processStoryWithRetry(poolInfoFor(browser, pool, storyB))
+      expect(failed.changeStatus).toBe("failed")
+
+      // Story C: the session is tainted by B's failure, so it must hard-navigate (hard nav #3)
+      // even though in-place switching is enabled and the channel works.
+      state.onEmit = undefined
+      fns.url.mockImplementation(async () => {
+        state.events.length = 0
+        state.phase = "completed"
+        state.currentStoryId = undefined
+      })
+      const testResult = await processStoryWithRetry(poolInfoFor(browser, pool, storyC))
+
+      expect(testResult.changeStatus).toBe("new")
+      expect(fns.url).toHaveBeenCalledTimes(3)
+      // Only story B's soft attempt ever emitted.
+      expect(state.emitted.filter((e) => e.type === "setCurrentStory")).toHaveLength(1)
+    })
+
+    it("honors parameters.vizdiff.forceNavigation as a per-story hard-navigation opt-out", async () => {
+      const { browser, state, fns } = createMockBrowser()
+      const optOutStory: Story = {
+        ...storyB,
+        parameters: { vizdiff: { forceNavigation: true } },
+      }
+
+      await renderStory(infoFor(browser))
+      await renderStory(infoFor(browser, optOutStory))
+
+      expect(fns.url).toHaveBeenCalledTimes(2)
+      expect(state.emitted).toEqual([])
+    })
+
+    it("hard-navigates every story when the page has no hooked channel", async () => {
+      const { browser, state, fns } = createMockBrowser({ channelPresent: false })
+
+      await renderStory(infoFor(browser))
+      await renderStory(infoFor(browser, storyB))
+
+      expect(fns.url).toHaveBeenCalledTimes(2)
+      expect(state.emitted).toEqual([])
+    })
+
+    it("hard-navigates on the WORKER_NAV_REFRESH_STORIES cadence (2 -> hard,soft,soft,hard)", async () => {
+      vi.stubEnv("WORKER_NAV_REFRESH_STORIES", "2")
+      vi.resetModules()
+      try {
+        const fresh = await import("./stories")
+        const { browser, state, fns } = createMockBrowser()
+        // Simulate a real hard navigation: a fresh document has no stale events or currentRender
+        // (the previous soft switch left currentStoryId pointing at story 3, which hard-mode
+        // readiness would rightly refuse to accept for story 4).
+        fns.url.mockImplementation(async () => {
+          state.events.length = 0
+          state.phase = "completed"
+          state.currentStoryId = undefined
+        })
+        const stories = [mockStory, storyB, storyC, { ...mockStory, id: "e2e--fourth" }]
+        for (const story of stories) {
+          await fresh.renderStory(infoFor(browser, story))
+        }
+
+        expect(fns.url).toHaveBeenCalledTimes(2) // stories 1 and 4
+        expect(state.emitted.filter((e) => e.type === "setCurrentStory")).toHaveLength(2)
+      } finally {
+        vi.unstubAllEnvs()
+        vi.resetModules()
+      }
+    })
+
+    it("hard-navigates every story when WORKER_INPLACE_STORY_SWITCHING=false", async () => {
+      vi.stubEnv("WORKER_INPLACE_STORY_SWITCHING", "false")
+      vi.resetModules()
+      try {
+        const fresh = await import("./stories")
+        const { browser, state, fns } = createMockBrowser()
+        await fresh.renderStory(infoFor(browser))
+        await fresh.renderStory(infoFor(browser, storyB))
+
+        expect(fns.url).toHaveBeenCalledTimes(2)
+        expect(state.emitted).toEqual([])
+      } finally {
+        vi.unstubAllEnvs()
+        vi.resetModules()
+      }
     })
   })
 

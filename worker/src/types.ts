@@ -29,6 +29,11 @@ export interface StoryParameters {
     delay?: number
     /** Wait for `window.__VIZDIFF_STORY_READY__ === true` before capture (see storyReady.ts). */
     waitForReady?: boolean
+    /**
+     * Opt this story out of in-place story switching (issue #474): always load it via a full
+     * page navigation, for stories known to leak global state that survives a soft switch.
+     */
+    forceNavigation?: boolean
   }
   /** Chromatic-era Foxglove convention: the story resolves an explicit ready signal. */
   useReadySignal?: boolean

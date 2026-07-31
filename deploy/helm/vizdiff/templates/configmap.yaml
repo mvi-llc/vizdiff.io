@@ -95,6 +95,13 @@ data:
   {{- with .Values.worker.postLoadDelayMs }}
   WORKER_POST_LOAD_DELAY_MS: {{ . | quote }}
   {{- end }}
+  {{- /* Always rendered explicitly (like WORKER_SHARDING_ENABLED): the worker's built-in
+  default is "true", so inplaceStorySwitching: false must emit
+  WORKER_INPLACE_STORY_SWITCHING: "false" to actually disable it. */}}
+  WORKER_INPLACE_STORY_SWITCHING: {{ .Values.worker.inplaceStorySwitching | quote }}
+  {{- with .Values.worker.navRefreshStories }}
+  WORKER_NAV_REFRESH_STORIES: {{ . | quote }}
+  {{- end }}
   {{- with .Values.worker.progressTimeoutMs }}
   WORKER_PROGRESS_TIMEOUT_MS: {{ . | quote }}
   {{- end }}

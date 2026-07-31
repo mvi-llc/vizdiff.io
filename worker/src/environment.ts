@@ -238,6 +238,29 @@ export const WORKER_STABILIZE_INTERVAL_MS = Math.max(1, intEnv("WORKER_STABILIZE
 // reused the 500 ms stabilization interval. Default: 250.
 export const WORKER_POST_LOAD_DELAY_MS = intEnv("WORKER_POST_LOAD_DELAY_MS", 250)
 
+// --- In-place story switching (issue #474, Phase B) ---------------------------------------------
+
+// Navigate each pooled browser session once, then switch stories in-place via the Storybook
+// preview channel (`setCurrentStory`) instead of paying a full page navigation per story — the
+// bundle re-parse/re-eval, i18n/provider boot, font loads, and CSS injection all become
+// once-per-document (issue #474, the same strategy as Storybook test-runner and Chromatic). Hard
+// navigation remains the automatic fallback: on a page without a hooked channel, after any story
+// failure on the session, on the WORKER_NAV_REFRESH_STORIES cadence, and for stories opting out
+// via `parameters.vizdiff.forceNavigation`. See docs/CONFIGURATION.md "In-place story
+// switching". Tri-state like WORKER_SHARDING_ENABLED: an explicit "true"/"false" wins; unset
+// means enabled.
+export const WORKER_INPLACE_STORY_SWITCHING =
+  process.env.WORKER_INPLACE_STORY_SWITCHING != undefined
+    ? process.env.WORKER_INPLACE_STORY_SWITCHING === "true"
+    : true
+
+// Hard-navigate (load a fresh document) after this many consecutive in-place story switches on a
+// session, bounding leaked page state (style/DOM/listener accumulation) between full refreshes.
+// Pairs with the session recycle counter (WORKER_SESSION_RECYCLE_STORIES), which bounds
+// browser-process memory at a coarser granularity. 0 disables the cadence (soft-switch
+// indefinitely). Default: 50.
+export const WORKER_NAV_REFRESH_STORIES = intEnv("WORKER_NAV_REFRESH_STORIES", 50)
+
 // Progress watchdog (issue #452): abort a build once no story has completed for this long. A
 // build that is steadily completing stories is healthy no matter how large it is, while a wedged
 // build (issue #450) is detected within minutes instead of at the whole-build ceiling. The

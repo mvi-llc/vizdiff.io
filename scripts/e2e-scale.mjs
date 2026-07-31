@@ -62,6 +62,9 @@ Options:
                         the repo root (default: docker-compose.images.yml,docker-compose.scale.yml)
   --kill-worker         docker kill the worker holding a claimed render_story_chunk task
                         mid-build, then assert the build still converges
+  --legacy-fixture      Generate the pre-#474 channel-less fixture HTML: no
+                        __STORYBOOK_ADDONS_CHANNEL__, so the worker cannot switch stories
+                        in-place and hard-navigates every story (fallback-ladder path)
   --poll-interval S     Seconds between polls (default: 5)
   --keep-fixture        Keep the generated fixture/tarball temp dir for inspection
   --help                Show this help
@@ -96,6 +99,7 @@ function parseArgs(argv) {
     jwtSecret: undefined,
     composeFiles: ["docker-compose.images.yml", "docker-compose.scale.yml"],
     killWorker: false,
+    legacyFixture: false,
     pollIntervalSeconds: 5,
     keepFixture: false,
   }
@@ -139,6 +143,9 @@ function parseArgs(argv) {
         break
       case "--kill-worker":
         opts.killWorker = true
+        break
+      case "--legacy-fixture":
+        opts.legacyFixture = true
         break
       case "--poll-interval":
         opts.pollIntervalSeconds = Math.max(1, parseInt(next(), 10) || 5)
@@ -299,13 +306,22 @@ function psql(opts, sql) {
  * DEDICATED WORKER (the worker script load + the worker's fetch), which frame-scoped CDP Fetch
  * interception cannot settle — the regression class where worker-backed stories died at the
  * ready-signal timeout.
+ *
+ * By default the fixture also exposes a minimal `window.__STORYBOOK_ADDONS_CHANNEL__` whose
+ * `emit("setCurrentStory", ...)` re-renders the requested story in place and channel-emits
+ * `storyRendered` — exercising the worker's in-place story switching (issue #474 Phase B). The
+ * channel is assigned from a page script AFTER the worker's init script has installed its
+ * defineProperty hook, so listeners attach at assignment time (exactly like a real Storybook
+ * preview boot). With `legacy: true` (--legacy-fixture) the pre-#474 channel-less HTML is
+ * generated instead: only the synchronous `?id=` render exists, so the worker's soft-switch
+ * probe finds no channel and hard-navigates every story (the fallback-ladder path).
  */
-function fixtureIframeHtml(storyCount, workerStoryCount) {
+function fixtureIframeHtml(storyCount, workerStoryCount, { legacy = false } = {}) {
   return `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>vizdiff e2e scale fixture</title>
+<title>vizdiff e2e scale fixture${legacy ? " (legacy)" : ""}</title>
 <style>html, body { margin: 0; padding: 0; background: #ffffff; }</style>
 </head>
 <body>
@@ -366,6 +382,10 @@ function fixtureIframeHtml(storyCount, workerStoryCount) {
   };
   window.__STORYBOOK_PREVIEW__ = preview;
 
+${
+    legacy
+      ? `  // Legacy (pre-#474) behavior: synchronous ?id= render only, NO preview channel — the
+  // worker's soft-switch probe finds nothing to emit on and hard-navigates every story.
   var storyId = new URLSearchParams(window.location.search).get("id");
   if (storyId != null) {
     var story = stories[storyId];
@@ -404,6 +424,76 @@ function fixtureIframeHtml(storyCount, workerStoryCount) {
         }
       };
     }
+  }`
+      : `  // Renders a story into the root, updates currentRender, and channel-emits storyRendered —
+  // shared by the initial ?id= hard-navigation load and in-place setCurrentStory switches
+  // (issue #474 Phase B).
+  function renderStoryById(storyId) {
+    var root = document.getElementById("storybook-root");
+    root.innerHTML = "";
+    var story = stories[storyId];
+    if (!story) {
+      preview.currentRender = { id: storyId, phase: "errored" };
+      window.__STORYBOOK_ADDONS_CHANNEL__.emit("storyErrored",
+        { storyId: storyId, message: "no such story: " + storyId });
+      return;
+    }
+    var div = document.createElement("div");
+    div.style.width = "600px";
+    div.style.height = "300px";
+    div.style.boxSizing = "border-box";
+    div.style.padding = "16px";
+    div.style.background = colorFor(storyId);
+    div.style.color = "#ffffff";
+    div.style.font = "16px/1.4 monospace";
+    div.textContent = story.title + " / " + story.name + " (" + storyId + ")";
+    root.appendChild(div);
+    // Semantic render-completion signals: the SB8-style currentRender phase AND the channel
+    // event (the worker's soft-mode readiness requires a story-scoped signal, issue #474).
+    preview.currentRender = { id: storyId, phase: "completed" };
+    window.__STORYBOOK_ADDONS_CHANNEL__.emit("storyRendered", storyId);
+
+    // Worker-backed story (issue #473): render completes immediately (above), but the explicit
+    // ready signal (parameters.useReadySignal) is only set once a dedicated Worker has fetched
+    // worker-data.bin and posted back — mirroring chart.js-in-OffscreenCanvas storybooks whose
+    // readiness depends on worker-owned network requests. Works in both navigation modes: a
+    // soft switch re-arms __VIZDIFF_STORY_READY__ via the init script's reset() before the
+    // switch is emitted.
+    if (story.parameters && story.parameters.useReadySignal) {
+      var worker = new Worker("worker-fixture.js");
+      worker.onmessage = function (event) {
+        if (event.data && event.data.ok) {
+          div.textContent = story.title + " / " + story.name +
+            " (worker ok, " + event.data.bytes + " bytes)";
+          window.__VIZDIFF_STORY_READY__ = true;
+        } else {
+          div.textContent = story.title + " / " + story.name +
+            " (worker error: " + (event.data && event.data.error) + ")";
+          // Ready signal deliberately NOT set: a failed worker fetch must fail the story.
+        }
+      };
+    }
+  }
+
+  // Minimal Storybook preview channel (issue #474): assigned AFTER the worker's init script has
+  // installed its defineProperty hook on __STORYBOOK_ADDONS_CHANNEL__, so the assignment below
+  // triggers the hook and the worker's lifecycle listeners attach immediately — exactly like a
+  // real Storybook preview boot.
+  window.__STORYBOOK_ADDONS_CHANNEL__ = {
+    _l: {},
+    on: function (t, f) { (this._l[t] = this._l[t] || []).push(f); },
+    off: function () {},
+    emit: function (t, p) {
+      if (t === "setCurrentStory") { renderStoryById(p.storyId); }
+      (this._l[t] || []).forEach(function (f) { f(p); });
+    }
+  };
+
+  // Initial hard-navigation load renders synchronously, like the legacy fixture.
+  var storyId = new URLSearchParams(window.location.search).get("id");
+  if (storyId != null) {
+    renderStoryById(storyId);
+  }`
   }
 })();
 </script>
@@ -429,9 +519,12 @@ fetch("worker-data.bin")
 `
 }
 
-function buildFixtureTarball(storyCount, workerStoryCount) {
+function buildFixtureTarball(storyCount, workerStoryCount, { legacy = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vizdiff-e2e-scale-"))
-  fs.writeFileSync(path.join(dir, "iframe.html"), fixtureIframeHtml(storyCount, workerStoryCount))
+  fs.writeFileSync(
+    path.join(dir, "iframe.html"),
+    fixtureIframeHtml(storyCount, workerStoryCount, { legacy }),
+  )
   fs.writeFileSync(
     path.join(dir, "index.html"),
     "<!doctype html><title>vizdiff e2e scale fixture</title>\n",
@@ -547,6 +640,7 @@ async function main() {
   budget:         ${opts.budgetSeconds}s
   api:            ${opts.apiUrl}
   kill-worker:    ${opts.killWorker ? "yes" : "no"}
+  fixture:        ${opts.legacyFixture ? "legacy (channel-less; hard-nav per story)" : "channel (in-place story switching, issue #474)"}
 `)
 
   // 1. Project + session.
@@ -573,7 +667,9 @@ async function main() {
     `Generating static storybook fixture (${opts.stories} plain + ${opts.workerStories} ` +
       `worker-backed stories)...`,
   )
-  const { dir, tarballPath } = buildFixtureTarball(opts.stories, opts.workerStories)
+  const { dir, tarballPath } = buildFixtureTarball(opts.stories, opts.workerStories, {
+    legacy: opts.legacyFixture,
+  })
   const tarball = fs.readFileSync(tarballPath)
   log(`Fixture tarball: ${tarballPath} (${(tarball.length / 1024).toFixed(1)} KiB)`)
 

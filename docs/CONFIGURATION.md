@@ -99,6 +99,8 @@ Single-host fallback: when `GITLAB_HOSTS` is unset, a single host is derived fro
 | `WORKER_FINALIZE_QUEUE_LIMIT` | worker | no | `16` | Upper bound on stories that have finished capture but are not yet finalized (issue #456). Each such story buffers one screenshot PNG in memory, so this caps the pipeline's extra memory footprint; when the backlog hits the limit, the next capture waits for a finalize to drain. Values < 1 are clamped to 1. |
 | `WORKER_STABILIZE_INTERVAL_MS` | worker | no | `250` | Pacing (ms) for the visual-stabilization loop's *paced* checks. **Adaptive cadence (issue #474):** the first stability check is rAF-spaced and sleep-free — after the semantic readiness gate (issue #458) the confirmation screenshot is taken roughly two animation frames after the first, so a story that is already settled pays no stabilization sleep at all. Only when that first comparison reports a nonzero diff (an animation or a late layout shift) does the loop fall back to paced checks, sleeping `min(interval, 100)` before the second check, this interval before the third, then twice this interval (capped at 500 ms) before each later check, all under the overall 10 s stabilization budget. **Default change (issue #456):** previously a hardcoded `500`. Raise it back toward `500` for storybooks with slow animations that need a longer window to register as still moving. Values < 1 are clamped to 1. |
 | `WORKER_POST_LOAD_DELAY_MS` | worker | no | `250` | Fixed settle delay (ms) after the post-stabilization viewport resize (growing the viewport to fit tall content) before the final full-height screenshot (issue #456; previously this reused the 500 ms stabilization interval). The legacy fixed post-load pause before the *first* screenshot was superseded by the issue #458 readiness gate; the degraded-readiness fallback path keeps its own fixed delay. |
+| `WORKER_INPLACE_STORY_SWITCHING` | worker | no | `true` | In-place story switching (issue #474, Phase B): navigate each pooled browser session once, then switch stories via the Storybook preview channel (`setCurrentStory`) instead of a full page navigation per story — the preview bundle re-parse/re-eval, i18n/provider boot, font loads, and CSS injection become once-per-document instead of once-per-story (the same strategy as Storybook test-runner and Chromatic). Hard navigation remains the automatic fallback; see "In-place story switching" below for the full fallback ladder and the per-story `parameters.vizdiff.forceNavigation` opt-out. Set `false` to hard-navigate every story. |
+| `WORKER_NAV_REFRESH_STORIES` | worker | no | `50` | Hard-navigate (load a fresh document) after this many consecutive in-place story switches on a session, bounding leaked page state (style/DOM/listener accumulation) between full refreshes (issue #474). Pairs with `WORKER_SESSION_RECYCLE_STORIES`, which bounds browser-process memory at a coarser granularity. `0` disables the cadence (soft-switch indefinitely). |
 | `WORKER_PROGRESS_TIMEOUT_MS` | worker | no | `300000` (5 min) | Progress watchdog (issue #452): abort a build once **no story has completed** for this long. A build that is steadily completing stories is healthy no matter how large it is, while a wedged build is detected within minutes instead of at the whole-build ceiling. The aborted build is failed and treated as non-retryable. `0` disables the watchdog (only the ceiling then applies). |
 | `WORKER_PER_STORY_BUDGET_MS` | worker | no | `5000` | Per-story render budget used to derive the whole-build timeout ceiling when `BUILD_TIMEOUT_MS` is unset: `ceiling = max(BUILD_TIMEOUT_FLOOR_MS, ceil(storyCount × budget / WORKER_STORY_CONCURRENCY))`. Deliberately generous versus the observed ~1.5–2 s happy-path story cost — the ceiling is a backstop; the progress watchdog is the primary stall detector. |
 | `BUILD_TIMEOUT_MS` | worker | no | unset (derived) | Whole-build render timeout ceiling. Unset = derived from the discovered story count (issue #452, see `WORKER_PER_STORY_BUDGET_MS` / `BUILD_TIMEOUT_FLOOR_MS`), so a large-but-healthy storybook is never killed by a flat cap; an explicit value is used verbatim (back-compat with deployments that tuned the former flat cap). Applies to the render fan-out only — download, extraction, and story discovery run under their own bounded timeouts. A build exceeding the ceiling is failed and treated as non-retryable. |
@@ -299,6 +301,36 @@ decorators: [
   },
 ]
 ```
+
+## In-place story switching
+
+By default (`WORKER_INPLACE_STORY_SWITCHING=true`, issue #474 Phase B) the worker navigates each
+pooled browser session to the Storybook preview once, then switches between stories **in place**
+by emitting `setCurrentStory` on the preview channel — the same strategy as Storybook test-runner
+and Chromatic. A full page navigation re-parses and re-executes the entire preview bundle (tens of
+MB of JS for a large Storybook), re-runs i18n/theme/provider boot, and re-loads fonts for every
+story; switching in place pays those costs once per document instead. Before each switch the
+worker re-arms its readiness state page-side and rewrites the iframe URL (`history.replaceState`)
+to the canonical `iframe.html?id=<storyId>&viewMode=<mode>` URL, and story readiness is
+**story-scoped**: a completed render phase or `storyRendered` event only counts for the story it
+names, so a stale signal from the previous story can never be captured as the next one.
+
+Hard navigation remains the automatic fallback, as a ladder:
+
+1. **No hooked channel** (a Storybook too old to expose `__STORYBOOK_ADDONS_CHANNEL__`, or the
+   init script could not run): every story hard-navigates, exactly as before this feature.
+2. **Soft-switch readiness failure**: if a story fails to become ready after an in-place switch,
+   the worker retries that story ONCE with a hard navigation (a fresh document) before recording
+   a failure — stories that misbehave only in a reused document (leaked globals, stale
+   singletons) still capture correctly.
+3. **Previous story failed**: the next story on that session hard-navigates, since the failed
+   story may have left the document in an arbitrary state.
+4. **Refresh cadence**: after `WORKER_NAV_REFRESH_STORIES` consecutive soft switches (default
+   50), the worker hard-navigates to bound leaked page state between full refreshes.
+5. **Per-story opt-out**: a story known to leak state that survives an in-place switch can set
+   `parameters.vizdiff.forceNavigation: true` to always load via a full navigation.
+6. **Kill switch**: `WORKER_INPLACE_STORY_SWITCHING=false` restores the pre-#474 behavior
+   (a hard navigation per story).
 
 ## Screenshot retention reaper
 
