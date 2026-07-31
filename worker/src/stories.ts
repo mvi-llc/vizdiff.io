@@ -5,9 +5,12 @@ import { Readable } from "node:stream"
 import { PNG } from "pngjs"
 import {
   diffImageKey,
+  failureScreenshotKey as buildFailureScreenshotKey,
   ScreenshotTest,
   screenshotKey as buildScreenshotKey,
   TestResult,
+  type TestResultDiagnostics,
+  type TestResultErrorKind,
   type TestResultStatus,
 } from "shared"
 import type { Repository } from "typeorm"
@@ -26,6 +29,11 @@ import { classifyStoryError, StorageError, type ClassifiedStoryError } from "./e
 import { diffImages, diffImagesNoMask } from "./images"
 import { log } from "./log"
 import type { CaptureOutcome } from "./pipeline"
+import {
+  collectFailureDiagnostics,
+  setCurrentStory,
+  type CollectedDiagnostics,
+} from "./sessionDiagnostics"
 import { probeSession } from "./sessionHealth"
 import { waitForStoryReady } from "./storyReady"
 import type { SetViewportOptions, Story, StorybookWindow } from "./types"
@@ -566,6 +574,7 @@ export async function captureStoryWithRetry(
   const logChild = log.child({ projectId, uploadId, storyId: story.id })
 
   let lastInfraError: ClassifiedStoryError | undefined
+  let lastInfraDiagnostics: CollectedDiagnostics | undefined
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const session = await pool.acquire()
     try {
@@ -578,7 +587,10 @@ export async function captureStoryWithRetry(
         )
         await pool.replace(session, "probe-failed")
       }
-      // Read the browser AFTER probe/replace so a replacement is picked up.
+      // Read the browser AFTER probe/replace so a replacement is picked up. Tag the session's
+      // diagnostics buffers with this story (issue #475) so console entries arriving during the
+      // capture attempt are attributable to it on failure.
+      setCurrentStory(session.browser, story.id)
       const captured = await captureStory({ ...storyInfo, browser: session.browser })
       session.consecutiveInfraFailures = 0
       session.storiesRendered++
@@ -590,7 +602,14 @@ export async function captureStoryWithRetry(
           { err, kind: classified.kind, attempt },
           `Story ${story.id} failed to render (${classified.kind}); recording failed result`,
         )
-        return { kind: "recorded", result: await recordErrorTestResult(storyInfo, classified) }
+        // Collect troubleshooting context while the session is still held (issue #475).
+        const diagnostics = await collectFailureDiagnostics(session.browser, story.id, {
+          screenshot: shouldAttemptFailureScreenshot(classified.kind),
+        })
+        return {
+          kind: "recorded",
+          result: await recordErrorTestResult(storyInfo, classified, diagnostics),
+        }
       }
       // Infra-class: condemn the session towards replacement and retry on the next attempt.
       session.consecutiveInfraFailures++
@@ -600,7 +619,17 @@ export async function captureStoryWithRetry(
         `Infra failure capturing story ${story.id} (${classified.kind}); ` +
           (attempt < maxAttempts ? "retrying on a healthy session" : "attempt budget exhausted"),
       )
+      if (attempt >= maxAttempts) {
+        // Final attempt: gather diagnostics now, while this session is still held, for the
+        // budget-exhausted record below (issue #475). Most infra kinds imply a dead/unresponsive
+        // session, so the screenshot is skipped for them.
+        lastInfraDiagnostics = await collectFailureDiagnostics(session.browser, story.id, {
+          screenshot: shouldAttemptFailureScreenshot(classified.kind),
+        })
+      }
     } finally {
+      // Clear the diagnostics story tag before the session returns to the pool (issue #475).
+      setCurrentStory(session.browser, undefined)
       await pool.release(session)
     }
   }
@@ -612,8 +641,19 @@ export async function captureStoryWithRetry(
     result: await recordErrorTestResult(
       storyInfo,
       lastInfraError ?? { errorClass: "infra", kind: "unknown", message: "Unknown infra failure" },
+      lastInfraDiagnostics,
     ),
   }
+}
+
+/**
+ * Whether the best-effort failure-time screenshot is worth attempting for this failure kind
+ * (issue #475): a gone/timed-out session cannot answer a screenshot command (it would just burn
+ * the diagnostics timeout), and a failure classified as screenshot-failed has already proven
+ * screenshots broken.
+ */
+function shouldAttemptFailureScreenshot(kind: TestResultErrorKind): boolean {
+  return !["browser-gone", "browser-timeout", "screenshot-failed"].includes(kind)
 }
 
 /**
@@ -682,12 +722,39 @@ export async function processStoryWithRetry(
  * Persists the single `failed` TestResult row for a story that could not be rendered (issue #152
  * failure isolation: the build keeps going). `newImageUrl` is NOT NULL with no screenshot for a
  * failed story, so it is stored as an empty string. `errorKind`/`errorMessage` (issue #454) let
- * the API/UI distinguish infra failures from genuine story failures.
+ * the API/UI distinguish infra failures from genuine story failures, and `diagnostics`
+ * (issue #475) carries the failure-time console tail, in-flight requests, and — when a
+ * failure-time screenshot was captured — its S3 key. The screenshot upload is BEST-EFFORT: an
+ * S3 failure logs a warning and omits the key, never failing the record itself.
  */
 async function recordErrorTestResult(
-  { story, screenshotTest, testResultTable }: Omit<StoryInfo, "browser">,
+  info: Omit<StoryInfo, "browser">,
   classified: ClassifiedStoryError,
+  diagnostics?: CollectedDiagnostics,
 ): Promise<TestResult> {
+  const { story, screenshotTest, testResultTable, bucket, projectId, uploadId, s3Client } = info
+
+  let screenshotKey: string | undefined
+  if (diagnostics?.screenshotBuffer) {
+    const key = buildFailureScreenshotKey(projectId, uploadId, story.id)
+    try {
+      await s3Client.send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: key,
+          Body: diagnostics.screenshotBuffer,
+          ContentType: "image/png",
+        }),
+      )
+      screenshotKey = key
+    } catch (err) {
+      log.warn(
+        { err, projectId, uploadId, storyId: story.id, key },
+        `Failed to upload failure-time screenshot for story ${story.id}; omitting it`,
+      )
+    }
+  }
+
   const testResult = new TestResult()
   testResult.name = getStoryName(story)
   testResult.screenshotTest = screenshotTest
@@ -700,8 +767,48 @@ async function recordErrorTestResult(
   testResult.changeStatus = "failed"
   testResult.errorKind = classified.kind
   testResult.errorMessage = classified.message.slice(0, MAX_ERROR_MESSAGE_LENGTH)
+  // Explicit null when nothing was collected (e.g. finalize-phase failures, where no session is
+  // held) so the idempotent upsert clears a previous attempt's diagnostics.
+  testResult.diagnostics = diagnostics
+    ? buildTestResultDiagnostics(diagnostics, screenshotKey)
+    : null
   await upsertTestResult(testResultTable, testResult)
   return testResult
+}
+
+/** Serialized-size budget for a persisted diagnostics payload (issue #475). */
+const MAX_DIAGNOSTICS_SERIALIZED_BYTES = 64 * 1024
+/** Maximum console entries persisted on a failed result. */
+const MAX_DIAGNOSTICS_CONSOLE_ENTRIES = 50
+
+/**
+ * Shapes collected diagnostics into the persisted {@link TestResultDiagnostics} payload
+ * (issue #475): the console tail is capped at {@link MAX_DIAGNOSTICS_CONSOLE_ENTRIES} entries
+ * (per-session storyId tags are dropped — the row itself identifies the story), and the whole
+ * payload is held under {@link MAX_DIAGNOSTICS_SERIALIZED_BYTES} by dropping oldest console
+ * entries until it fits. Exported for tests.
+ */
+export function buildTestResultDiagnostics(
+  collected: CollectedDiagnostics,
+  failureScreenshotKey?: string,
+): TestResultDiagnostics {
+  let consoleTail = collected.consoleTail
+    .slice(-MAX_DIAGNOSTICS_CONSOLE_ENTRIES)
+    .map(({ level, text, stampMs }) => ({ level, text, stampMs }))
+  const build = (): TestResultDiagnostics => ({
+    consoleTail,
+    pendingRequests: collected.pendingRequests,
+    ...(failureScreenshotKey != undefined ? { failureScreenshotKey } : {}),
+  })
+  let diagnostics = build()
+  while (
+    consoleTail.length > 0 &&
+    Buffer.byteLength(JSON.stringify(diagnostics), "utf8") > MAX_DIAGNOSTICS_SERIALIZED_BYTES
+  ) {
+    consoleTail = consoleTail.slice(1)
+    diagnostics = build()
+  }
+  return diagnostics
 }
 
 /**
@@ -921,6 +1028,7 @@ export async function finalizeStory(
   // error columns when the retry succeeds — undefined fields are omitted from the update set.
   testResult.errorKind = null
   testResult.errorMessage = null
+  testResult.diagnostics = null
   await upsertTestResult(testResultTable, testResult)
   logChild.debug(
     { testResultId: testResult.id, captureDurationMs },
