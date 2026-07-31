@@ -107,5 +107,19 @@ export type TestResponse = ScreenshotTestResponse & {
    * or have not reached enumeration yet.
    */
   expectedStoryCount?: number
+  /**
+   * Milliseconds since the worker last reported render progress for this build (issue #477).
+   * Server-computed so client clock skew cannot distort the staleness math; falls back to the
+   * build row's last update time when no progress heartbeat has been written yet. Only present
+   * while the build status is "pending" or "running". Note a healthy build can legitimately go
+   * quiet for tens of seconds (heartbeats are per completed story, and a single story may take
+   * up to the story timeout).
+   */
+  lastProgressAgeMs?: number
+  /**
+   * Identity of the worker currently rendering this build (issue #477). Only present while the
+   * build status is "pending" or "running".
+   */
+  workerId?: string
   testResults: TestResultResponse[]
 }

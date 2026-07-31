@@ -192,6 +192,7 @@ export const list: RequestHandler = async (req, res) => {
 }
 
 export const get: RequestHandler = async (req, res) => {
+  const { user } = res.locals
   const screenshotTestId = getParamInt("id", req)
   if (!screenshotTestId) {
     res.status(400).json({ error: "Missing id" })
@@ -208,6 +209,18 @@ export const get: RequestHandler = async (req, res) => {
     return
   }
   const project = screenshotTest.project
+
+  // Permissions check (mirrors `list`): respond 404 rather than 403 so callers cannot probe
+  // which build IDs exist in projects they cannot access.
+  const projectIds = await getAccessibleProjectIds(db, user.id)
+  if (!projectIds.includes(project.id)) {
+    log.error(
+      { userId: user.id, projectId: project.id, screenshotTestId },
+      "Screenshot test's project not found in accessible projects",
+    )
+    res.status(404).json({ error: "Screenshot test not found" })
+    return
+  }
 
   // Get the most recent test result for each test name
   const testResultTable = db.getRepository(TestResult)
@@ -242,6 +255,10 @@ export const get: RequestHandler = async (req, res) => {
     })),
   )
 
+  // Progress metadata only makes sense while the build is in flight; omit it entirely for
+  // terminal builds so stale worker/heartbeat rows never leak into finished-build payloads.
+  const isInFlight = screenshotTest.status === "pending" || screenshotTest.status === "running"
+
   const response: TestResponse = {
     id: screenshotTest.id,
     projectId: project.id,
@@ -261,6 +278,13 @@ export const get: RequestHandler = async (req, res) => {
     initiatedStampSec: toSeconds(screenshotTest.createdAt),
     buildDurationSec: screenshotTest.buildDurationSec ?? undefined,
     expectedStoryCount: screenshotTest.expectedStoryCount ?? undefined,
+    // Server-computed age so client clock skew cannot distort the stalled heuristic (issue #477).
+    // Falls back to updated_at when no progress heartbeat has been written yet (matching the
+    // stuck-build sweeper's COALESCE(last_progress_at, updated_at)).
+    lastProgressAgeMs: isInFlight
+      ? Date.now() - (screenshotTest.lastProgressAt ?? screenshotTest.updatedAt).getTime()
+      : undefined,
+    workerId: isInFlight ? (screenshotTest.workerId ?? undefined) : undefined,
     testResults: testResultResponses,
   }
 

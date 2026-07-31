@@ -241,8 +241,64 @@ export const Running: Story = {
             ...mockBuildData,
             status: "running",
             // Partial results stream in while the build runs; the page shows the one finished
-            // card and "1 / 6" style live counts (issue #476).
+            // card plus "1 / 6" live counts, a segmented progress bar, skeleton placeholders
+            // for the 5 outstanding stories, and the worker caption (issues #476/#477). The
+            // static lastProgressAgeMs keeps the story deterministic for Chromatic.
             expectedStoryCount: 6,
+            lastProgressAgeMs: 5000,
+            workerId: "worker-abc123",
+            testResults: mockBuildData.testResults.slice(0, 1),
+          }),
+        ),
+        catchAllHandler,
+      ],
+    },
+  },
+}
+
+export const RunningPreEnumeration: Story = {
+  args: {
+    mode: "light",
+  },
+  parameters: {
+    msw: {
+      handlers: [
+        userHandler,
+        http.get("/api/tests/:id", () =>
+          HttpResponse.json({
+            ...mockBuildData,
+            status: "running",
+            // No expectedStoryCount and no results yet: the worker has not enumerated the
+            // storybook's stories, so the page shows an indeterminate "Preparing stories…" bar
+            // instead of counts or skeletons (issue #477).
+            lastProgressAgeMs: 5000,
+            workerId: "worker-abc123",
+            testResults: [],
+          }),
+        ),
+        catchAllHandler,
+      ],
+    },
+  },
+}
+
+export const RunningStalled: Story = {
+  args: {
+    mode: "light",
+  },
+  parameters: {
+    msw: {
+      handlers: [
+        userHandler,
+        http.get("/api/tests/:id", () =>
+          HttpResponse.json({
+            ...mockBuildData,
+            status: "running",
+            // lastProgressAgeMs past STALLED_THRESHOLD_MS (90s): the page adds the
+            // warning-colored "No progress for 120s — build may be stalled" line (issue #477).
+            expectedStoryCount: 6,
+            lastProgressAgeMs: 120000,
+            workerId: "worker-abc123",
             testResults: mockBuildData.testResults.slice(0, 1),
           }),
         ),
