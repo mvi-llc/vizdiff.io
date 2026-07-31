@@ -16,6 +16,7 @@ import { Database, DatabasePool } from "./database"
 import {
   MAX_STORIES_PER_UPLOAD,
   S3_CLIENT_CONFIG,
+  WORKER_EGRESS_BLOCK_MODE,
   WORKER_SHARD_CHUNK_SIZE,
   WORKER_SHARD_MIN_STORIES,
   WORKER_SHARDING_ENABLED,
@@ -281,15 +282,20 @@ export async function ingestStorybook(
       // Start a local server to serve the Storybook files
       const { server, port } = await startStaticServer(tmpDir)
 
-      // Install the hard network egress boundary on EVERY pooled session: fail every off-origin
-      // request (sub-resource, navigation, fetch, XHR, WebSocket, beacon) so an untrusted story
+      // Install the network egress boundary on EVERY pooled session so an untrusted story
       // bundle cannot exfiltrate data. Must run before navigating to any story. Sessions created
       // later as replacements (probe failure / recycling, issues #450/#453) get the same boundary
-      // via the pool's session-init callback.
+      // via the pool's session-init callback. In the default "resolver" mode (issue #473) this
+      // is a no-op — enforcement lives in the Chrome launch args (hardenedChromeArgs) — while
+      // the interception modes install a BiDi intercept per session.
       const origin = `http://localhost:${port}`
-      pool.setSessionInit((browser) => installNetworkEgressBlock(browser, origin))
+      pool.setSessionInit((browser) =>
+        installNetworkEgressBlock(browser, origin, WORKER_EGRESS_BLOCK_MODE),
+      )
       await Promise.all(
-        pool.sessions.map((session) => installNetworkEgressBlock(session.browser, origin)),
+        pool.sessions.map((session) =>
+          installNetworkEgressBlock(session.browser, origin, WORKER_EGRESS_BLOCK_MODE),
+        ),
       )
 
       try {

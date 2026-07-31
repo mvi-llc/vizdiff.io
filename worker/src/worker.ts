@@ -11,6 +11,8 @@ import {
   IS_TEST,
   RETENTION_REAPER_ENABLED,
   RETENTION_SWEEP_INTERVAL_MS,
+  WORKER_EGRESS_BLOCK_MODE,
+  WORKER_EGRESS_BLOCK_MODE_INVALID,
   WORKER_MAX_TASK_ATTEMPTS,
   WORKER_PROGRESS_TIMEOUT_MS,
   WORKER_STUCK_PENDING_MINUTES,
@@ -197,6 +199,15 @@ async function claimTaskIfIdle(excludeIds: readonly number[]): Promise<ClaimedTa
 
 async function main() {
   startHealthServer()
+
+  // Surface config validation that environment.ts cannot log itself (log.ts imports it).
+  if (WORKER_EGRESS_BLOCK_MODE_INVALID != undefined) {
+    log.warn(
+      `Invalid WORKER_EGRESS_BLOCK_MODE "${WORKER_EGRESS_BLOCK_MODE_INVALID}" ` +
+        `(expected resolver|intercept|off); using "${WORKER_EGRESS_BLOCK_MODE}"`,
+    )
+  }
+  log.info(`Network egress block mode: ${WORKER_EGRESS_BLOCK_MODE}`)
 
   // Reclaim builds this worker owned before a crash/restart (issue #451) BEFORE subscribing for
   // new tasks, so an orphaned "running" build is requeued or failed instead of sitting in

@@ -50,6 +50,9 @@ data:
   {{- with .Values.worker.chromeExtraArgs }}
   WORKER_CHROME_EXTRA_ARGS: {{ . | quote }}
   {{- end }}
+  {{- with .Values.worker.egressBlockMode }}
+  WORKER_EGRESS_BLOCK_MODE: {{ . | quote }}
+  {{- end }}
   {{- with .Values.worker.fatalFailsafeTimeoutMs }}
   WORKER_FATAL_FAILSAFE_TIMEOUT_MS: {{ . | quote }}
   {{- end }}

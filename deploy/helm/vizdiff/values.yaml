@@ -175,6 +175,13 @@ worker:
   # -- Whitespace-separated extra Chrome flags appended to the worker's screenshot sessions,
   # after the hardening and WebGL flags (WORKER_CHROME_EXTRA_ARGS).
   chromeExtraArgs: ""
+  # -- Network egress blocking mode for untrusted story bundles (issue #473,
+  # WORKER_EGRESS_BLOCK_MODE; see docs/CONFIGURATION.md "Network egress blocking"):
+  # "resolver" (DNS-layer block for every browser context; cannot wedge requests),
+  # "intercept" (legacy BiDi request interception escape hatch; known to wedge worker-owned
+  # font/worker fetches under load), or "off" (no network-layer control; last resort).
+  # Empty uses the built-in default (resolver).
+  egressBlockMode: ""
   # -- Upper bound (ms) on the best-effort "fail the build + post the failed VCS status" work
   # that runs before the worker's fatal exit on a wedged render (issue #451,
   # WORKER_FATAL_FAILSAFE_TIMEOUT_MS). Empty uses the built-in default (5000).

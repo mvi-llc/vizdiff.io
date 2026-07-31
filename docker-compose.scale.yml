@@ -62,6 +62,13 @@ services:
     environment:
       <<: *scale-s3-env
       WORKER_STORY_CONCURRENCY: "4"
+      # Passthroughs for the #473 reproduction/validation runs (see docs/SCALE-TESTING.md):
+      # SwiftShader WebGL adds the CPU contention the production wedge needed, a short render
+      # timeout speeds up failure iteration, and the egress-mode override exercises the
+      # legacy/off escape hatches. Empty/unset falls back to the worker's own defaults.
+      WORKER_ENABLE_WEBGL: ${WORKER_ENABLE_WEBGL:-}
+      WORKER_STORY_RENDER_TIMEOUT_MS: ${WORKER_STORY_RENDER_TIMEOUT_MS:-}
+      WORKER_EGRESS_BLOCK_MODE: ${WORKER_EGRESS_BLOCK_MODE:-}
     depends_on:
       minio-init:
         condition: service_completed_successfully
@@ -80,6 +87,9 @@ services:
       POSTGRES_PORT: 5432
       WORKER_HEALTH_PORT: 3003
       WORKER_STORY_CONCURRENCY: "4"
+      WORKER_ENABLE_WEBGL: ${WORKER_ENABLE_WEBGL:-}
+      WORKER_STORY_RENDER_TIMEOUT_MS: ${WORKER_STORY_RENDER_TIMEOUT_MS:-}
+      WORKER_EGRESS_BLOCK_MODE: ${WORKER_EGRESS_BLOCK_MODE:-}
     depends_on:
       postgres:
         condition: service_healthy

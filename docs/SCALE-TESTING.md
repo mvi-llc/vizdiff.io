@@ -11,13 +11,29 @@ End-to-end verification that a large build shards across multiple worker replica
   api until the build is terminal, and asserts the result count, terminal status, and wall clock.
   `--kill-worker` adds a mid-build worker-crash drill.
 
-In addition to `--stories N` plain stories, every generated fixture includes one **web-worker-backed
-story** by default (`--worker-stories` to change the count, `0` to disable): the story page spawns a
-dedicated `Worker` whose script `fetch()`es a same-origin binary and postMessages back, and the
-story only signals readiness (`parameters.useReadySignal`) from that `onmessage`. This keeps
-worker-owned network requests — which frame-scoped request interception cannot settle — permanently
-covered end to end (issue #473). All assertions run against the total (`--stories` +
-`--worker-stories`).
+In addition to `--stories N` plain stories, every generated fixture includes (issue #473; each
+knob accepts `0` to disable):
+
+- One **web-worker-backed story** (`--worker-stories`, default 1): the page spawns a dedicated
+  `Worker` whose script `fetch()`es a same-origin binary and postMessages back; the story only
+  signals readiness (`parameters.useReadySignal`) from that `onmessage`.
+- Two **font-loading story pairs** (`--font-stories`, default 2; each pair is a light+dark story
+  id, so N pairs add 2N stories): even pairs load a real same-origin woff2 via page-scope
+  `FontFace` + `document.fonts`, odd pairs load it from a dedicated worker's scope (`self.fonts`
+  + OffscreenCanvas text draw). Readiness is gated on the font load **settling** — the #473
+  production wedge left same-origin font fetches paused forever, so a regression shows up as
+  `ready-signal-timeout` with the woff2 pending in the story's failure diagnostics. Each story
+  id busts the font cache with its own query param; the fixture `<head>` also requests the font
+  at document-boot time (CSS `@font-face` + preload) and every story kicks off a non-gating
+  "ambient" font load, mirroring production font traffic in flight across story switches.
+- One **egress-canary story** (`--canary-stories`, default 1): a dedicated worker (outside the
+  page init-script guard, so only the network-layer egress control applies) fetches
+  `http://example.com/` and an IP-literal URL; the story only signals readiness if the hostname
+  fetch is BLOCKED fast. An open egress path — or a block that wedges the request instead of
+  failing it — fails the story.
+
+All assertions run against the total (`--stories` + `--worker-stories` + 2 × `--font-stories` +
+`--canary-stories`).
 
 The fixture also exposes a minimal Storybook preview channel so the worker's in-place story
 switching (issue #474) is exercised by default; pass `--legacy-fixture` to generate the pre-#474
@@ -115,6 +131,29 @@ Reference numbers from this rig (2 workers x `WORKER_STORY_CONCURRENCY=4`, local
 host): 60 stories (inline) ~10 s; 150 stories (3 chunks) ~15 s; 743 stories (15 chunks) ~45 s
 upload-to-terminal; kill-worker drill on 150 stories ~10.5 min (dominated by the 10-minute
 `WORKER_TASK_LOCK_TIMEOUT_MINUTES` before the orphaned chunk is reclaimed).
+
+### Reproducing the #473 egress-interception wedge
+
+The scale compose file passes `WORKER_ENABLE_WEBGL`, `WORKER_STORY_RENDER_TIMEOUT_MS`, and
+`WORKER_EGRESS_BLOCK_MODE` through from the host environment. The interception wedge
+(`'Fetch.continueRequest' wasn't found` → request paused forever → `ready-signal-timeout`) is a
+load-dependent race on requests owned by dedicated-worker targets; it reproduces with the legacy
+`intercept` mode under CPU contention and hard-navigation churn:
+
+```sh
+export WORKER_ENABLE_WEBGL=true WORKER_STORY_RENDER_TIMEOUT_MS=15000 \
+       WORKER_EGRESS_BLOCK_MODE=intercept
+# restart the workers so the env applies, then:
+node scripts/e2e-scale.mjs --stories 200 --font-stories 24 --worker-stories 24 \
+  --canary-stories 4 --legacy-fixture --budget-seconds 900
+```
+
+On a many-core host, also cap the worker containers' CPUs (e.g. `cpus: 2.0` in a local compose
+override) to mirror production pod sizing — without contention the race window closes. Expect a
+handful of worker-backed/canary stories to fail `ready-signal-timeout` with the same-origin
+request pending in their failure diagnostics (`test_results.diagnostics->'pendingRequests'`).
+The same run with `WORKER_EGRESS_BLOCK_MODE=resolver` (the default) passes with every canary
+reporting the off-origin probe blocked.
 
 ## 5. The kill-worker drill
 
