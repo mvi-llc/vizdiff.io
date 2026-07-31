@@ -11,6 +11,14 @@ End-to-end verification that a large build shards across multiple worker replica
   api until the build is terminal, and asserts the result count, terminal status, and wall clock.
   `--kill-worker` adds a mid-build worker-crash drill.
 
+In addition to `--stories N` plain stories, every generated fixture includes one **web-worker-backed
+story** by default (`--worker-stories` to change the count, `0` to disable): the story page spawns a
+dedicated `Worker` whose script `fetch()`es a same-origin binary and postMessages back, and the
+story only signals readiness (`parameters.useReadySignal`) from that `onmessage`. This keeps
+worker-owned network requests — which frame-scoped request interception cannot settle — permanently
+covered end to end (issue #473). All assertions run against the total (`--stories` +
+`--worker-stories`).
+
 Requirements: Docker + the compose plugin, `tar`, Node >= 20. Everything below runs from the
 repo root.
 
