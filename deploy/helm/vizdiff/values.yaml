@@ -183,6 +183,13 @@ worker:
   # build instead of requeueing it (issue #451, WORKER_MAX_TASK_ATTEMPTS). Empty uses the
   # built-in default (3).
   maxTaskAttempts: ""
+  # -- Task-queue claim lock expiry in minutes (WORKER_TASK_LOCK_TIMEOUT_MINUTES). Live owners
+  # refresh the lock every minute (task-lock heartbeat), so expiry only reclaims tasks from
+  # workers that died without releasing (SIGKILL/OOM). Keep it below the effective stuck-running
+  # threshold (max(stuckRunningMinutes, 3 x WORKER_PROGRESS_TIMEOUT_MS)) so an orphaned render
+  # chunk is reclaimed before the stuck-build sweeper fails the whole build. Empty uses the
+  # built-in default (10).
+  taskLockTimeoutMinutes: ""
   # -- Stuck-build sweeper threshold (minutes) for "running" builds (issue #451,
   # WORKER_STUCK_RUNNING_MINUTES). Empty uses the built-in default (15).
   stuckRunningMinutes: ""

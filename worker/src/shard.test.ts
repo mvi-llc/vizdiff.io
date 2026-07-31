@@ -18,6 +18,7 @@ import { promises as fsPromises } from "node:fs"
 import path from "node:path"
 import { Readable } from "node:stream"
 import pg from "pg"
+import type { ScreenshotTest } from "shared"
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { DatabasePool } from "./database"
@@ -32,7 +33,9 @@ import { safeExtract } from "./extract"
 import {
   UPLOAD_CACHE_TTL_MS,
   ensureUploadExtracted,
+  enqueueRenderChunks,
   giveUpOnChunkTask,
+  parseRenderChunkPayload,
   planChunks,
   reconcileBuildCompletion,
   recordChunkStoryFailures,
@@ -96,8 +99,9 @@ beforeAll(async () => {
     connectionTimeoutMillis: 5000,
   })
 
-  // Minimal mirrors of the two tables the sharding SQL touches, matching the real schema's
+  // Minimal mirrors of the tables the sharding SQL touches, matching the real schema's
   // column shapes and the unique (screenshot_test_id, story_id) index (AddShardingSupport).
+  await testPool.query(`DROP TABLE IF EXISTS task_queue`)
   await testPool.query(`DROP TABLE IF EXISTS test_results`)
   await testPool.query(`DROP TABLE IF EXISTS screenshot_tests`)
   await testPool.query(`
@@ -124,6 +128,18 @@ beforeAll(async () => {
       updated_at timestamptz NOT NULL DEFAULT now(),
       CONSTRAINT uq_test_results_test_story UNIQUE (screenshot_test_id, story_id)
     )`)
+  await testPool.query(`
+    CREATE TABLE task_queue (
+      id serial PRIMARY KEY,
+      screenshot_test_id integer,
+      task_type text NOT NULL,
+      data jsonb,
+      locked_at timestamptz,
+      locked_by text,
+      attempts integer NOT NULL DEFAULT 0,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )`)
 
   vi.mocked(DatabasePool).mockImplementation(async () => {
     if (!testPool) {
@@ -139,7 +155,7 @@ afterAll(async () => {
 })
 
 beforeEach(async () => {
-  await testPool?.query(`TRUNCATE test_results, screenshot_tests RESTART IDENTITY`)
+  await testPool?.query(`TRUNCATE test_results, screenshot_tests, task_queue RESTART IDENTITY`)
 })
 
 async function insertBuild(status: string, expectedStoryCount: number | null): Promise<number> {
@@ -211,6 +227,98 @@ describe("planChunks", () => {
 
   it("returns no chunks for no stories", () => {
     expect(planChunks([], 10)).toEqual([])
+  })
+})
+
+describe("parseRenderChunkPayload", () => {
+  const validPayload = {
+    projectId: "proj-1",
+    uploadId: "upload-1",
+    storyIds: ["a", "b"],
+    chunkIndex: 0,
+    chunkCount: 2,
+  }
+
+  it("parses a valid all-string payload", () => {
+    expect(parseRenderChunkPayload(validPayload)).toMatchObject(validPayload)
+  })
+
+  it("normalizes the api's numeric projectId to a string", () => {
+    // The api enqueues `projectId: project.id` where Project.id is a NUMBER
+    // (@PrimaryGeneratedColumn), stored unquoted in jsonb. Pre-fix this returned undefined,
+    // which deleted every chunk task as non-retryable and stranded the build in "running".
+    const parsed = parseRenderChunkPayload({ ...validPayload, projectId: 42 })
+    expect(parsed).toMatchObject({ projectId: "42", uploadId: "upload-1" })
+  })
+
+  it("normalizes a numeric projectId that round-tripped through Postgres jsonb", async () => {
+    const data = JSON.stringify({ ...validPayload, projectId: 42 })
+    await testPool!.query(
+      `INSERT INTO task_queue (screenshot_test_id, task_type, data)
+       VALUES (1, 'render_story_chunk', $1::jsonb)`,
+      [data],
+    )
+    const res = await testPool!.query(`SELECT data FROM task_queue LIMIT 1`)
+    const roundTripped = (res.rows[0] as { data: unknown }).data
+
+    // node-postgres parses jsonb back to a JS object with projectId as a number.
+    expect((roundTripped as { projectId: unknown }).projectId).toBe(42)
+    const parsed = parseRenderChunkPayload(roundTripped)
+    expect(parsed).toMatchObject({ projectId: "42", storyIds: ["a", "b"] })
+  })
+
+  it("rejects null/missing/empty projectId and uploadId", () => {
+    expect(parseRenderChunkPayload({ ...validPayload, projectId: null })).toBeUndefined()
+    expect(parseRenderChunkPayload({ ...validPayload, projectId: "" })).toBeUndefined()
+    expect(parseRenderChunkPayload({ ...validPayload, uploadId: undefined })).toBeUndefined()
+    expect(parseRenderChunkPayload({ ...validPayload, uploadId: "" })).toBeUndefined()
+    const { projectId: _dropped, ...withoutProjectId } = validPayload
+    expect(parseRenderChunkPayload(withoutProjectId)).toBeUndefined()
+  })
+
+  it("rejects malformed storyIds and chunk fields", () => {
+    expect(parseRenderChunkPayload({ ...validPayload, storyIds: [] })).toBeUndefined()
+    expect(parseRenderChunkPayload({ ...validPayload, storyIds: ["a", 5] })).toBeUndefined()
+    expect(parseRenderChunkPayload({ ...validPayload, chunkIndex: -1 })).toBeUndefined()
+    expect(parseRenderChunkPayload({ ...validPayload, chunkCount: 0 })).toBeUndefined()
+    expect(parseRenderChunkPayload(null)).toBeUndefined()
+    expect(parseRenderChunkPayload("nope")).toBeUndefined()
+  })
+})
+
+describe("enqueueRenderChunks", () => {
+  it("inserts one task per chunk with string ids in the jsonb payload even when fed a number", async () => {
+    const buildId = await insertBuild("running", 3)
+    const screenshotTest = { id: buildId, buildNumber: 1 } as ScreenshotTest
+
+    // Simulate the pre-fix caller: the ingest payload's numeric projectId reaching the enqueue.
+    // The enqueued jsonb must still carry string ids.
+    await enqueueRenderChunks(screenshotTest, 42, "upload-1", [["a", "b"], ["c"]])
+
+    const res = await testPool!.query(
+      `SELECT screenshot_test_id, task_type, data,
+              jsonb_typeof(data->'projectId') AS project_id_type,
+              jsonb_typeof(data->'uploadId') AS upload_id_type
+       FROM task_queue ORDER BY id`,
+    )
+    expect(res.rowCount).toBe(2)
+    const rows = res.rows as Array<{
+      screenshot_test_id: number
+      task_type: string
+      data: Record<string, unknown>
+      project_id_type: string
+      upload_id_type: string
+    }>
+    for (const row of rows) {
+      expect(row.screenshot_test_id).toBe(buildId)
+      expect(row.task_type).toBe("render_story_chunk")
+      expect(row.project_id_type).toBe("string")
+      expect(row.upload_id_type).toBe("string")
+      expect(row.data.projectId).toBe("42")
+      expect(row.data.uploadId).toBe("upload-1")
+    }
+    expect(rows[0]!.data).toMatchObject({ storyIds: ["a", "b"], chunkIndex: 0, chunkCount: 2 })
+    expect(rows[1]!.data).toMatchObject({ storyIds: ["c"], chunkIndex: 1, chunkCount: 2 })
   })
 })
 

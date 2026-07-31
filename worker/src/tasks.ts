@@ -1,5 +1,7 @@
 import { DatabasePool } from "./database"
+import { WORKER_TASK_LOCK_TIMEOUT_MINUTES } from "./environment"
 import { WORKER_ID } from "./identity"
+import { log } from "./log"
 
 /**
  * A task-queue row this worker has successfully claimed (locked). `id` is the queue row id —
@@ -13,7 +15,22 @@ export type ClaimedTask = {
   attempts: number
 }
 
-const LOCK_TIMEOUT_MINUTES = 60
+/**
+ * Normalize an id field from a task's jsonb payload to a non-empty string. The api enqueues
+ * `projectId` as `Project.id` — a NUMBER (`@PrimaryGeneratedColumn`), stored unquoted in jsonb —
+ * while worker code treats ids as strings everywhere (S3 keys, cache dirs, chunk payloads), so
+ * both arrivals normalize here. Returns undefined for anything unusable (null, undefined, empty
+ * string, non-finite number, objects).
+ */
+export function normalizeTaskDataId(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    return value === "" ? undefined : value
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value)
+  }
+  return undefined
+}
 
 /**
  * Error that signals the task should NOT be retried. When the worker catches one
@@ -118,9 +135,14 @@ function isClaimedTaskRow(row: unknown): row is ClaimedTask {
  *    of newer arrivals.
  *  - `FOR UPDATE SKIP LOCKED`: a row another transaction is mid-claim on is skipped instead of
  *    waited on, so concurrent workers contend without blocking each other.
- *  - Eligibility: unlocked rows, plus rows whose lock has expired (LOCK_TIMEOUT_MINUTES —
- *    crashed-worker recovery), minus `excludeIds` (tasks the caller is temporarily deferring or
- *    backing off, so the next-best task is claimed instead of re-selecting an ineligible one).
+ *  - Eligibility: unlocked rows, plus rows whose lock has expired
+ *    (WORKER_TASK_LOCK_TIMEOUT_MINUTES — crashed-worker recovery), minus `excludeIds` (tasks the
+ *    caller is temporarily deferring or backing off, so the next-best task is claimed instead of
+ *    re-selecting an ineligible one). Lock expiry is minutes-scale because live owners refresh
+ *    locked_at via the task-lock heartbeat (startTaskLockHeartbeat below): only a task whose
+ *    owner died without releasing (SIGKILL/OOM) ever goes stale, and it must be reclaimed before
+ *    the stuck-build sweeper's no-progress threshold fails its whole build (see the ordering
+ *    constraint on WORKER_TASK_LOCK_TIMEOUT_MINUTES in environment.ts).
  *
  * The claim records the stable WORKER_ID (hostname, not pid — issue #451) so a restarted worker
  * can recognize its own orphaned work, and bumps `attempts` so the startup reclaim can bound
@@ -139,7 +161,7 @@ export async function claimNextTask(
        WHERE id = (
          SELECT id FROM task_queue
          WHERE (locked_at IS NULL
-            OR locked_at < NOW() - INTERVAL '${LOCK_TIMEOUT_MINUTES} minutes')
+            OR locked_at < NOW() - INTERVAL '${WORKER_TASK_LOCK_TIMEOUT_MINUTES} minutes')
            AND NOT (id = ANY($2::int[]))
          ORDER BY id ASC
          LIMIT 1
@@ -158,4 +180,55 @@ export async function claimNextTask(
   } finally {
     client.release()
   }
+}
+
+/**
+ * How often the owning worker refreshes a claimed task's `locked_at` while processing it. Far
+ * below WORKER_TASK_LOCK_TIMEOUT_MINUTES, so a healthy long-running task can never look expired
+ * to claimNextTask() on a sibling worker.
+ */
+export const TASK_LOCK_HEARTBEAT_INTERVAL_MS = 60_000
+
+/**
+ * Start the task-lock heartbeat for a claimed task: refresh `locked_at` on an unref'd interval
+ * for as long as this worker is processing the task, so lock expiry
+ * (WORKER_TASK_LOCK_TIMEOUT_MINUTES) only ever reclaims tasks whose owner died without releasing
+ * (SIGKILL/OOM) — not tasks that are simply slow. The UPDATE is guarded on `locked_by = us` so a
+ * heartbeat can never re-lock a row that was released, reclaimed by another worker after a
+ * genuine expiry, or deleted. Best-effort: a failed refresh is logged and retried on the next
+ * tick (one miss is harmless — expiry needs WORKER_TASK_LOCK_TIMEOUT_MINUTES of silence).
+ *
+ * Returns a stop function; callers MUST invoke it when the task finishes or is released.
+ */
+export function startTaskLockHeartbeat(
+  taskQueueId: number,
+  intervalMs: number = TASK_LOCK_HEARTBEAT_INTERVAL_MS,
+): () => void {
+  let inFlight = false
+  const timer = setInterval(() => {
+    if (inFlight) {
+      return
+    }
+    inFlight = true
+    void (async () => {
+      try {
+        const client = await DatabasePool()
+        try {
+          await client.query(
+            `UPDATE task_queue SET locked_at = NOW() WHERE id = $1 AND locked_by = $2`,
+            [taskQueueId, WORKER_ID],
+          )
+        } finally {
+          client.release()
+        }
+      } catch (err) {
+        log.warn(err, `Failed to refresh task lock for task ${taskQueueId}; will retry`)
+      } finally {
+        inFlight = false
+      }
+    })()
+  }, intervalMs)
+  // unref'd: the heartbeat must never keep a shutting-down process alive.
+  timer.unref()
+  return () => clearInterval(timer)
 }

@@ -118,6 +118,9 @@ vi.mock("./tasks", async (importOriginal) => {
     claimNextTask: vi.fn().mockResolvedValue(undefined),
     deleteTask: vi.fn().mockResolvedValue(undefined),
     releaseLock: vi.fn().mockResolvedValue(undefined),
+    // The task-lock heartbeat's own behavior (interval, ownership guard) is covered in
+    // tasks.test.ts; here it is stubbed so startTask tests can assert the start/stop wiring.
+    startTaskLockHeartbeat: vi.fn().mockReturnValue(vi.fn()),
   }
 })
 
@@ -558,6 +561,83 @@ describe("worker", () => {
       expect(runRenderChunk).not.toHaveBeenCalled()
       log.error = originalError
     })
+
+    // Regression (#456 follow-up): the api enqueues the ingest payload with the NUMERIC
+    // Project.id, and pre-fix chunk payloads copied it verbatim — parseRenderChunkPayload
+    // rejected the number, so every chunk task was deleted as non-retryable and the build sat
+    // in "running" until the sweeper failed it. A numeric projectId must dispatch normally,
+    // normalized to a string.
+    it("accepts a numeric projectId in a render_story_chunk payload, normalized to a string", async () => {
+      const { runRenderChunk } = await import("./shard")
+
+      await processTask("render_story_chunk", 123, {
+        projectId: 42,
+        uploadId: "test-upload",
+        storyIds: ["story-a"],
+        chunkIndex: 0,
+        chunkCount: 1,
+      })
+
+      expect(runRenderChunk).toHaveBeenCalledWith(
+        expect.objectContaining({ projectId: "42", uploadId: "test-upload" }),
+        123,
+        undefined,
+      )
+    })
+
+    it("rejects an ingest_storybook payload with null/missing ids", async () => {
+      const originalError = log.error
+      log.error = vi.fn()
+
+      await expect(
+        processTask("ingest_storybook", 123, { projectId: null, uploadId: "test-upload" }),
+      ).rejects.toThrow(/Missing required ingest_storybook fields/)
+
+      log.error = originalError
+    })
+  })
+
+  describe("task-lock heartbeat wiring (#456 follow-up)", () => {
+    const chunkTask = {
+      id: 55,
+      task_type: "render_story_chunk",
+      screenshot_test_id: 123,
+      data: {
+        projectId: "test-project",
+        uploadId: "test-upload",
+        storyIds: ["story-a"],
+        chunkIndex: 0,
+        chunkCount: 1,
+      },
+      attempts: 1,
+    }
+
+    it("starts the heartbeat when a claimed task starts and stops it when the task finishes", async () => {
+      const { startTaskLockHeartbeat } = await import("./tasks")
+      const stop = vi.fn()
+      vi.mocked(startTaskLockHeartbeat).mockReturnValue(stop)
+
+      await startTask(chunkTask)
+
+      expect(startTaskLockHeartbeat).toHaveBeenCalledWith(55)
+      expect(stop).toHaveBeenCalledTimes(1)
+    })
+
+    it("stops the heartbeat when the task fails", async () => {
+      const originalError = log.error
+      log.error = vi.fn()
+      const { startTaskLockHeartbeat } = await import("./tasks")
+      const { runRenderChunk } = await import("./shard")
+      const stop = vi.fn()
+      vi.mocked(startTaskLockHeartbeat).mockReturnValue(stop)
+      vi.mocked(runRenderChunk).mockRejectedValueOnce(new Error("chunk render failed"))
+
+      await expect(startTask(chunkTask)).rejects.toThrow("chunk render failed")
+
+      expect(startTaskLockHeartbeat).toHaveBeenCalledWith(55)
+      expect(stop).toHaveBeenCalledTimes(1)
+      log.error = originalError
+    })
   })
 
   describe("isPermanentS3FetchError", () => {
@@ -686,6 +766,24 @@ describe("worker", () => {
       // The task must remain in the queue so it can be retried after the
       // dependency finishes.
       expect(deleteTask).not.toHaveBeenCalled()
+
+      log.error = originalError
+    })
+
+    // Regression (#456 follow-up): the api's ingest payload carries the NUMERIC Project.id.
+    // The boundary normalization must accept it (reaching the baseline-dependency gate, i.e.
+    // normal ingest control flow) instead of failing the missing-fields guard.
+    it("processTask accepts the api's numeric projectId for ingest_storybook", async () => {
+      const originalError = log.error
+      log.error = vi.fn()
+      mockDatabaseForDependency(
+        { id: 200, baseCommitSha: "base-sha", project: { id: "test-project" } },
+        1,
+      )
+
+      await expect(
+        processTask("ingest_storybook", 200, { projectId: 42, uploadId: "test-upload" }),
+      ).rejects.toBeInstanceOf(DependencyNotReadyError)
 
       log.error = originalError
     })
