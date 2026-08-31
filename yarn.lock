@@ -2703,19 +2703,19 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@mui/icons-material@npm:9.1.1":
-  version: 9.1.1
-  resolution: "@mui/icons-material@npm:9.1.1"
+"@mui/icons-material@npm:9.2.0":
+  version: 9.2.0
+  resolution: "@mui/icons-material@npm:9.2.0"
   dependencies:
     "@babel/runtime": "npm:^7.29.2"
   peerDependencies:
-    "@mui/material": ^9.1.1
+    "@mui/material": ^9.2.0
     "@types/react": ^17.0.0 || ^18.0.0 || ^19.0.0
     react: ^17.0.0 || ^18.0.0 || ^19.0.0
   peerDependenciesMeta:
     "@types/react":
       optional: true
-  checksum: 10/52735f700d5306254d7d6fafa95d7cb8d7da0b919b8566fb1fd154393f937554da32cd392346aa335f8ff9cd2ce8f117621857ab3cac58541dabff18eed0bdbc
+  checksum: 10/53e9a9124ef298b6afd10467f0cd07e5b7a51d99dfa994d7385aeedf83e29c184a47aaab472b5c7980cd5dffc3fe716daa32124b7786a13621cd7cc351d081c3
   languageName: node
   linkType: hard
 
@@ -8856,7 +8856,7 @@ __metadata:
     "@emotion/styled": "npm:11.14.1"
     "@eslint/eslintrc": "npm:^3.3.3"
     "@foxglove/eslint-plugin": "npm:2.0.0"
-    "@mui/icons-material": "npm:9.1.1"
+    "@mui/icons-material": "npm:9.2.0"
     "@mui/material": "npm:9.1.1"
     "@octokit/types": "npm:16.0.0"
     "@storybook/addon-docs": "npm:10.2.8"
